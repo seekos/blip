@@ -1,0 +1,59 @@
+[package]
+name = "macscp"
+version = "0.1.0"
+edition = "2024"
+description = "A native, GPU-accelerated macOS SFTP client built with GPUI Kit"
+
+[features]
+default = []
+# 把一个假的 SFTP 服务器编进二进制（127.0.0.1 随机端口、tester / s3cret）。
+# 用来在没有真实主机的情况下手工验证「连接 → 列目录 → 上传/下载 → 取消/续传 →
+# 从 Finder 拖文件上传」整条链路：`cargo run --features demo-server`。
+demo-server = []
+
+[dependencies]
+# UI: GPUI Kit re-exports gpui, base, component library and the icon set.
+gpui-kit = "0.8"
+
+# Networking: a dedicated multi-threaded Tokio runtime lives on its own thread.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "io-util",
+    "net",
+    "time",
+    "sync",
+] }
+
+# SSH / SFTP core (pure Rust, async).
+russh = { version = "0.64", default-features = false, features = [
+    "ring",
+    "rsa",
+    "flate2",
+] }
+russh-sftp = "3.0"
+
+# Cross-runtime actor channels.
+flume = { version = "0.12", features = ["async"] }
+
+# macOS integration.
+keyring = "4"
+dirs = "6"
+
+# Dock 图标：裸二进制（`cargo run`）没有 bundle，Dock 里只能靠运行时
+# `NSApplication.setApplicationIconImage` 换成自己的图标。
+# 版本必须与 gpui 依赖树里的对齐（objc2 0.6 / objc2-app-kit 0.3），
+# 否则会同时链进两套 objc2，编译时间和二进制体积都会翻倍。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3", features = ["NSData"] }
+
+# Utilities.
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

@@ -1,0 +1,8 @@
+/target
+.DS_Store
+
+# 图标中间产物（scripts/make-icon.sh 会重新生成）
+/assets/icon/AppIcon.iconset
+
+# 构建产物
+/dist
