@@ -157,11 +157,7 @@ mod tests {
         assert_eq!(tree.skipped, 0);
 
         // 空目录不能漏 —— 远端该建的目录一个都不能少。
-        let dirs: Vec<String> = tree
-            .dirs
-            .iter()
-            .map(|dir| relative_to_posix(dir))
-            .collect();
+        let dirs: Vec<String> = tree.dirs.iter().map(|dir| relative_to_posix(dir)).collect();
         assert!(dirs.contains(&"empty".to_string()));
         assert!(dirs.contains(&"sub".to_string()));
         assert!(dirs.contains(&"sub/deep".to_string()));

@@ -8,8 +8,8 @@
 //!   每秒会产生上千条消息，GPUI 主线程会被重绘请求淹没。这里按 100ms 节流，
 //!   结束前再补一条终值，保证进度条一定能到 100%。
 //! * **速率**：worker 侧测（`Speedometer`），UI 直接显示，不再自己按时间戳反推。
-//! * **续传**：允许时，先看两端已有的字节数，从小的那一段后面接着传。
-//!   取消时**保留**半成品（不再删掉），否则下次就没法续了。
+//! * **续传**：下载只续写身份匹配的 `<local>.filepart`，绝不把已有目标文件当半成品；
+//!   上传续写远端 `.filepart`。取消时保留半成品，完整后才原子替换目标。
 //! * **上传永远走临时文件**：数据先写 `<remote>.filepart`，写完整再替换目标。
 //!   这样中途取消不会留下一个被截断的目标文件，替换时也不必打开目标文件，
 //!   于是「覆盖正在运行的可执行文件」不会撞上 `ETXTBSY`（详见 [`replace_remote`]）。
@@ -19,20 +19,19 @@
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileAttributes;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::local_tree::{self, LocalTree};
 use super::remote_tree;
 use super::session::join_remote;
-use super::types::{
-    ExistingPolicy, SftpEvent, TransferId, TransferOutcome, UploadDecision,
-};
+use super::types::{ExistingPolicy, SftpEvent, TransferId, TransferOutcome, UploadDecision};
 
 /// 一次搬运的块大小。64 KiB 是「进度条平滑」和「系统调用次数」之间的折中。
 const CHUNK_SIZE: usize = 64 * 1024;
@@ -40,12 +39,84 @@ const CHUNK_SIZE: usize = 64 * 1024;
 /// 进度上报的最小间隔。
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
+/// 取消标志是同步原子量；用一个很短的异步轮询把它变成可 `select!` 的等待。
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// 速率平滑系数：越接近 1 越稳，越接近 0 越灵敏。
 const SPEED_SMOOTHING: f64 = 0.7;
 
 /// 两次采样之间的最小间隔（秒）。低于它的样本直接丢弃 —— 除以接近 0 的时间
 /// 会把速率算成天文数字。
 const MIN_SAMPLE_INTERVAL: f64 = 0.05;
+
+/// 应用内文本编辑器可打开的最大文件。
+///
+/// 编辑器需要把全部内容放进内存和文本布局引擎，不适合无上限地打开日志或二进制文件。
+pub const MAX_EDITABLE_TEXT_SIZE: u64 = 2 * 1024 * 1024;
+
+static NEXT_EDIT_TEMP: AtomicU64 = AtomicU64::new(1);
+
+fn edit_temp_path(path: &str) -> String {
+    let sequence = NEXT_EDIT_TEMP.fetch_add(1, Ordering::Relaxed);
+    format!("{path}.macscp-editpart-{}-{sequence}", std::process::id())
+}
+
+pub(crate) fn decode_text_for_editor(bytes: &[u8]) -> String {
+    // 「以文本打开」是用户的显式选择：非 UTF-8 字节和 NUL 以替换字符显示。
+    String::from_utf8_lossy(bytes).replace('\0', "\u{FFFD}")
+}
+
+/// 读取一个远端文件供文本编辑器打开，不判断扩展名或文件类型。
+pub async fn read_remote_text(sftp: &SftpSession, path: &str) -> Result<String> {
+    let metadata = sftp
+        .metadata(path)
+        .await
+        .map_err(|err| anyhow!("读取 {path} 的信息失败：{err}"))?;
+    if metadata.size.unwrap_or(0) > MAX_EDITABLE_TEXT_SIZE {
+        return Err(anyhow!("文件超过 2 MiB，请下载后使用本地编辑器"));
+    }
+
+    let bytes = sftp
+        .read(path)
+        .await
+        .map_err(|err| anyhow!("读取 {path} 失败：{err}"))?;
+    if bytes.len() as u64 > MAX_EDITABLE_TEXT_SIZE {
+        return Err(anyhow!("文件超过 2 MiB，请下载后使用本地编辑器"));
+    }
+    Ok(decode_text_for_editor(&bytes))
+}
+
+/// 把文本先写到同目录临时文件，完整落盘后再替换目标。
+///
+/// 这样在断线、超时或写入失败时，原文件仍保持完整。
+pub async fn write_remote_text(sftp: &SftpSession, path: &str, content: &str) -> Result<()> {
+    if content.len() as u64 > MAX_EDITABLE_TEXT_SIZE {
+        return Err(anyhow!("编辑后的内容超过 2 MiB，无法保存"));
+    }
+
+    let preserved_mode = sftp
+        .metadata(path)
+        .await
+        .map_err(|err| anyhow!("读取 {path} 的信息失败：{err}"))?
+        .permissions;
+    let temp = edit_temp_path(path);
+    let mut file = sftp
+        .create(&temp)
+        .await
+        .map_err(|err| anyhow!("创建临时文件 {temp} 失败：{err}"))?;
+
+    file.write_all(content.as_bytes())
+        .await
+        .map_err(|err| anyhow!("写入临时文件 {temp} 失败：{err}"))?;
+    file.shutdown()
+        .await
+        .map_err(|err| anyhow!("关闭临时文件 {temp} 失败：{err}"))?;
+
+    if let Some(mode) = preserved_mode {
+        apply_mode(sftp, &temp, mode).await?;
+    }
+    replace_remote(sftp, &temp, path).await
+}
 
 // ---------------------------------------------------------------------------
 // 小工具
@@ -144,6 +215,27 @@ pub struct Plan {
     pub total: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RemoteIdentity {
+    remote: String,
+    size: u64,
+    modified_secs: Option<u64>,
+}
+
+struct DownloadPlan {
+    offset: u64,
+    total: u64,
+    temp: PathBuf,
+    marker: PathBuf,
+    identity: RemoteIdentity,
+}
+
+async fn wait_for_cancel(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 下载：远端 → 本地
 // ---------------------------------------------------------------------------
@@ -161,11 +253,16 @@ pub async fn run_download(
     cancel: Arc<AtomicBool>,
     events: flume::Sender<SftpEvent>,
 ) {
-    let outcome = match download_once(
-        &sftp, id, &remote, &local, total, resume, &cancel, &events,
-    )
-    .await
-    {
+    let result = if cancel.load(Ordering::Relaxed) {
+        Err(anyhow!("已取消"))
+    } else {
+        tokio::select! {
+            biased;
+            result = download_once(&sftp, id, &remote, &local, total, resume, &cancel, &events) => result,
+            _ = wait_for_cancel(&cancel) => Err(anyhow!("已取消")),
+        }
+    };
+    let outcome = match result {
         Ok(()) => TransferOutcome::Completed,
         Err(err) => {
             if cancel.load(Ordering::Relaxed) {
@@ -203,22 +300,53 @@ async fn plan_download(
     local: &Path,
     total: u64,
     resume: bool,
-) -> Result<Plan> {
-    // 远端大小优先用 stat，拿不到就退回调用方给的值。
-    let remote_len = match sftp.metadata(remote).await {
-        Ok(meta) => meta.size.unwrap_or(total),
-        Err(_) => total,
-    };
-    let total = remote_len.max(total);
+) -> Result<DownloadPlan> {
+    if let Some(parent) = local.parent() {
+        let meta = tokio::fs::symlink_metadata(parent)
+            .await
+            .map_err(|err| anyhow!("本地目标目录 {} 不可用：{err}", parent.display()))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(anyhow!(
+                "本地目标目录不安全或不是目录：{}",
+                parent.display()
+            ));
+        }
+    }
 
-    let local_len = tokio::fs::metadata(local)
+    let identity = read_remote_identity(sftp, remote, total).await?;
+    let total = identity.size;
+    let temp = local_filepart_path(local);
+    let marker = local_marker_path(&temp);
+
+    let recorded = read_download_marker(&marker).await;
+    let temp_len = tokio::fs::symlink_metadata(&temp)
         .await
-        .map(|meta| meta.len())
-        .unwrap_or(0);
+        .ok()
+        .filter(|meta| !meta.file_type().is_symlink() && meta.is_file())
+        .map(|meta| meta.len());
+    let reusable = resume && recorded.as_ref() == Some(&identity) && temp_len.is_some();
+    let offset = if reusable {
+        resume_offset(true, temp_len.unwrap_or(0), total)
+    } else {
+        0
+    };
 
-    Ok(Plan {
-        offset: resume_offset(resume, local_len, total),
+    if !reusable {
+        // 先截断旧数据，再把标记指向新身份。反过来做时，如果此处被取消或打开远端
+        // 失败，下一次会把“旧内容 + 新标记”误认成可续传断点。
+        drop(
+            open_local_no_follow(&temp, false)
+                .await
+                .map_err(|err| anyhow!("重置本地半成品 {} 失败：{err}", temp.display()))?,
+        );
+        write_download_marker(&marker, &identity).await?;
+    }
+    Ok(DownloadPlan {
+        offset,
         total,
+        temp,
+        marker,
+        identity,
     })
 }
 
@@ -230,17 +358,11 @@ async fn download_file(
     sftp: &SftpSession,
     remote: &str,
     local: &Path,
-    plan: &Plan,
+    plan: &DownloadPlan,
     cancel: &AtomicBool,
     sink: &mut dyn UploadSink,
 ) -> Result<()> {
     sink.started(plan.total, plan.offset);
-
-    // 本地已经和远端一样长：不用传，但进度要报满（队列那一行得走到 100%）。
-    if plan.total > 0 && plan.offset >= plan.total {
-        sink.progress(plan.total, plan.total, 0.);
-        return Ok(());
-    }
 
     let mut source = sftp
         .open(remote)
@@ -255,23 +377,15 @@ async fn download_file(
             .map_err(|err| anyhow!("定位远端文件偏移失败：{err}"))?;
     }
 
-    if let Some(parent) = local.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|err| anyhow!("创建本地目录 {} 失败：{err}", parent.display()))?;
-    }
-
     // 从头传才需要 truncate；续传必须用 append，否则前半段会被抹掉。
     let mut target = if plan.offset > 0 {
-        tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(local)
+        open_local_no_follow(&plan.temp, true)
             .await
-            .map_err(|err| anyhow!("打开本地文件 {} 失败：{err}", local.display()))?
+            .map_err(|err| anyhow!("打开本地半成品 {} 失败：{err}", plan.temp.display()))?
     } else {
-        tokio::fs::File::create(local)
+        open_local_no_follow(&plan.temp, false)
             .await
-            .map_err(|err| anyhow!("创建本地文件 {} 失败：{err}", local.display()))?
+            .map_err(|err| anyhow!("创建本地半成品 {} 失败：{err}", plan.temp.display()))?
     };
 
     let mut buffer = vec![0u8; CHUNK_SIZE];
@@ -309,11 +423,123 @@ async fn download_file(
         .flush()
         .await
         .map_err(|err| anyhow!("刷新本地文件失败：{err}"))?;
+    target
+        .sync_all()
+        .await
+        .map_err(|err| anyhow!("同步本地文件失败：{err}"))?;
+    drop(target);
+
+    let current = read_remote_identity(sftp, remote, plan.total).await?;
+    if current != plan.identity {
+        return Err(anyhow!(
+            "远端文件在下载过程中发生变化，已保留半成品而未覆盖本地文件"
+        ));
+    }
+    replace_local(&plan.temp, local).await?;
+    let _ = tokio::fs::remove_file(&plan.marker).await;
 
     // 终值：即使最后一次节流没触发，进度条也要走到头。
-    sink.progress(transferred, plan.total.max(transferred), speedometer.current());
+    sink.progress(
+        transferred,
+        plan.total.max(transferred),
+        speedometer.current(),
+    );
 
     Ok(())
+}
+
+pub(crate) fn local_filepart_path(local: &Path) -> PathBuf {
+    let mut name = local.as_os_str().to_os_string();
+    name.push(FILEPART_SUFFIX);
+    PathBuf::from(name)
+}
+
+fn local_marker_path(temp: &Path) -> PathBuf {
+    let mut name = temp.as_os_str().to_os_string();
+    name.push(".json");
+    PathBuf::from(name)
+}
+
+#[cfg(test)]
+pub(crate) async fn seed_download_checkpoint_for_test(
+    sftp: &SftpSession,
+    remote: &str,
+    local: &Path,
+    prefix: &[u8],
+) -> Result<()> {
+    let identity = read_remote_identity(sftp, remote, prefix.len() as u64).await?;
+    let temp = local_filepart_path(local);
+    tokio::fs::write(&temp, prefix)
+        .await
+        .map_err(|err| anyhow!("写测试下载断点失败：{err}"))?;
+    write_download_marker(&local_marker_path(&temp), &identity).await
+}
+
+async fn read_remote_identity(
+    sftp: &SftpSession,
+    remote: &str,
+    total_hint: u64,
+) -> Result<RemoteIdentity> {
+    let meta = sftp
+        .metadata(remote)
+        .await
+        .map_err(|err| anyhow!("读取远端文件信息失败：{err}"))?;
+    let modified_secs = meta.modified().ok().and_then(|time| {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+    });
+    Ok(RemoteIdentity {
+        remote: remote.to_string(),
+        size: meta.size.unwrap_or(total_hint),
+        modified_secs,
+    })
+}
+
+async fn read_download_marker(path: &Path) -> Option<RemoteIdentity> {
+    let raw = tokio::fs::read(path).await.ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+async fn write_download_marker(path: &Path, identity: &RemoteIdentity) -> Result<()> {
+    let raw = serde_json::to_vec(identity).map_err(|err| anyhow!("生成下载断点信息失败：{err}"))?;
+    let mut file = open_local_no_follow(path, false)
+        .await
+        .map_err(|err| anyhow!("创建下载断点信息 {} 失败：{err}", path.display()))?;
+    file.write_all(&raw)
+        .await
+        .map_err(|err| anyhow!("写入下载断点信息失败：{err}"))?;
+    file.flush()
+        .await
+        .map_err(|err| anyhow!("刷新下载断点信息失败：{err}"))
+}
+
+async fn open_local_no_follow(path: &Path, append: bool) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true);
+    if append {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path).await
+}
+
+async fn replace_local(temp: &Path, target: &Path) -> Result<()> {
+    if tokio::fs::symlink_metadata(target)
+        .await
+        .is_ok_and(|meta| meta.is_dir())
+    {
+        return Err(anyhow!(
+            "本地同名条目是目录，无法覆盖：{}",
+            target.display()
+        ));
+    }
+    tokio::fs::rename(temp, target)
+        .await
+        .map_err(|err| anyhow!("替换本地文件 {} 失败：{err}", target.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -464,12 +690,7 @@ struct BatchSink<'a> {
 }
 
 impl<'a> BatchSink<'a> {
-    fn new(
-        id: TransferId,
-        events: &'a flume::Sender<SftpEvent>,
-        base: u64,
-        total: u64,
-    ) -> Self {
+    fn new(id: TransferId, events: &'a flume::Sender<SftpEvent>, base: u64, total: u64) -> Self {
         Self {
             id,
             events,
@@ -511,11 +732,18 @@ pub async fn run_upload(
     cancel: Arc<AtomicBool>,
     events: flume::Sender<SftpEvent>,
 ) {
-    let outcome = match upload_once(
-        &sftp, id, &local, &remote, total, decision, &cancel, &events,
-    )
-    .await
-    {
+    let result = if cancel.load(Ordering::Relaxed) {
+        Err(anyhow!("已取消"))
+    } else {
+        tokio::select! {
+            biased;
+            result = upload_once(
+                &sftp, id, &local, &remote, total, decision, &cancel, &events,
+            ) => result,
+            _ = wait_for_cancel(&cancel) => Err(anyhow!("已取消")),
+        }
+    };
+    let outcome = match result {
         Ok(()) => TransferOutcome::Completed,
         Err(err) => {
             if cancel.load(Ordering::Relaxed) {
@@ -548,7 +776,10 @@ async fn upload_once(
 
     let probe = probe_upload(sftp, local, remote).await?;
     let mut sink = RowSink { id, events };
-    upload_file(sftp, local, remote, &probe, total, decision, cancel, &mut sink).await
+    upload_file(
+        sftp, local, remote, &probe, total, decision, cancel, &mut sink,
+    )
+    .await
 }
 
 /// 上传一个文件的核心流程：探针已经由调用方跑过。
@@ -582,15 +813,7 @@ async fn upload_file(
 
     sink.started(total, offset);
 
-    upload_stream(
-        sftp,
-        local,
-        &temp,
-        &Plan { offset, total },
-        cancel,
-        sink,
-    )
-    .await?;
+    upload_stream(sftp, local, &temp, &Plan { offset, total }, cancel, sink).await?;
 
     // 1) 继承原文件的权限位 —— 可执行位丢了最难查。
     //    失败只警告、不中断：相比「传完的数据不要了」，丢一个权限位是小事。
@@ -742,7 +965,11 @@ async fn upload_stream(
         .map_err(|err| anyhow!("关闭远端临时文件失败：{err}"))?;
 
     // 终值：即使最后一次节流没触发，进度条也要走到头。
-    sink.progress(transferred, plan.total.max(transferred), speedometer.current());
+    sink.progress(
+        transferred,
+        plan.total.max(transferred),
+        speedometer.current(),
+    );
 
     Ok(())
 }
@@ -771,17 +998,27 @@ pub async fn run_upload_dir(
     cancel: Arc<AtomicBool>,
     events: flume::Sender<SftpEvent>,
 ) {
-    let outcome =
-        match upload_dir_inner(&sftp, id, &local, &remote, on_existing, &cancel, &events).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                if cancel.load(Ordering::Relaxed) {
-                    TransferOutcome::Cancelled
-                } else {
-                    TransferOutcome::Failed(err.to_string())
-                }
+    let result = if cancel.load(Ordering::Relaxed) {
+        Ok(TransferOutcome::Cancelled)
+    } else {
+        tokio::select! {
+            biased;
+            result = upload_dir_inner(
+                &sftp, id, &local, &remote, on_existing, &cancel, &events,
+            ) => result,
+            _ = wait_for_cancel(&cancel) => Ok(TransferOutcome::Cancelled),
+        }
+    };
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if cancel.load(Ordering::Relaxed) {
+                TransferOutcome::Cancelled
+            } else {
+                TransferOutcome::Failed(err.to_string())
             }
-        };
+        }
+    };
 
     let _ = events.send(SftpEvent::TransferCompleted { id, outcome });
 }
@@ -885,17 +1122,9 @@ async fn upload_dir_inner(
             continue;
         }
 
-        // 上次传到一半留下的 `.filepart` 自动接着传 —— 那不是覆盖，是续传。
-        let decision = if upload_resume_offset(
-            UploadDecision::Resume,
-            probe.filepart_size.unwrap_or(0),
-            probe.local_size,
-        ) > 0
-        {
-            UploadDecision::Resume
-        } else {
-            UploadDecision::Overwrite
-        };
+        // 整批没有逐文件的“确认这份断点可信”步骤，因此不能只凭长度自动续传；
+        // 残留 `.filepart` 可能来自旧版本文件，混接会悄悄产出损坏内容。
+        let decision = UploadDecision::Overwrite;
 
         let mut sink = BatchSink::new(id, events, done, total);
         match upload_file(
@@ -963,9 +1192,7 @@ async fn ensure_dir(sftp: &SftpSession, path: &str) -> Result<()> {
     match sftp.metadata(path).await {
         // 已经是个目录：这次是合并上传，不是错误。
         Ok(meta) if meta.permissions.is_none_or(mode_is_dir) => Ok(()),
-        Ok(_) => Err(anyhow!(
-            "远端同名条目不是目录，无法上传文件夹进去：{path}"
-        )),
+        Ok(_) => Err(anyhow!("远端同名条目不是目录，无法上传文件夹进去：{path}")),
         Err(_) => Err(anyhow!("创建远端目录 {path} 失败：{create_err}")),
     }
 }
@@ -989,17 +1216,27 @@ pub async fn run_download_dir(
     cancel: Arc<AtomicBool>,
     events: flume::Sender<SftpEvent>,
 ) {
-    let outcome =
-        match download_dir_inner(&sftp, id, &remote, &local, on_existing, &cancel, &events).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                if cancel.load(Ordering::Relaxed) {
-                    TransferOutcome::Cancelled
-                } else {
-                    TransferOutcome::Failed(err.to_string())
-                }
+    let result = if cancel.load(Ordering::Relaxed) {
+        Ok(TransferOutcome::Cancelled)
+    } else {
+        tokio::select! {
+            biased;
+            result = download_dir_inner(
+                &sftp, id, &remote, &local, on_existing, &cancel, &events,
+            ) => result,
+            _ = wait_for_cancel(&cancel) => Ok(TransferOutcome::Cancelled),
+        }
+    };
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if cancel.load(Ordering::Relaxed) {
+                TransferOutcome::Cancelled
+            } else {
+                TransferOutcome::Failed(err.to_string())
             }
-        };
+        }
+    };
 
     let _ = events.send(SftpEvent::TransferCompleted { id, outcome });
 }
@@ -1040,10 +1277,8 @@ async fn download_dir_inner(
         total,
     });
 
-    // 本地目标目录本身建不出来就整批没戏（多半是没权限或路径写错）。
-    tokio::fs::create_dir_all(local)
-        .await
-        .map_err(|err| anyhow!("创建本地目录 {} 失败：{err}", local.display()))?;
+    // 每一级都拒绝符号链接，恶意服务器文件名或本地预置链接都不能把下载写出根目录。
+    ensure_safe_download_root(local).await?;
 
     let mut done = 0u64;
     let mut finished = 0usize;
@@ -1056,8 +1291,7 @@ async fn download_dir_inner(
         if cancel.load(Ordering::Relaxed) {
             return Ok(TransferOutcome::Cancelled);
         }
-        let path = local.join(relative);
-        if let Err(err) = tokio::fs::create_dir_all(&path).await {
+        if let Err(err) = ensure_safe_download_subdir(local, relative).await {
             failures.push(format!("{}/：创建本地目录失败：{err}", relative.display()));
             broken_dirs.push(relative.clone());
         }
@@ -1072,6 +1306,11 @@ async fn download_dir_inner(
         }
 
         let name = local_tree::relative_to_posix(&file.relative);
+        let parent = file.relative.parent().unwrap_or_else(|| Path::new(""));
+        if let Err(err) = ensure_safe_download_subdir(local, parent).await {
+            failures.push(format!("{name}：本地父目录不安全：{err}"));
+            continue;
+        }
         let target = local.join(&file.relative);
 
         // 「跳过同名」且本地已经有这个文件：一个字节都不动，进度照走。
@@ -1087,7 +1326,7 @@ async fn download_dir_inner(
             continue;
         }
 
-        // 允许续传：本地那个文件比远端短就从它末尾接着写（取消过的下载能续）。
+        // 只续写带匹配身份标记的 `.filepart`；已有目标文件始终保持不动直到下载完成。
         let plan = match plan_download(sftp, &file.remote, &target, file.size, true).await {
             Ok(plan) => plan,
             Err(err) => {
@@ -1119,6 +1358,57 @@ async fn download_dir_inner(
     });
 
     Ok(batch_outcome(finished, skipped, &failures))
+}
+
+/// 准备递归下载的根目录。只创建最后一级，避免 `create_dir_all` 沿途跟随符号链接。
+async fn ensure_safe_download_root(root: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(root).await {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(anyhow!("本地下载目录不能是符号链接：{}", root.display()))
+        }
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(anyhow!("本地下载目标不是目录：{}", root.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let parent = root
+                .parent()
+                .ok_or_else(|| anyhow!("本地下载路径没有父目录"))?;
+            let parent_meta = tokio::fs::symlink_metadata(parent)
+                .await
+                .map_err(|err| anyhow!("读取父目录 {} 失败：{err}", parent.display()))?;
+            if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+                return Err(anyhow!("本地下载父目录不安全：{}", parent.display()));
+            }
+            tokio::fs::create_dir(root)
+                .await
+                .map_err(|err| anyhow!("创建本地目录 {} 失败：{err}", root.display()))
+        }
+        Err(err) => Err(anyhow!("读取本地目录 {} 失败：{err}", root.display())),
+    }
+}
+
+/// 在已验证的根目录内逐级创建子目录；任何非普通分量或符号链接都会终止该分支。
+async fn ensure_safe_download_subdir(root: &Path, relative: &Path) -> Result<PathBuf> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(anyhow!("远端路径包含非法分量：{}", relative.display()));
+        };
+        current.push(name);
+        match tokio::fs::symlink_metadata(&current).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(anyhow!("拒绝跟随符号链接：{}", current.display()));
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(anyhow!("路径不是目录：{}", current.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir(&current)
+                    .await
+                    .map_err(|err| anyhow!("创建 {} 失败：{err}", current.display()))?;
+            }
+            Err(err) => return Err(anyhow!("读取 {} 失败：{err}", current.display())),
+        }
+    }
+    Ok(current)
 }
 
 #[cfg(test)]
@@ -1181,12 +1471,30 @@ mod tests {
         assert_eq!(filepart_path("/a/b"), "/a/b.filepart");
     }
 
+    #[test]
+    fn text_edit_temp_paths_are_unique_and_stay_next_to_the_target() {
+        let first = edit_temp_path("/srv/app/config.toml");
+        let second = edit_temp_path("/srv/app/config.toml");
+        assert_ne!(first, second);
+        assert!(first.starts_with("/srv/app/config.toml.macscp-editpart-"));
+        assert!(!first.contains("/../"));
+    }
+
+    #[test]
+    fn text_editor_force_opens_non_utf8_and_nul_bytes() {
+        let decoded = decode_text_for_editor(&[b'A', 0xff, 0, b'B']);
+        assert_eq!(decoded, "A\u{FFFD}\u{FFFD}B");
+    }
+
     /// 上传续传只认「临时文件比本地短」；其余一律重传。
     #[test]
     fn upload_resume_needs_a_shorter_filepart() {
         use UploadDecision::{Overwrite, Resume, Skip};
 
-        assert_eq!(upload_resume_offset(Resume, 50 * 1024, 300 * 1024), 50 * 1024);
+        assert_eq!(
+            upload_resume_offset(Resume, 50 * 1024, 300 * 1024),
+            50 * 1024
+        );
         // 临时文件是空的 / 不存在：没有可续的东西。
         assert_eq!(upload_resume_offset(Resume, 0, 300 * 1024), 0);
         // 一样长：内容可能对也可能不对，按规范重传。

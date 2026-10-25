@@ -55,8 +55,7 @@ wY2Mci/5DVHF4JVqTOjQAAAAEG1hY3NjcC10ZXN0LW9ubHkBAgMEBQ==
 ";
 
 /// [`CLIENT_KEY`] 对应的公钥（带注释的 OpenSSH 单行格式）。
-pub const CLIENT_KEY_PUBLIC: &str =
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICaEpv0wklfEupBq0hro0QrkwY2Mci/5DVHF4JVqTOjQ macscp-test-only";
+pub const CLIENT_KEY_PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICaEpv0wklfEupBq0hro0QrkwY2Mci/5DVHF4JVqTOjQ macscp-test-only";
 
 /// 同一把私钥的口令保护版本（口令见 [`CLIENT_KEY_PASSPHRASE`]）。
 ///
@@ -78,9 +77,14 @@ pub const CLIENT_KEY_PASSPHRASE: &str = "test-pass";
 
 /// 在 127.0.0.1 的随机端口上起一个测试服务器，返回它的地址。
 pub async fn spawn() -> SocketAddr {
+    spawn_with_inactivity_timeout(None).await
+}
+
+async fn spawn_with_inactivity_timeout(inactivity_timeout: Option<Duration>) -> SocketAddr {
     let key = PrivateKey::from_openssh(TEST_HOST_KEY).expect("解析测试主机密钥");
     let config = Arc::new(russh::server::Config {
         keys: vec![key],
+        inactivity_timeout,
         // 默认 1 秒的拒绝延迟会让「密码错误」用例白等，这里压到 50ms。
         auth_rejection_time: Duration::from_millis(50),
         auth_rejection_time_initial: Some(Duration::ZERO),
@@ -134,8 +138,8 @@ impl russh::server::Handler for SshSession {
         user: &str,
         public_key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        let expected = russh::keys::PublicKey::from_openssh(CLIENT_KEY_PUBLIC)
-            .expect("解析测试客户端公钥");
+        let expected =
+            russh::keys::PublicKey::from_openssh(CLIENT_KEY_PUBLIC).expect("解析测试客户端公钥");
         if user == USER && expected.key_data() == public_key.key_data() {
             Ok(Auth::Accept)
         } else {
@@ -254,9 +258,9 @@ fn is_dir_path(disk: &HashMap<String, VfsFile>, path: &str) -> bool {
         return is_dir_mode(file.mode);
     }
     direct_child(path).is_some_and(|name| {
-        fixture()
-            .iter()
-            .any(|(fixture_name, attrs)| *fixture_name == name && attrs.permissions.is_some_and(is_dir_mode))
+        fixture().iter().any(|(fixture_name, attrs)| {
+            *fixture_name == name && attrs.permissions.is_some_and(is_dir_mode)
+        })
     })
 }
 
@@ -823,10 +827,10 @@ impl russh_sftp::server::Handler for TestSftp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sftp::session::{self, format_mode};
+    use crate::sftp::session::{self, HostKeyPolicy, format_mode};
     use crate::sftp::types::{
-        AuthMethod, ErrorContext, ExistingPolicy, SessionConfig, SftpCommand, SftpEvent,
-        TransferOutcome, UploadDecision,
+        AuthMethod, ErrorContext, ExistingPolicy, HostKeyDecision, SessionConfig, SftpCommand,
+        SftpEvent, TransferOutcome, UploadDecision,
     };
     use crate::sftp::worker::SftpWorker;
 
@@ -839,11 +843,22 @@ mod tests {
         }
     }
 
+    fn test_host_key_policy() -> HostKeyPolicy {
+        let key = PrivateKey::from_openssh(TEST_HOST_KEY).expect("解析测试主机密钥");
+        HostKeyPolicy::Exact(key.public_key().clone())
+    }
+
+    async fn connect_test(
+        config: &SessionConfig,
+    ) -> std::result::Result<session::ActiveSession, session::ConnectError> {
+        session::connect(config, test_host_key_policy()).await
+    }
+
     /// 走完真实 TCP + SSH 握手 + 密码认证 + SFTP 握手，然后读目录。
     #[tokio::test]
     async fn connect_and_list_dir_over_real_ssh() {
         let addr = spawn().await;
-        let session = session::connect(&config_for(addr, PASSWORD))
+        let session = connect_test(&config_for(addr, PASSWORD))
             .await
             .expect("连接测试服务器");
 
@@ -855,7 +870,10 @@ mod tests {
 
         // 排序：文件夹优先，同类按名称（大小写不敏感）字母序。
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["alpha", "Beta", ".env", "archive.zip", "zeta.txt"]);
+        assert_eq!(
+            names,
+            vec!["alpha", "Beta", ".env", "archive.zip", "zeta.txt"]
+        );
 
         // 目录标记
         assert!(entries[0].is_dir());
@@ -879,11 +897,34 @@ mod tests {
         assert_eq!(format_mode(env.mode), "-rw-------");
     }
 
+    /// 业务层完全空闲时，SSH keepalive 也必须让服务器和客户端都保持会话。
+    #[tokio::test]
+    async fn keepalive_preserves_an_idle_sftp_session() {
+        let server_idle_timeout = Duration::from_millis(250);
+        let addr = spawn_with_inactivity_timeout(Some(server_idle_timeout)).await;
+        let session = session::connect_with_keepalive_for_test(
+            &config_for(addr, PASSWORD),
+            test_host_key_policy(),
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("连接带空闲超时的测试服务器");
+
+        // 明显超过服务端空闲阈值；期间不发送任何 SFTP 指令，只靠 SSH keepalive。
+        tokio::time::sleep(server_idle_timeout * 3).await;
+
+        let entries = session::list_dir(&session.sftp, HOME)
+            .await
+            .expect("保活后仍应能读取目录");
+        assert!(!entries.is_empty());
+    }
+
     /// 密码错误必须变成一条可读错误，而不是挂死或 panic。
     #[tokio::test]
     async fn wrong_password_is_reported_as_error() {
         let addr = spawn().await;
-        let err = session::connect(&config_for(addr, "wrong"))
+        let err = connect_test(&config_for(addr, "wrong"))
             .await
             .err()
             .expect("密码错误必须失败");
@@ -906,7 +947,11 @@ mod tests {
         path
     }
 
-    fn config_with_key(addr: SocketAddr, path: std::path::PathBuf, passphrase: Option<&str>) -> SessionConfig {
+    fn config_with_key(
+        addr: SocketAddr,
+        path: std::path::PathBuf,
+        passphrase: Option<&str>,
+    ) -> SessionConfig {
         SessionConfig {
             host: addr.ip().to_string(),
             port: addr.port(),
@@ -924,7 +969,7 @@ mod tests {
         let addr = spawn().await;
         let path = write_key("plain", CLIENT_KEY);
 
-        let session = session::connect(&config_with_key(addr, path, None))
+        let session = connect_test(&config_with_key(addr, path, None))
             .await
             .expect("私钥认证应成功");
         assert_eq!(session.home, HOME);
@@ -937,7 +982,7 @@ mod tests {
         let addr = spawn().await;
         let path = write_key("enc-nopass", CLIENT_KEY_ENCRYPTED);
 
-        let err = session::connect(&config_with_key(addr, path, None))
+        let err = connect_test(&config_with_key(addr, path, None))
             .await
             .err()
             .expect("缺少口令必须失败");
@@ -954,13 +999,9 @@ mod tests {
         let addr = spawn().await;
         let path = write_key("enc-pass", CLIENT_KEY_ENCRYPTED);
 
-        let session = session::connect(&config_with_key(
-            addr,
-            path,
-            Some(CLIENT_KEY_PASSPHRASE),
-        ))
-        .await
-        .expect("口令正确的加密私钥应能认证");
+        let session = connect_test(&config_with_key(addr, path, Some(CLIENT_KEY_PASSPHRASE)))
+            .await
+            .expect("口令正确的加密私钥应能认证");
         assert_eq!(session.home, HOME);
     }
 
@@ -970,7 +1011,7 @@ mod tests {
         let addr = spawn().await;
         let path = write_key("enc-badpass", CLIENT_KEY_ENCRYPTED);
 
-        let err = session::connect(&config_with_key(addr, path, Some("nope")))
+        let err = connect_test(&config_with_key(addr, path, Some("nope")))
             .await
             .err()
             .expect("口令错误必须失败");
@@ -985,7 +1026,7 @@ mod tests {
         // 用主机密钥充当客户端密钥：能读、能签名，但不是服务器认可的那把。
         let path = write_key("unknown", TEST_HOST_KEY);
 
-        let err = session::connect(&config_with_key(addr, path, None))
+        let err = connect_test(&config_with_key(addr, path, None))
             .await
             .err()
             .expect("未授权的密钥必须被拒绝");
@@ -1002,7 +1043,7 @@ mod tests {
         let addr = spawn().await;
         let path = std::env::temp_dir().join("macscp-definitely-missing-key");
 
-        let err = session::connect(&config_with_key(addr, path, None))
+        let err = connect_test(&config_with_key(addr, path, None))
             .await
             .err()
             .expect("不存在的私钥必须失败");
@@ -1015,13 +1056,28 @@ mod tests {
     async fn list_dir_without_session_is_rejected() {
         let addr = spawn().await;
         // 不复用连接，直接对不存在的路径读目录：SFTP 层返回 NoSuchFile。
-        let session = session::connect(&config_for(addr, PASSWORD))
+        let session = connect_test(&config_for(addr, PASSWORD))
             .await
             .expect("连接测试服务器");
         let err = session::list_dir(&session.sftp, "/nope")
             .await
             .expect_err("不存在的目录必须失败");
         assert!(err.contains("读取目录"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn missing_remembered_directory_falls_back_to_remote_home() {
+        let addr = spawn().await;
+        let session = connect_test(&config_for(addr, PASSWORD))
+            .await
+            .expect("连接测试服务器");
+
+        let (path, entries) = session::list_dir_or_fallback(&session.sftp, "/nope", Some(HOME))
+            .await
+            .expect("不存在的历史目录应回退到登录目录");
+
+        assert_eq!(path, HOME);
+        assert!(!entries.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1035,21 +1091,36 @@ mod tests {
             .expect("事件通道不应关闭")
     }
 
+    /// 真实 worker 首次连接必须先让 UI 确认指纹；测试选择“仅本次信任”。
+    async fn connect_worker(worker: &SftpWorker, config: SessionConfig) {
+        worker.send(SftpCommand::Connect(config));
+        match next_event(worker).await {
+            SftpEvent::HostKeyPrompt(prompt) => {
+                assert!(prompt.fingerprint.starts_with("SHA256:"));
+                assert!(!prompt.algorithm.is_empty());
+                assert!(prompt.changed_line.is_none());
+            }
+            other => panic!("期望 HostKeyPrompt，实际 {other:?}"),
+        }
+        worker.send(SftpCommand::ResolveHostKey(HostKeyDecision::TrustOnce));
+        match next_event(worker).await {
+            SftpEvent::Connected { home } => assert_eq!(home, HOME),
+            other => panic!("期望 Connected，实际 {other:?}"),
+        }
+    }
+
     /// 走 worker 的完整往返：Connect → Connected，ListDir → DirListed。
     #[tokio::test]
     async fn worker_round_trip_connect_and_list() {
         let addr = spawn().await;
         let worker = SftpWorker::spawn();
 
-        worker.send(SftpCommand::Connect(config_for(addr, PASSWORD)));
-        match next_event(&worker).await {
-            SftpEvent::Connected { home } => assert_eq!(home, HOME),
-            other => panic!("期望 Connected，实际 {other:?}"),
-        }
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
 
         worker.send(SftpCommand::ListDir {
             request_id: 7,
             path: HOME.to_string(),
+            fallback: None,
         });
         match next_event(&worker).await {
             SftpEvent::DirListed {
@@ -1064,6 +1135,46 @@ mod tests {
             }
             other => panic!("期望 DirListed，实际 {other:?}"),
         }
+    }
+
+    /// 右键编辑的完整链路：读取 UTF-8、保存、保留权限，且不遗留临时文件。
+    #[tokio::test]
+    async fn worker_round_trip_read_and_write_text() {
+        const PATH: &str = "/home/tester/macscp-worker-edit.txt";
+        let _guard = vfs_lock().lock_owned().await;
+        vfs_reset().await;
+        vfs_write(PATH, b"before\n").await;
+        vfs_set_mode(PATH, 0o100_640).await;
+
+        let addr = spawn().await;
+        let worker = SftpWorker::spawn();
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
+
+        worker.send(SftpCommand::ReadText {
+            path: PATH.to_string(),
+        });
+        match next_event(&worker).await {
+            SftpEvent::TextLoaded { path, content } => {
+                assert_eq!(path, PATH);
+                assert_eq!(content, "before\n");
+            }
+            other => panic!("期望 TextLoaded，实际 {other:?}"),
+        }
+
+        worker.send(SftpCommand::WriteText {
+            path: PATH.to_string(),
+            content: "修改后\nsecond line\n".to_string(),
+        });
+        match next_event(&worker).await {
+            SftpEvent::TextSaved { path } => assert_eq!(path, PATH),
+            other => panic!("期望 TextSaved，实际 {other:?}"),
+        }
+
+        assert_eq!(
+            vfs_read(PATH).await.as_deref(),
+            Some("修改后\nsecond line\n".as_bytes())
+        );
+        assert_eq!(vfs_mode(PATH).await, Some(0o100_640), "原权限必须保留");
     }
 
     /// 连不上时必须收到带 `Connect` 上下文的 Error，而不是线程静默死掉。
@@ -1084,6 +1195,27 @@ mod tests {
             }
             other => panic!("期望 Error，实际 {other:?}"),
         }
+    }
+
+    /// SFTP 的 rmdir 只能删空目录，应用层删除目录必须先递归清空子项。
+    #[tokio::test]
+    async fn remove_non_empty_remote_directory_recursively() {
+        let ctx = connect_and_dir("remove-dir").await;
+        const ROOT: &str = "/home/tester/remove-me";
+        const NESTED: &str = "/home/tester/remove-me/nested";
+        const FILE: &str = "/home/tester/remove-me/nested/file.txt";
+
+        vfs_mkdir(ROOT).await;
+        vfs_mkdir(NESTED).await;
+        vfs_write(FILE, b"delete me").await;
+
+        session::remove(&ctx.active.sftp, ROOT, true)
+            .await
+            .expect("非空远端目录应递归删除");
+
+        assert!(!vfs_exists(FILE).await);
+        assert!(!vfs_exists(NESTED).await);
+        assert!(!vfs_exists(ROOT).await);
     }
 
     // -----------------------------------------------------------------------
@@ -1117,7 +1249,8 @@ mod tests {
     /// 远端路径还会互相覆盖 —— 这个坑真的踩到过（续传起点变成别的用例的长度）。
     fn vfs_lock() -> Arc<tokio::sync::Mutex<()>> {
         static LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// 一个用例独占的上下文：`_vfs_guard` 活到用例结束，天然完成串行化。
@@ -1132,7 +1265,7 @@ mod tests {
         let guard = vfs_lock().lock_owned().await;
         let addr = spawn().await;
         vfs_reset().await;
-        let active = session::connect(&config_for(addr, PASSWORD))
+        let active = connect_test(&config_for(addr, PASSWORD))
             .await
             .expect("连接测试服务器");
         TestCtx {
@@ -1178,13 +1311,19 @@ mod tests {
         let mut saw_started = false;
         for event in &events {
             match event {
-                SftpEvent::TransferStarted { id, resumed_from, total } => {
+                SftpEvent::TransferStarted {
+                    id,
+                    resumed_from,
+                    total,
+                } => {
                     assert_eq!(*id, 1);
                     assert_eq!(*resumed_from, 0, "没有半成品时不该续传");
                     assert_eq!(*total, BIG_LEN as u64);
                     saw_started = true;
                 }
-                SftpEvent::TransferProgress { transferred, total, .. } => {
+                SftpEvent::TransferProgress {
+                    transferred, total, ..
+                } => {
                     assert!(*transferred >= progress, "已传输字节数不能回退");
                     progress = *transferred;
                     assert_eq!(*total, BIG_LEN as u64);
@@ -1203,7 +1342,7 @@ mod tests {
         assert_same_bytes(&actual, &expected);
     }
 
-    /// 断点续传下载：本地已有 100 KiB，第二次只应传剩下的 412 KiB。
+    /// 断点续传下载：身份标记匹配的 `.filepart` 已有 100 KiB，只补剩余部分。
     #[tokio::test]
     async fn download_resumes_from_partial_local_file() {
         let ctx = connect_and_dir("dl-resume").await;
@@ -1214,8 +1353,14 @@ mod tests {
         };
 
         let local = ctx.dir.join("big.bin");
-        // 先手动造一个 100 KiB 的半成品（内容取自动生成的正确前缀）。
-        std::fs::write(&local, &expected[..100 * 1024]).expect("写半成品");
+        transfer::seed_download_checkpoint_for_test(
+            &ctx.active.sftp,
+            BIG_NAME,
+            &local,
+            &expected[..100 * 1024],
+        )
+        .await
+        .expect("写带身份标记的下载断点");
 
         let (tx, rx) = flume::unbounded::<SftpEvent>();
         transfer::run_download(
@@ -1410,11 +1555,7 @@ mod tests {
         std::fs::write(&local, b"new content").expect("写本地文件");
 
         let worker = SftpWorker::spawn();
-        worker.send(SftpCommand::Connect(config_for(addr, PASSWORD)));
-        match next_event(&worker).await {
-            SftpEvent::Connected { .. } => {}
-            other => panic!("期望 Connected，实际 {other:?}"),
-        }
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
 
         worker.send(SftpCommand::Upload {
             id: 42,
@@ -1460,6 +1601,55 @@ mod tests {
         );
     }
 
+    /// 外部编辑器保存属于同一文件的回写：必须直接安全覆盖，不能再弹冲突框。
+    #[tokio::test]
+    async fn worker_external_edit_overwrites_without_prompt() {
+        let _guard = vfs_lock().lock_owned().await;
+        let addr = spawn().await;
+        vfs_reset().await;
+
+        const REMOTE: &str = "/home/tester/external-edit.bin";
+        vfs_write(REMOTE, b"before").await;
+        vfs_set_mode(REMOTE, 0o100_640).await;
+
+        let local = temp_dir("external-edit").join("external-edit.bin");
+        std::fs::write(&local, b"after\0binary").expect("写编辑缓存");
+
+        let worker = SftpWorker::spawn();
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
+        worker.send(SftpCommand::UploadOverwrite {
+            id: 43,
+            local,
+            remote: REMOTE.to_string(),
+            total: 12,
+        });
+
+        loop {
+            match next_event(&worker).await {
+                SftpEvent::TransferStarted { id, .. } | SftpEvent::TransferProgress { id, .. } => {
+                    assert_eq!(id, 43)
+                }
+                SftpEvent::TransferCompleted { id, outcome } => {
+                    assert_eq!(id, 43);
+                    assert_eq!(outcome, TransferOutcome::Completed);
+                    break;
+                }
+                SftpEvent::UploadConflict(_) => panic!("编辑回写不应再次询问覆盖"),
+                other => panic!("意外事件：{other:?}"),
+            }
+        }
+
+        assert_eq!(
+            vfs_read(REMOTE).await.as_deref(),
+            Some(&b"after\0binary"[..])
+        );
+        assert_eq!(
+            vfs_mode(REMOTE).await.map(|mode| mode & 0o7777),
+            Some(0o640)
+        );
+        assert!(!vfs_exists(&format!("{REMOTE}.filepart")).await);
+    }
+
     /// worker：上传还在等冲突确认时点取消，必须立刻变成 Cancelled，
     /// 而且之后不管用户再点「覆盖」都不会再写字节。
     ///
@@ -1478,11 +1668,7 @@ mod tests {
         std::fs::write(&local, b"new content").expect("写本地文件");
 
         let worker = SftpWorker::spawn();
-        worker.send(SftpCommand::Connect(config_for(addr, PASSWORD)));
-        match next_event(&worker).await {
-            SftpEvent::Connected { .. } => {}
-            other => panic!("期望 Connected，实际 {other:?}"),
-        }
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
 
         worker.send(SftpCommand::Upload {
             id: 7,
@@ -1532,6 +1718,44 @@ mod tests {
         );
     }
 
+    /// 断开连接必须结束仍在等待冲突选择的任务，并为队列发出最终状态。
+    #[tokio::test]
+    async fn disconnect_cancels_pending_upload_and_emits_completion() {
+        let _guard = vfs_lock().lock_owned().await;
+        let addr = spawn().await;
+        vfs_reset().await;
+
+        const REMOTE: &str = "/home/tester/disconnect-pending.txt";
+        vfs_write(REMOTE, b"keep").await;
+        let local = temp_dir("disconnect-pending").join("disconnect-pending.txt");
+        std::fs::write(&local, b"new").expect("写本地文件");
+
+        let worker = SftpWorker::spawn();
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
+        worker.send(SftpCommand::Upload {
+            id: 8,
+            local,
+            remote: REMOTE.to_string(),
+            total: 3,
+            resume: true,
+        });
+        assert!(matches!(
+            next_event(&worker).await,
+            SftpEvent::UploadConflict(_)
+        ));
+
+        worker.send(SftpCommand::Disconnect);
+        match next_event(&worker).await {
+            SftpEvent::TransferCompleted { id, outcome } => {
+                assert_eq!(id, 8);
+                assert_eq!(outcome, TransferOutcome::Cancelled);
+            }
+            other => panic!("断连应先结束待决任务，实际 {other:?}"),
+        }
+        assert!(matches!(next_event(&worker).await, SftpEvent::Disconnected));
+        assert_eq!(vfs_read(REMOTE).await.as_deref(), Some(&b"keep"[..]));
+    }
+
     /// 用户选「断点续传」时，只补 `.filepart` 后面的字节，写完再原子替换。
     ///
     /// 这条用例顶替「手点弹窗按钮」的手工验证：`UploadConflict` → `ResolveUpload`
@@ -1553,11 +1777,7 @@ mod tests {
         std::fs::write(&local, &payload).expect("写本地文件");
 
         let worker = SftpWorker::spawn();
-        worker.send(SftpCommand::Connect(config_for(addr, PASSWORD)));
-        match next_event(&worker).await {
-            SftpEvent::Connected { .. } => {}
-            other => panic!("期望 Connected，实际 {other:?}"),
-        }
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
 
         worker.send(SftpCommand::Upload {
             id: 77,
@@ -1617,11 +1837,7 @@ mod tests {
         vfs_reset().await;
 
         let worker = SftpWorker::spawn();
-        worker.send(SftpCommand::Connect(config_for(addr, PASSWORD)));
-        match next_event(&worker).await {
-            SftpEvent::Connected { .. } => {}
-            other => panic!("期望 Connected，实际 {other:?}"),
-        }
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
 
         let dir = temp_dir("apply-all");
         let mut ids = Vec::new();
@@ -1669,16 +1885,14 @@ mod tests {
         }
 
         for name in ["a.bin", "b.bin"] {
-            let stored = vfs_read(&format!("{HOME}/{name}"))
-                .await
-                .expect("应已上传");
+            let stored = vfs_read(&format!("{HOME}/{name}")).await.expect("应已上传");
             assert_same_bytes(&stored, &vec![7u8; 4096]);
         }
     }
 
-    /// 取消：传输必须停在原地并保留半成品，这样下次才能续传。
+    /// 任务在开始前已经取消：不应创建目标或半成品。
     #[tokio::test]
-    async fn cancel_keeps_partial_file() {
+    async fn preset_cancel_does_not_touch_local_files() {
         let ctx = connect_and_dir("cancel").await;
         seed_big_file().await;
 
@@ -1706,7 +1920,11 @@ mod tests {
             other => panic!("期望 TransferCompleted(Cancelled)，实际 {other:?}"),
         }
 
-        assert!(local.exists(), "半成品必须保留，否则无法续传");
+        assert!(!local.exists(), "取消前目标文件不应出现");
+        assert!(
+            !transfer::local_filepart_path(&local).exists(),
+            "取消前半成品也不应出现"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1764,15 +1982,24 @@ mod tests {
         let mut outcome = TransferOutcome::Failed("没有收到结论".to_string());
         for event in rx.drain() {
             match event {
-                SftpEvent::TransferStarted { id: got, total: t, .. } => {
+                SftpEvent::TransferStarted {
+                    id: got, total: t, ..
+                } => {
                     assert_eq!(got, id);
                     total = t;
                 }
-                SftpEvent::TransferProgress { id: got, transferred, .. } => {
+                SftpEvent::TransferProgress {
+                    id: got,
+                    transferred,
+                    ..
+                } => {
                     assert_eq!(got, id);
                     progress = transferred;
                 }
-                SftpEvent::TransferCompleted { id: got, outcome: o } => {
+                SftpEvent::TransferCompleted {
+                    id: got,
+                    outcome: o,
+                } => {
                     assert_eq!(got, id);
                     outcome = o;
                 }
@@ -1864,18 +2091,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ctx.dir);
     }
 
-    /// 整批上传自动续传上次留下的 `.filepart`（只比长度、不比内容，
-    /// 和单文件续传同一个前提）。
+    /// 整批上传不能自动信任仅长度匹配的旧 `.filepart`，必须从头安全覆盖。
     #[tokio::test]
-    async fn upload_dir_continues_from_a_leftover_filepart() {
+    async fn upload_dir_overwrites_an_untrusted_leftover_filepart() {
         let ctx = connect_and_dir("up-dir-resume").await;
         const REMOTE: &str = "/home/tester/resume";
 
         let (local, files) = seed_dist(&ctx.dir);
         let target = format!("{REMOTE}/sub/deep/c.bin");
 
-        // 上次传到 100 KiB 就断了。故意写入**错的内容**：只有它出现在最终文件
-        // 的前半段，才能证明这次是从 100 KiB 接着写，而不是从头重传。
+        // 故意造一份长度合理但内容错误的旧断点；按长度续传会生成混合损坏文件。
         vfs_write(&format!("{target}.filepart"), &[0xFFu8; 100 * 1024]).await;
 
         let (_, _, outcome) =
@@ -1884,12 +2109,7 @@ mod tests {
 
         let stored = vfs_read(&target).await.expect("远端应有这个文件");
         let original = &files[2].1;
-        assert_eq!(stored.len(), original.len(), "长度应和本地一致");
-        assert!(
-            stored[..100 * 1024].iter().all(|byte| *byte == 0xFF),
-            "前半段应来自半成品 —— 说明真的续传了"
-        );
-        assert_same_bytes(&stored[100 * 1024..], &original[100 * 1024..]);
+        assert_same_bytes(&stored, original);
 
         let _ = std::fs::remove_dir_all(&ctx.dir);
     }
@@ -1911,7 +2131,10 @@ mod tests {
         match outcome {
             TransferOutcome::Failed(message) => {
                 assert!(message.contains("sub"), "错误里应点出是哪个目录：{message}");
-                assert!(message.contains("2 处失败"), "sub 和 sub/deep 各一处：{message}");
+                assert!(
+                    message.contains("2 处失败"),
+                    "sub 和 sub/deep 各一处：{message}"
+                );
             }
             other => panic!("期望 Failed，实际 {other:?}"),
         }
@@ -1941,11 +2164,7 @@ mod tests {
         let expected_total: u64 = files.iter().map(|(_, data)| data.len() as u64).sum();
 
         let worker = SftpWorker::spawn();
-        worker.send(SftpCommand::Connect(config_for(addr, PASSWORD)));
-        match next_event(&worker).await {
-            SftpEvent::Connected { .. } => {}
-            other => panic!("期望 Connected，实际 {other:?}"),
-        }
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
 
         worker.send(SftpCommand::UploadDir {
             id: 21,
@@ -2033,15 +2252,24 @@ mod tests {
         let mut outcome = TransferOutcome::Failed("没有收到结论".to_string());
         for event in rx.drain() {
             match event {
-                SftpEvent::TransferStarted { id: got, total: t, .. } => {
+                SftpEvent::TransferStarted {
+                    id: got, total: t, ..
+                } => {
                     assert_eq!(got, id);
                     total = t;
                 }
-                SftpEvent::TransferProgress { id: got, transferred, .. } => {
+                SftpEvent::TransferProgress {
+                    id: got,
+                    transferred,
+                    ..
+                } => {
                     assert_eq!(got, id);
                     progress = transferred;
                 }
-                SftpEvent::TransferCompleted { id: got, outcome: o } => {
+                SftpEvent::TransferCompleted {
+                    id: got,
+                    outcome: o,
+                } => {
                     assert_eq!(got, id);
                     outcome = o;
                 }
@@ -2078,11 +2306,7 @@ mod tests {
         // 空目录也得建出来：漏了它，本地结构和远端就对不上。
         for suffix in ["", "sub", "sub/deep", "empty"] {
             let path = local.join(suffix);
-            assert!(
-                path.is_dir(),
-                "缺少本地目录 {}",
-                path.display()
-            );
+            assert!(path.is_dir(), "缺少本地目录 {}", path.display());
         }
 
         let _ = std::fs::remove_dir_all(&ctx.dir);
@@ -2120,9 +2344,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ctx.dir);
     }
 
-    /// 整批下载自动续传本地那份半成品：只补后半段，不从头覆盖。
+    /// 本地预置的目录符号链接不能把递归下载引到用户选择目录之外。
+    #[cfg(unix)]
     #[tokio::test]
-    async fn download_dir_resumes_from_a_partial_file() {
+    async fn download_dir_refuses_local_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let ctx = connect_and_dir("dl-dir-symlink").await;
+        const REMOTE: &str = "/home/tester/link-escape";
+        seed_remote_tree(REMOTE).await;
+
+        let local = ctx.dir.join("link-escape");
+        let outside = ctx.dir.join("outside");
+        std::fs::create_dir_all(&local).expect("建下载根目录");
+        std::fs::create_dir_all(&outside).expect("建外部目录");
+        symlink(&outside, local.join("sub")).expect("创建测试符号链接");
+
+        let (_, _, outcome) =
+            run_folder_download(&ctx, 35, REMOTE, local.clone(), ExistingPolicy::Overwrite).await;
+
+        match outcome {
+            TransferOutcome::Failed(message) => {
+                assert!(
+                    message.contains("符号链接"),
+                    "错误应解释拒绝原因：{message}"
+                );
+            }
+            other => panic!("符号链接逃逸必须失败，实际 {other:?}"),
+        }
+        assert!(
+            !outside.join("b.txt").exists() && !outside.join("deep/c.bin").exists(),
+            "下载不能写到根目录之外"
+        );
+
+        let _ = std::fs::remove_dir_all(&ctx.dir);
+    }
+
+    /// 已有目标文件不能被误当成断点；覆盖必须重新下载并得到远端的完整内容。
+    #[tokio::test]
+    async fn download_dir_replaces_existing_target_safely() {
         let ctx = connect_and_dir("dl-dir-resume").await;
         const REMOTE: &str = "/home/tester/resume";
 
@@ -2130,8 +2390,8 @@ mod tests {
         let local = ctx.dir.join("resume");
         std::fs::create_dir_all(local.join("sub/deep")).expect("建本地目录");
 
-        // 上次下到 100 KiB 就断了。故意写入**错的内容**：只有它留在最终文件的前半段，
-        // 才能证明这次是从 100 KiB 接着写，而不是从头重来。
+        // 故意放一个“长度像半成品、内容却错误”的目标文件。旧实现会从它末尾续写，
+        // 生成前后拼接的损坏文件；新实现必须把目标保留到完整临时文件下载完再替换。
         let target = local.join("sub/deep/c.bin");
         std::fs::write(&target, vec![0xFFu8; 100 * 1024]).expect("写半成品");
 
@@ -2141,12 +2401,7 @@ mod tests {
 
         let stored = std::fs::read(&target).expect("读下载结果");
         let original = &files[2].1;
-        assert_eq!(stored.len(), original.len(), "长度应和远端一致");
-        assert!(
-            stored[..100 * 1024].iter().all(|byte| *byte == 0xFF),
-            "前半段应保留本地半成品 —— 说明真的续传了"
-        );
-        assert_same_bytes(&stored[100 * 1024..], &original[100 * 1024..]);
+        assert_same_bytes(&stored, original);
 
         let _ = std::fs::remove_dir_all(&ctx.dir);
     }
@@ -2198,7 +2453,10 @@ mod tests {
         assert_eq!(total, 0, "扫不动就不该报出总量");
         match outcome {
             TransferOutcome::Failed(message) => {
-                assert!(message.contains(REMOTE), "错误里应点出是哪个路径：{message}");
+                assert!(
+                    message.contains(REMOTE),
+                    "错误里应点出是哪个路径：{message}"
+                );
             }
             other => panic!("期望 Failed，实际 {other:?}"),
         }
@@ -2236,7 +2494,10 @@ mod tests {
             .expect("打开 b");
 
         let names = |name: &russh_sftp::protocol::Name| -> Vec<String> {
-            name.files.iter().map(|file| file.filename.clone()).collect()
+            name.files
+                .iter()
+                .map(|file| file.filename.clone())
+                .collect()
         };
 
         // 交替读：以前第二次会拿到 EOF（空列表），现在必须各读各的。
@@ -2268,11 +2529,7 @@ mod tests {
         let local = dir.join("worker-pkg");
 
         let worker = SftpWorker::spawn();
-        worker.send(SftpCommand::Connect(config_for(addr, PASSWORD)));
-        match next_event(&worker).await {
-            SftpEvent::Connected { .. } => {}
-            other => panic!("期望 Connected，实际 {other:?}"),
-        }
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
 
         worker.send(SftpCommand::DownloadDir {
             id: 41,
@@ -2299,10 +2556,7 @@ mod tests {
         }
 
         assert_eq!(started_total, expected_total);
-        assert!(
-            local.join("sub/deep/c.bin").is_file(),
-            "整棵树都该下到本地"
-        );
+        assert!(local.join("sub/deep/c.bin").is_file(), "整棵树都该下到本地");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

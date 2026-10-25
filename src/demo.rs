@@ -115,6 +115,12 @@ fn boot() -> Result<SocketAddr, String> {
 /// 预置虚拟文件树。
 async fn seed() {
     testserver::vfs_reset().await;
+    // 给右键「编辑」留一个真正的 UTF-8 文本文件；fixture 的其他文件是伪随机字节。
+    testserver::vfs_write(
+        &format!("{}/zeta.txt", testserver::HOME),
+        b"Edit this text in macscp.\n",
+    )
+    .await;
     // 打开「上传过/预置的文件也出现在列表里」这条通道，否则传完看不见。
     testserver::enable_extra_entries();
 

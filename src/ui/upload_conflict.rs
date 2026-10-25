@@ -15,8 +15,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
-    h_flex,
-    v_flex,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -107,11 +106,7 @@ impl Render for UploadConflictPrompt {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(SharedString::from(headline)),
-                    )
+                    .child(div().text_sm().child(SharedString::from(headline)))
                     .child(
                         div()
                             .text_xs()
@@ -147,15 +142,12 @@ impl Render for UploadConflictPrompt {
                     )),
             )
             .when(can_resume, |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from(format!(
-                            "续传只补剩下的 {}，已传部分不会重来。",
-                            format_size(local_size.saturating_sub(filepart_size.unwrap_or(0)))
-                        ))),
-                )
+                this.child(div().text_xs().text_color(theme.muted_foreground).child(
+                    SharedString::from(format!(
+                        "续传只补剩下的 {}，已传部分不会重来。",
+                        format_size(local_size.saturating_sub(filepart_size.unwrap_or(0)))
+                    )),
+                ))
             })
             .when(stale_filepart, |this| {
                 this.child(

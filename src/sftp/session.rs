@@ -2,16 +2,21 @@
 //!
 //! 这个文件里的所有函数都是 `async`，且只能在 [`super::worker`] 的 Tokio runtime 上调用。
 
+use std::fmt;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use log::warn;
 use russh::client::{self, Handle};
-use russh::keys::{load_secret_key, HashAlg, PrivateKey, PrivateKeyWithHashAlg};
-use russh_sftp::client::SftpSession;
+use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, load_secret_key};
+use russh_sftp::{
+    client::{SftpSession, error::Error as SftpClientError},
+    protocol::StatusCode,
+};
 use tokio::time::timeout;
 
 use super::types::{AuthMethod, EntryKind, FileEntry, SessionConfig};
@@ -20,20 +25,218 @@ use super::types::{AuthMethod, EntryKind, FileEntry, SessionConfig};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// 认证超时：避免用户在密码错误时界面无限转圈。
 const AUTH_TIMEOUT: Duration = Duration::from_secs(20);
+/// 空闲连接的 SSH 协议级保活间隔；持续有业务数据时 russh 会自动延后发送。
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// 最长无响应时间。超过该时间说明连接已经半断，交给界面报告实际操作失败。
+const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+/// 连续无响应的保活次数上限。
+const KEEPALIVE_MAX: usize = 3;
 
-pub struct ClientHandler;
+/// 一次连接允许采用的主机密钥信任方式。
+#[derive(Clone)]
+pub enum HostKeyPolicy {
+    /// 正常连接：严格按 `~/.ssh/known_hosts` 校验。
+    KnownHosts,
+    /// 用户刚在指纹确认框里选择了信任；重连时只接受这把精确密钥。
+    Exact(PublicKey),
+}
+
+/// 需要 UI 让用户确认的主机身份。
+#[derive(Clone, Debug)]
+pub struct HostKeyChallenge {
+    pub key: PublicKey,
+    pub endpoint: String,
+    pub algorithm: String,
+    pub fingerprint: String,
+    pub changed_line: Option<usize>,
+}
+
+#[derive(Debug)]
+pub enum ConnectError {
+    HostKey(Box<HostKeyChallenge>),
+    Other(anyhow::Error),
+}
+
+impl fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HostKey(challenge) => write!(
+                f,
+                "需要确认 SSH 主机密钥：{} {}",
+                challenge.endpoint, challenge.fingerprint
+            ),
+            Self::Other(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
+impl From<anyhow::Error> for ConnectError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Other(err)
+    }
+}
+
+/// 统一生成 SSH 客户端策略，避免后续重构建连流程时意外丢掉空闲保活。
+fn ssh_client_config() -> client::Config {
+    client::Config {
+        inactivity_timeout: Some(INACTIVITY_TIMEOUT),
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: KEEPALIVE_MAX,
+        nodelay: true,
+        ..Default::default()
+    }
+}
+
+#[derive(Default)]
+struct VerificationState {
+    challenge: Option<HostKeyChallenge>,
+    error: Option<String>,
+}
+
+pub struct ClientHandler {
+    host: String,
+    port: u16,
+    policy: HostKeyPolicy,
+    verification: Arc<Mutex<VerificationState>>,
+}
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        // 说明：这里接受任意主机公钥（首次连接即信任）。
-        // 生产环境应改为与 `~/.ssh/known_hosts` 比对，或在指纹变化时向 UI 抛出确认事件。
-        Ok(true)
+        let key = server_public_key.public_key();
+        match &self.policy {
+            HostKeyPolicy::Exact(expected) => {
+                // OpenSSH 注释不属于密钥身份；测试私钥带注释，而握手报文不会带。
+                if expected.key_data() == key.key_data() {
+                    return Ok(true);
+                }
+                if let Ok(mut state) = self.verification.lock() {
+                    state.error = Some("服务器主机密钥在确认期间再次变化，已拒绝连接".to_string());
+                }
+                Ok(false)
+            }
+            HostKeyPolicy::KnownHosts => {
+                let changed_line = match russh::keys::check_known_hosts(&self.host, self.port, &key)
+                {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => None,
+                    Err(russh::keys::Error::KeyChanged { line }) => Some(line),
+                    Err(err) => {
+                        if let Ok(mut state) = self.verification.lock() {
+                            state.error = Some(format!("读取 ~/.ssh/known_hosts 失败：{err}"));
+                        }
+                        return Ok(false);
+                    }
+                };
+
+                let challenge = HostKeyChallenge {
+                    endpoint: if self.port == 22 {
+                        self.host.clone()
+                    } else {
+                        format!("[{}]:{}", self.host, self.port)
+                    },
+                    algorithm: key.algorithm().as_str().to_string(),
+                    fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+                    key,
+                    changed_line,
+                };
+                if let Ok(mut state) = self.verification.lock() {
+                    state.challenge = Some(challenge);
+                }
+                Ok(false)
+            }
+        }
     }
+}
+
+/// 把用户确认过的主机密钥写入标准 `known_hosts`。
+///
+/// 新主机走 russh 的追加逻辑；密钥变化时必须替换冲突行，否则旧行仍会让下一次连接
+/// 报 `KeyChanged`，用户刚保存的决定完全不起作用。
+pub fn remember_host_key(
+    config: &SessionConfig,
+    key: &PublicKey,
+    changed_line: Option<usize>,
+) -> Result<(), String> {
+    if changed_line.is_some() {
+        // 用户核对指纹期间文件可能被 ssh 或别的进程改过；重新定位冲突行，绝不按过期
+        // 行号覆盖一个无关主机。若别人已经写好则直接成功，条目被移除则转为追加。
+        match russh::keys::check_known_hosts(&config.host, config.port, key) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(russh::keys::Error::KeyChanged { line }) => {
+                let path = dirs::home_dir()
+                    .ok_or_else(|| "找不到用户主目录，无法更新 known_hosts".to_string())?
+                    .join(".ssh/known_hosts");
+                return replace_known_host_line(&path, line, key);
+            }
+            Err(err) => return Err(format!("重新检查 ~/.ssh/known_hosts 失败：{err}")),
+        }
+    }
+    russh::keys::known_hosts::learn_known_hosts(&config.host, config.port, key)
+        .map_err(|err| format!("写入 ~/.ssh/known_hosts 失败：{err}"))
+}
+
+fn replace_known_host_line(path: &Path, line: usize, key: &PublicKey) -> Result<(), String> {
+    let original = std::fs::read_to_string(path)
+        .map_err(|err| format!("读取 {} 失败：{err}", path.display()))?;
+    let had_final_newline = original.ends_with('\n');
+    let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+    let index = line
+        .checked_sub(1)
+        .filter(|index| *index < lines.len())
+        .ok_or_else(|| format!("known_hosts 第 {line} 行已不存在，请重新连接后再确认"))?;
+    let host_field = lines[index]
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("known_hosts 第 {line} 行格式无效"))?
+        .to_string();
+    let encoded = key
+        .to_openssh()
+        .map_err(|err| format!("编码服务器主机密钥失败：{err}"))?;
+    lines[index] = format!("{host_field} {encoded}");
+
+    let mut updated = lines.join("\n");
+    if had_final_newline {
+        updated.push('\n');
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "known_hosts 路径没有父目录".to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".known_hosts.macscp-{}-{nonce}",
+        std::process::id()
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|err| format!("创建 known_hosts 临时文件失败：{err}"))?;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            std::fs::set_permissions(&temp, metadata.permissions())
+                .map_err(|err| format!("保留 known_hosts 权限失败：{err}"))?;
+        }
+        file.write_all(updated.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|err| format!("写入 known_hosts 临时文件失败：{err}"))?;
+        std::fs::rename(&temp, path).map_err(|err| format!("替换 {} 失败：{err}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// 一条已建立的连接。`handle` 只用来“持有”SSH 会话，读不读无所谓，但必须保活。
@@ -171,10 +374,8 @@ const CONNECT_ATTEMPTS: usize = 3;
 /// 刻意很短（这类失败通常只需要「再发一个 SYN」），但也留够 ARP 重新解析的
 /// 时间 —— 只在已经失败的路径上多花这 1.6 秒，成功路径零成本。
 /// 数组长度和 [`CONNECT_ATTEMPTS`] 绑在一起：改次数忘了改等待会直接编译不过。
-const CONNECT_RETRY_DELAYS: [Duration; CONNECT_ATTEMPTS - 1] = [
-    Duration::from_millis(400),
-    Duration::from_millis(1200),
-];
+const CONNECT_RETRY_DELAYS: [Duration; CONNECT_ATTEMPTS - 1] =
+    [Duration::from_millis(400), Duration::from_millis(1200)];
 
 /// 建连失败的原始错误 + 已经试过几次。
 type ConnectFailure = (russh::Error, usize);
@@ -281,23 +482,43 @@ fn explain_connect_error(
 /// 建立 SSH 连接并打开 SFTP 子系统。
 ///
 /// 任何一步失败都会返回人类可读的错误，由 worker 转成 [`super::types::SftpEvent::Error`]。
-pub async fn connect(config: &SessionConfig) -> Result<ActiveSession> {
-    let ssh_config = Arc::new(client::Config {
-        // 传输大文件时长时间没有通道数据是正常的，交给 TCP keepalive。
-        inactivity_timeout: None,
-        nodelay: true,
-        ..Default::default()
-    });
+pub async fn connect(
+    config: &SessionConfig,
+    host_key_policy: HostKeyPolicy,
+) -> std::result::Result<ActiveSession, ConnectError> {
+    // russh 会在没有业务数据时发送 SSH keepalive；服务器的响应也会重置空闲计时。
+    connect_with_ssh_config(config, host_key_policy, Arc::new(ssh_client_config())).await
+}
+
+async fn connect_with_ssh_config(
+    config: &SessionConfig,
+    host_key_policy: HostKeyPolicy,
+    ssh_config: Arc<client::Config>,
+) -> std::result::Result<ActiveSession, ConnectError> {
+    let verification = Arc::new(Mutex::new(VerificationState::default()));
 
     let addr = (config.host.as_str(), config.port);
     // TCP + 版本交换 + 密钥交换这一段带重试（见 `is_transient_connect_error`）；
     // 后面的认证与 SFTP 握手不重试 —— 那两步失败重试也没用。
-    let mut handle = connect_with_retries(|_round| {
+    let handle_result = connect_with_retries(|_round| {
         let ssh_config = ssh_config.clone();
+        let verification = verification.clone();
+        let host_key_policy = host_key_policy.clone();
+        let host = config.host.clone();
+        let port = config.port;
         async move {
             let transport = timeout(
                 CONNECT_TIMEOUT,
-                client::connect(ssh_config, addr, ClientHandler),
+                client::connect(
+                    ssh_config,
+                    addr,
+                    ClientHandler {
+                        host,
+                        port,
+                        policy: host_key_policy,
+                        verification,
+                    },
+                ),
             )
             .await;
             match transport {
@@ -307,19 +528,34 @@ pub async fn connect(config: &SessionConfig) -> Result<ActiveSession> {
             }
         }
     })
-    .await
-    .map_err(|(err, rounds)| explain_connect_error(config, &err, rounds))?;
+    .await;
+
+    let mut handle = match handle_result {
+        Ok(handle) => handle,
+        Err((err, rounds)) => {
+            let mut state = verification
+                .lock()
+                .map_err(|_| ConnectError::Other(anyhow!("主机密钥校验状态异常，已拒绝连接")))?;
+            if let Some(challenge) = state.challenge.take() {
+                return Err(ConnectError::HostKey(Box::new(challenge)));
+            }
+            if let Some(message) = state.error.take() {
+                return Err(ConnectError::Other(anyhow!(message)));
+            }
+            return Err(ConnectError::Other(explain_connect_error(
+                config, &err, rounds,
+            )));
+        }
+    };
 
     let auth_result = match &config.auth {
-        AuthMethod::Password(password) => {
-            timeout(
-                AUTH_TIMEOUT,
-                handle.authenticate_password(config.username.clone(), password.clone()),
-            )
-            .await
-            .map_err(|_| anyhow!("认证超时"))?
-            .map_err(|err| anyhow!("认证失败：{err}"))?
-        }
+        AuthMethod::Password(password) => timeout(
+            AUTH_TIMEOUT,
+            handle.authenticate_password(config.username.clone(), password.clone()),
+        )
+        .await
+        .map_err(|_| anyhow!("认证超时"))?
+        .map_err(|err| anyhow!("认证失败：{err}"))?,
         AuthMethod::PrivateKey { path, passphrase } => {
             // `load_private_key` 内部会做路径解析（空路径 = 自动查找）、
             // 存在性检查和「加密/口令错」的翻译。
@@ -361,7 +597,8 @@ pub async fn connect(config: &SessionConfig) -> Result<ActiveSession> {
                     "私钥（公钥要加到服务器的 ~/.ssh/authorized_keys 里）".to_string()
                 }
             }
-        ));
+        )
+        .into());
     }
 
     let channel = timeout(CONNECT_TIMEOUT, handle.channel_open_session())
@@ -387,11 +624,25 @@ pub async fn connect(config: &SessionConfig) -> Result<ActiveSession> {
         .await
         .unwrap_or_else(|_| "/".to_string());
 
-    Ok(ActiveSession {
-        handle,
-        sftp,
-        home,
-    })
+    Ok(ActiveSession { handle, sftp, home })
+}
+
+/// 测试时缩短保活周期，验证真实 TCP/SSH/SFTP 空闲连接，而不用让测试等待 15 秒。
+#[cfg(test)]
+pub(crate) async fn connect_with_keepalive_for_test(
+    config: &SessionConfig,
+    host_key_policy: HostKeyPolicy,
+    interval: Duration,
+    inactivity_timeout: Duration,
+) -> std::result::Result<ActiveSession, ConnectError> {
+    let ssh_config = client::Config {
+        keepalive_interval: Some(interval),
+        keepalive_max: KEEPALIVE_MAX,
+        inactivity_timeout: Some(inactivity_timeout),
+        nodelay: true,
+        ..Default::default()
+    };
+    connect_with_ssh_config(config, host_key_policy, Arc::new(ssh_config)).await
 }
 
 /// 列出远端目录。
@@ -401,15 +652,58 @@ pub async fn connect(config: &SessionConfig) -> Result<ActiveSession> {
 /// 返回 `Err(String)` 而不是 `anyhow::Error`：这条路径上的错误会直接展示给用户，
 /// 不需要保留错误链。
 pub async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<FileEntry>, String> {
+    read_dir(sftp, path).await.map_err(|err| err.message)
+}
+
+/// 读取上次的远端目录；只有 SFTP 明确返回 `NoSuchFile` 时才改读
+/// `fallback`。权限不足、连接中断和超时仍保留原错误，不伪装成默认目录。
+pub async fn list_dir_or_fallback(
+    sftp: &SftpSession,
+    path: &str,
+    fallback: Option<&str>,
+) -> Result<(String, Vec<FileEntry>), String> {
+    match read_dir(sftp, path).await {
+        Ok(entries) => Ok((path.to_string(), entries)),
+        Err(err)
+            if err.not_found
+                && fallback.is_some_and(|fallback| !fallback.is_empty() && fallback != path) =>
+        {
+            let fallback = fallback.expect("上面已检查 fallback 存在");
+            let entries = read_dir(sftp, fallback)
+                .await
+                .map_err(|fallback_err| fallback_err.message)?;
+            Ok((fallback.to_string(), entries))
+        }
+        Err(err) => Err(err.message),
+    }
+}
+
+struct DirectoryReadError {
+    message: String,
+    not_found: bool,
+}
+
+async fn read_dir(sftp: &SftpSession, path: &str) -> Result<Vec<FileEntry>, DirectoryReadError> {
     let read_dir = sftp
         .read_dir(path)
         .await
-        .map_err(|err| format!("读取目录 {path} 失败：{err}"))?;
+        .map_err(|err| DirectoryReadError {
+            not_found: matches!(
+                err,
+                SftpClientError::Status(ref status)
+                    if status.status_code == StatusCode::NoSuchFile
+            ),
+            message: format!("读取目录 {path} 失败：{err}"),
+        })?;
 
     let mut entries = Vec::new();
     for entry in read_dir {
         let name = entry.file_name();
         if name == "." || name == ".." {
+            continue;
+        }
+        if !is_safe_entry_name(&name) {
+            warn!("跳过服务器返回的危险文件名：{name:?}");
             continue;
         }
         let meta = entry.metadata();
@@ -436,6 +730,14 @@ pub async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<FileEntry>, 
     Ok(entries)
 }
 
+/// SFTP `readdir` 的文件名必须只是一个普通路径分量。
+///
+/// 正常 Unix 文件名不会含 `/`，但恶意服务器可以伪造 `../x` 或绝对路径；如果直接
+/// 拼成本地下载目标，就会逃出用户选择的目录。
+pub fn is_safe_entry_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+}
+
 pub async fn create_dir(sftp: &SftpSession, path: &str) -> Result<(), String> {
     sftp.create_dir(path)
         .await
@@ -443,12 +745,36 @@ pub async fn create_dir(sftp: &SftpSession, path: &str) -> Result<(), String> {
 }
 
 pub async fn remove(sftp: &SftpSession, path: &str, is_dir: bool) -> Result<(), String> {
-    let result = if is_dir {
-        sftp.remove_dir(path).await
-    } else {
-        sftp.remove_file(path).await
-    };
-    result.map_err(|err| format!("删除 {path} 失败：{err}"))
+    if !is_dir {
+        return sftp
+            .remove_file(path)
+            .await
+            .map_err(|err| format!("删除 {path} 失败：{err}"));
+    }
+
+    // SFTP 的 rmdir 只接受空目录：先展开整棵树并删除文件，再自底向上删目录。
+    let mut directories = vec![path.to_string()];
+    let mut index = 0;
+    while index < directories.len() {
+        let directory = directories[index].clone();
+        for entry in list_dir(sftp, &directory).await? {
+            if entry.is_dir() {
+                directories.push(entry.path);
+            } else {
+                sftp.remove_file(&entry.path)
+                    .await
+                    .map_err(|err| format!("删除 {} 失败：{err}", entry.path))?;
+            }
+        }
+        index += 1;
+    }
+
+    for directory in directories.into_iter().rev() {
+        sftp.remove_dir(&directory)
+            .await
+            .map_err(|err| format!("删除 {directory} 失败：{err}"))?;
+    }
+    Ok(())
 }
 
 pub async fn rename(sftp: &SftpSession, from: &str, to: &str) -> Result<(), String> {
@@ -551,10 +877,29 @@ mod tests {
     use crate::sftp::types::SessionConfig;
 
     #[test]
+    fn ssh_client_config_keeps_idle_connections_alive() {
+        let config = ssh_client_config();
+
+        assert_eq!(config.keepalive_interval, Some(Duration::from_secs(15)));
+        assert_eq!(config.keepalive_max, 3);
+        assert_eq!(config.inactivity_timeout, Some(Duration::from_secs(60)));
+        assert!(config.nodelay);
+    }
+
+    #[test]
     fn join_remote_never_double_slashes() {
         assert_eq!(join_remote("/", "etc"), "/etc");
         assert_eq!(join_remote("/home/zy", "docs"), "/home/zy/docs");
         assert_eq!(join_remote("/home/zy/", "docs"), "/home/zy/docs");
+    }
+
+    #[test]
+    fn entry_names_must_be_single_safe_components() {
+        assert!(is_safe_entry_name("report.txt"));
+        assert!(is_safe_entry_name("a\\b"), "反斜杠在 Unix 上是普通字符");
+        for unsafe_name in ["", ".", "..", "../secret", "a/b", "a/", "/tmp/owned"] {
+            assert!(!is_safe_entry_name(unsafe_name), "应拒绝 {unsafe_name:?}");
+        }
     }
 
     #[test]
@@ -613,7 +958,7 @@ mod tests {
         };
 
         let started = std::time::Instant::now();
-        let result = connect(&config).await;
+        let result = connect(&config, HostKeyPolicy::KnownHosts).await;
         let elapsed = started.elapsed();
 
         let err = result.err().expect("连接关闭端口必须失败");
@@ -785,5 +1130,41 @@ mod tests {
             resolve_key_path(&explicit).expect("显式路径不该被改写"),
             explicit
         );
+    }
+
+    #[test]
+    fn changed_known_host_line_is_replaced_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "macscp-known-hosts-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join("known_hosts");
+        let old =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICI3sgKh1PV+Banw9IaXhAEMKHTyAhBmRyx8MEhL3rdo";
+        let new =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICaEpv0wklfEupBq0hro0QrkwY2Mci/5DVHF4JVqTOjQ";
+        std::fs::write(
+            &path,
+            format!("other.example {old}\nexample.com,alias.example {old}\n"),
+        )
+        .expect("写 known_hosts");
+        let key = PublicKey::from_openssh(new).expect("解析新主机密钥");
+
+        replace_known_host_line(&path, 2, &key).expect("替换冲突行");
+
+        let updated = std::fs::read_to_string(&path).expect("读回 known_hosts");
+        assert!(updated.starts_with(&format!("other.example {old}\n")));
+        assert!(updated.contains(&format!("example.com,alias.example {new}\n")));
+        assert!(!updated.contains(".known_hosts.macscp"));
+        assert!(
+            russh::keys::check_known_hosts_path("example.com", 22, &key, &path)
+                .expect("校验 known_hosts"),
+            "保存后的下一次连接应直接通过"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

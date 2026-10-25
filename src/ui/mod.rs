@@ -2,6 +2,7 @@
 
 pub mod app_icon;
 pub mod file_pane;
+#[allow(dead_code)]
 pub mod mock;
 pub mod toolbar;
 pub mod transfer_panel;

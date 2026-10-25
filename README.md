@@ -33,7 +33,7 @@
 ```bash
 cargo run                                  # 调试构建
 cargo run --features demo-server           # 带内置假服务器，启动即自动连上
-cargo test                                 # 77 个用例，含一个跑真实 SSH 握手的进程内 SFTP 服务器
+cargo test --all-features                  # 84 个用例，含真实 SSH/SFTP 进程内端到端测试
 cargo test keychain_round_trip -- --ignored   # 真的读写一次 macOS 钥匙串
 ```
 
@@ -48,13 +48,17 @@ cargo test keychain_round_trip -- --ignored   # 真的读写一次 macOS 钥匙�
 工具栏右侧的钥匙图标切换「密码 / 私钥」认证；切到私钥后路径留空即可，worker 会按
 `~/.ssh/id_ed25519` → `id_ecdsa` → `id_rsa` 的顺序自动找一个。
 
+首次连接会显示服务器算法与 SHA-256 主机密钥指纹；核对后可选择「仅本次信任」或
+「信任并保存」到标准 `~/.ssh/known_hosts`。已保存密钥发生变化时会显示安全警告并默认
+突出「拒绝连接」，未经明确确认不会继续认证。所有确认都使用应用内模态框。
+
 **表格交互**（两侧一致）：
 
 | 操作 | 效果 |
 | --- | --- |
 | 双击文件夹行 | 进入该目录并刷新列表 |
 | 双击 `..` 行 / 点标题栏的 ↑ | 返回上一级（根目录时该行不出现） |
-| 双击文件行 | 本地 → 上传到当前远程目录；远端 → 下载到当前本地目录 |
+| 双击文件行 | 按设置中的编辑方式打开；远端文件使用编辑缓存，保存后自动同步 |
 | 右键文件行 | 本地：`上传到当前远程目录`；远端：`下载到当前本地目录` / `重命名…` / `删除` |
 | 右键文件夹行 | 本地：`上传文件夹到当前远程目录`；远端：`下载文件夹到当前本地目录` —— 两侧都是整棵递归传，先问一次「同名文件覆盖还是跳过」 |
 | 面包屑 | 点任意一级直接跳过去（当前目录不可点） |
@@ -76,7 +80,8 @@ cargo run --features demo-server
 
 这个特性把 `src/sftp/testserver.rs` 里那个进程内 SFTP 服务器一起编进二进制：
 监听 `127.0.0.1` 的随机端口，账号 `tester` / `s3cret`，家目录 `/home/tester`，
-文件树在内存里（不写磁盘，退出即丢）。启动后表单已经填好并自动连接：
+文件树在内存里（不写磁盘，退出即丢）。启动后表单会自动填好并发起连接；首次运行会先
+显示回环测试服务器的主机指纹，选「仅本次信任」即可进入工作区（不会污染 known_hosts）：
 
 ![演示模式](docs/demo-connected.png)
 
@@ -123,8 +128,9 @@ MACSCP_DEMO_UPLOAD=1 cargo run --features demo-server
 | 分块流式 | 每次 64 KiB（`CHUNK_SIZE`），全程不把文件读进内存 |
 | 实时速率 | worker 侧 `Speedometer` 算（指数滑动平均），随进度事件一起送到 UI |
 | 进度节流 | 每 100ms 最多一条 `TransferProgress`，结束前补一条终值 |
-| 断点续传 | 两端各看已有字节数，从短的那头接着传；半成品不删 |
-| 取消 | 队列每行右侧 ✕ → `SftpCommand::Cancel(id)` → `AtomicBool`，循环下一轮退出 |
+| 断点续传 | 上传续写远端 `.filepart`；下载只续写身份标记匹配的本地 `.filepart` |
+| 取消 | `AtomicBool` + 50ms 异步取消分支，可打断正在等待的网络 I/O |
+| 下载落盘 | 先写 `<目标>.filepart`，刷盘并复核远端身份后再原子替换目标 |
 
 ### 上传：临时文件 + 原子替换
 
@@ -165,15 +171,15 @@ MACSCP_DEMO_UPLOAD=1 cargo run --features demo-server
 
 | 场景 | 行为 |
 | --- | --- |
-| 下载：本地 0 < L < 远端 N | 从 L 接着传，UI 显示「续传 · 已有 L」 |
-| 下载：本地 L == 远端 N | 视为已传完，直接标记完成 |
-| 下载：本地 L > 远端 N | 内容对不上，重头传 |
+| 下载：匹配当前远端路径、大小、修改时间的 `.filepart` 长度 L < N | 从 L 接着传 |
+| 下载：标记缺失、损坏或远端身份变化 | 截断临时文件，从头下载 |
+| 下载：已有最终目标文件 | 保持不动；完整下载到临时文件后才替换 |
 | 上传：`.filepart` 0 < L < 本地 N | 从 L 接着传（远端写指针也 seek 到 L） |
 | 上传：`.filepart` L == 本地 N | 按规范重传：长度相等不证明内容相同 |
 | 上传：`.filepart` L > 本地 N | 本地换过文件了，重传 |
 
-取消时**保留** `.filepart` —— 那正是下次续传的起点。目录里因此可能看到
-`xxx.filepart`，传完或删除源文件后它会消失。
+取消时**保留** `.filepart` 和下载身份标记 —— 那正是下次安全续传的起点。传输完成后
+临时文件会被原子替换，标记随即删除。远端在下载过程中变化时不会覆盖本地目标。
 
 ### 冲突确认：覆盖 / 续传 / 跳过
 
@@ -228,8 +234,8 @@ MACSCP_DEMO_UPLOAD=1 MACSCP_DEMO_RESUME=1 cargo run --features demo-server
   上传：scan 本地树 ─▶ mkdir -p 远端目录 ─▶ 逐个文件走单文件那套
         （blocking 池）   （已存在算成功）      （探针 → .filepart → 原子替换）
                │
-  下载：scan 远端树 ─▶ create_dir_all 本地目录 ─▶ 逐个文件走单文件那套
-        （一路 read_dir）  （含空目录）            （探针 → 从断点接着写）
+  下载：scan 远端树 ─▶ 逐级校验/创建本地目录 ─▶ 逐个文件走单文件那套
+        （一路 read_dir）  （拒绝符号链接逃逸）       （.filepart → 复核 → 原子替换）
                │
                └─ 进度按整批字节汇总 → 队列那一行
 ```
@@ -251,10 +257,13 @@ MACSCP_DEMO_UPLOAD=1 MACSCP_DEMO_RESUME=1 cargo run --features demo-server
 
 两个方向各自怎么「接着上次」：
 
-- **上传**：`.filepart` 那套在整批里照旧生效 —— 上次传到一半取消，再传同一个文件夹时，
-  每个文件各自从自己的 `.filepart` 长度接着写，不需要重新问一遍。
-- **下载**：本地那个文件比远端短就从它末尾接着写（追加模式），比远端长或一样长就重头来。
-  半成品就是本地文件本身，所以取消之后它仍然在那儿，下次点「覆盖同名文件」就续上了。
+- **上传**：整批没有逐文件核对断点的步骤，所以残留 `.filepart` 会从头安全覆盖；单文件
+  上传仍可在冲突模态框中明确选择「断点续传」。
+- **下载**：半成品独立放在 `<目标>.filepart`，旁边的身份标记记录远端路径、大小和修改时间；
+  三者匹配才追加续传。已有目标文件不参与续传，下载完整且远端未变化后才被替换。
+
+远端 `readdir` 返回的名称必须是单个普通路径分量；递归下载在本地也逐级拒绝符号链接，
+所以恶意服务器不能用 `../`、绝对路径或预置链接把文件写出用户选择的目录。
 
 远端树是**一路 `read_dir` 扫出来的**，每一步都是网络往返，所以放在 runtime 上 `await`
 （`remote_tree::scan`），不能像本地扫描那样丢进 blocking 池 —— 那里没有 reactor。
@@ -361,20 +370,22 @@ Finder 显示的都是系统给「Unix 可执行文件」的那张通用图。�
 | `SftpCommand` | 载荷 | 说明 |
 | --- | --- | --- |
 | `Connect` | `SessionConfig` | 建 SSH 会话 + 认证 + 打开 sftp 子系统 |
+| `ResolveHostKey` | `Reject` / `TrustOnce` / `TrustAndSave` | 回答主机指纹模态框；保存到 `known_hosts` 前不会认证 |
 | `ListDir` | `request_id`, `path` | `request_id` 由 UI 自增，用来丢弃迟到的响应 |
-| `Download` | `id`, 路径, `total`, `resume` | `resume` 为 true 时先探测两端长度再决定偏移 |
+| `Download` | `id`, 路径, `total`, `resume` | 只续写身份标记匹配的本地 `.filepart`，完成后原子替换 |
 | `Upload` | `id`, 路径, `total`, `resume` | 永远先写 `<目标>.filepart`；有冲突时先发 `UploadConflict` |
 | `UploadDir` | `id`, 本地根, 远端目标, `on_existing` | 整棵递归上传；队列里只占一行，策略整批问一次 |
-| `DownloadDir` | `id`, 远端根, 本地目标, `on_existing` | 整棵递归下载；与 `UploadDir` 完全对称，续传走本地文件长度 |
+| `DownloadDir` | `id`, 远端根, 本地目标, `on_existing` | 整棵递归下载；逐级拒绝符号链接，文件走安全临时落盘 |
 | `ResolveUpload` | `id`, `decision`, `apply_to_all` | 回答冲突：`Resume` / `Overwrite` / `Skip` |
 | `Mkdir` | `path` | 成功回 `Notice` |
-| `Remove` | `path`, `is_dir` | 目录走 `rmdir`，文件走 `remove_file` |
+| `Remove` | `path`, `is_dir` | 文件走 `remove_file`；目录先递归清空，再自底向上 `rmdir` |
 | `Rename` | `from`, `to` | 已实现，右键菜单「重命名…」是它的入口 |
 | `Cancel` / `Disconnect` / `Shutdown` | — | 控制指令 |
 
 | `SftpEvent` | 载荷 | 说明 |
 | --- | --- | --- |
 | `Connected` | `home` | `home` 来自服务器 `realpath(".")` |
+| `HostKeyPrompt` | 端点、算法、SHA-256 指纹、冲突行 | 首次连接或主机密钥变化，等待应用内模态框确认 |
 | `DirListed` | `request_id`, `path`, `entries` | 已排序，元数据齐备 |
 | `TransferStarted` | `id`, `resumed_from`, `total` | `resumed_from > 0` 表示这是续传 |
 | `TransferProgress` | `id`, `transferred`, `total`, `speed` | 100ms 节流，`speed` 是字节/秒 |
@@ -498,7 +509,7 @@ russh 服务端 + `russh_sftp::server::run`，虚拟文件树固定在 `/home/te
 | 用例 | 验证什么 |
 | --- | --- |
 | `download_streams_file_and_reports_progress` | 逐字节一致、进度单调不回退、终值等于总大小 |
-| `download_resumes_from_partial_local_file` | 本地已有 100 KiB 时从 100 KiB 接着传，结果完整 |
+| `download_resumes_from_partial_local_file` | 身份标记匹配的 `.filepart` 已有 100 KiB 时安全续传 |
 | `upload_then_download_round_trip` | 内容原样落地，`.filepart` 必须被 rename 掉 |
 | `upload_resumes_from_partial_filepart` | `.filepart` 已有 50 KiB 时只补剩下的部分 |
 | `upload_overwrites_and_keeps_mode` | 覆盖后内容更新，0755 可执行位从原文件继承 |
@@ -506,7 +517,8 @@ russh 服务端 + `russh_sftp::server::run`，虚拟文件树固定在 `/home/te
 | `worker_asks_before_overwriting` | 有同名文件先发 `UploadConflict`；选「跳过」原文件一字不改 |
 | `worker_resumes_when_user_picks_resume` | 选「断点续传」后 `resumed_from` = 半成品长度，写完内容正确且 `.filepart` 消失 |
 | `apply_to_all_resolves_every_pending_upload` | 一次 `apply_to_all` 把所有在等决定的上传都处理掉 |
-| `cancel_keeps_partial_file` | 取消后状态是 `Cancelled`，半成品保留 |
+| `disconnect_cancels_pending_upload_and_emits_completion` | 断连会结束待确认任务并给队列最终状态 |
+| `preset_cancel_does_not_touch_local_files` | 开始前取消不会创建目标文件或半成品 |
 | `speedometer_converges_to_real_rate` / `resume_offset_*` / `upload_resume_*` / `throttle_*` / `filepart_sits_*` | 速率、续传偏移、临时文件路径、节流的纯逻辑 |
 
 整目录传输（同样是真协议、真虚拟磁盘）：
@@ -517,20 +529,22 @@ russh 服务端 + `russh_sftp::server::run`，虚拟文件树固定在 `/home/te
 | `scan_skips_symlinks` | 符号链接（含环形链接）跳过并计数 |
 | `scan_includes_hidden_files` | `.env` 这类文件不能被「显示隐藏文件」的开关牵连 |
 | `absorb_sorts_entries_into_dirs_files_and_skips` | 远端扫描：目录/文件分开、相对路径前缀、跳过的项计数 |
+| `absorb_rejects_server_names_that_escape_the_root` | 拒绝服务器伪造的 `../` 与绝对路径名称 |
 | `absorb_stops_at_the_depth_cap` | 深度到顶就不再往下扫（服务器把目录链接报成目录时的刹车） |
 | `upload_dir_creates_nested_tree` | 三层目录 + 空目录 + 3 个文件全部到位，`.filepart` 都消失了，传完还能 `list_dir` 进去 |
 | `upload_dir_skips_existing_files` | 选「跳过同名」时远端旧内容一字不改，其余照传 |
 | `upload_dir_keeps_going_when_one_subdirectory_fails` | 某个子目录建不出来时，其余部分照传，失败只记该目录 |
-| `upload_dir_continues_from_a_leftover_filepart` | 残留 `.filepart` 自动续传（前半段来自半成品，证明没从头重传） |
+| `upload_dir_overwrites_an_untrusted_leftover_filepart` | 长度合理但内容错误的旧 `.filepart` 会被安全重写，不产生混合文件 |
 | `worker_uploads_a_whole_folder` | 走 actor 链路：`UploadDir` → 一串进度事件 → `TransferCompleted`，id 全程一致 |
 | `download_dir_creates_nested_tree` | 三层目录 + 空目录 + 3 个文件全部落到本地，字节逐一对上 |
 | `download_dir_skips_existing_files` | 选「跳过同名」时本地旧内容一字不改，其余照下 |
-| `download_dir_resumes_from_a_partial_file` | 本地半成品的前 100 KiB 保留，只补后半段 |
+| `download_dir_replaces_existing_target_safely` | 错误前缀的现有目标不会被当作断点，最终内容与远端一致 |
+| `download_dir_refuses_local_symlink_escape` | 本地预置符号链接不能把下载写出目标根目录 |
 | `download_dir_honours_a_preset_cancel_flag` | 取消标志预置为真时一个文件都不下，结论是 `Cancelled` |
 | `download_dir_reports_a_missing_remote_root` | 远端根不存在时报错（带路径），不会安静地传个空目录 |
 | `worker_downloads_a_whole_folder` | 走 actor 链路：`DownloadDir` → 一串进度事件 → `TransferCompleted`，id 全程一致 |
 
-UI 层能脱离窗口验证的部分也都有用例（`cargo test` 共 77 个）：
+UI 层能脱离窗口验证的部分也都有用例（`cargo test --all-features` 共 84 个）：
 
 | 用例 | 验证什么 |
 | --- | --- |
@@ -561,21 +575,18 @@ UI 层能脱离窗口验证的部分也都有用例（`cargo test` 共 77 个）
   报成目录」导致扫描无限往下的刹车。到顶的目录只建出来、不往下扫，个数记在日志里。
 - 整目录传输没有排除规则：`node_modules` / `.git` 这类目录会照传，传之前自己掂量。
 - 整目录传输的进度按**字节**汇总，看不到「第几个文件 / 共几个文件」。
-- `check_server_key` 目前接受任意主机公钥，未与 `~/.ssh/known_hosts` 比对。
 - 单个文件上传不会自动创建远端父目录（整目录上传会，它自己按树建）。
 - 整目录传输里单个文件失败不会中断整批，最后一个 `Failed` 只带**首个**错误和失败个数，
   逐条错误要去看日志。
-- 续传只比长度、不比内容：长度相等就当作「传完了」/「该重传」，不校验 mtime 或校验和。
+- 上传续传由用户明确选择，仍以远端 `.filepart` 长度为断点，不计算内容校验和。
 - 上传失败或取消后目录里会留下 `xxx.filepart`，需要手动清理（或再次上传同名文件，
-  选「断点续传 / 安全覆盖」都会复用它）。下载的半成品就是本地文件本身，没有额外临时文件。
+  选「断点续传 / 安全覆盖」会复用或截断它）。下载也会保留 `.filepart` 和身份标记，
+  下次只在远端路径、大小、修改时间均匹配时续传，成功后自动清理。
 - `posix-rename@openssh.com` 用不了（russh-sftp 3.0.1 没实现），原子覆盖靠
   「rename → 失败则 unlink + rename」两步走。第二步有个极小的窗口：unlink 之后、
   rename 之前如果连接断了，目标文件会暂时不存在（临时文件还在，重传即可恢复）。
 - 删除 / 重命名只作用于远端；本地面板的右键菜单只有「上传」（本地文件操作用 Finder 更顺手）。
 - 远端面板在未连接时显示的路径（`/srv/app`）只是展示用，不代表真实服务器。
-- 整目录上传会自动续传上次留下的 `.filepart`，和单文件续传一样只比长度不比内容 ——
-  本地文件换过内容但长度没变时，续传会得到一份「新旧混着」的文件。整目录下载同理
-  （看的是本地文件的长度）。
 - 打出来的 `.app` 只做了 ad-hoc 签名（`codesign --sign -`），本机自用没问题，发给别人
   会被 Gatekeeper 拦。要分发得配 Developer ID 证书并公证。
 

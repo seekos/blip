@@ -26,11 +26,11 @@ use std::time::Duration;
 use log::{debug, error, info, warn};
 use russh_sftp::client::SftpSession;
 
-use super::session::{self, ActiveSession};
+use super::session::{self, ActiveSession, ConnectError, HostKeyChallenge, HostKeyPolicy};
 use super::transfer;
 use super::types::{
-    ErrorContext, SftpCommand, SftpEvent, TransferId, TransferOutcome, UploadConflict,
-    UploadDecision,
+    ErrorContext, HostKeyDecision, HostKeyPrompt, SftpCommand, SftpEvent, TransferId,
+    TransferOutcome, UploadConflict, UploadDecision,
 };
 
 /// 传输任务的取消句柄。
@@ -58,6 +58,11 @@ struct PendingUpload {
 
 /// 等待用户拍板的上传：`TransferId -> 任务`。
 type PendingRegistry = Arc<Mutex<HashMap<TransferId, PendingUpload>>>;
+
+struct PendingHostTrust {
+    config: super::types::SessionConfig,
+    challenge: HostKeyChallenge,
+}
 
 /// 单条指令的最长等待时间。超时后按失败处理，避免界面无限转圈。
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -157,6 +162,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
     let mut session: Option<ActiveSession> = None;
     let cancels: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
     let pending: PendingRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let mut pending_host: Option<PendingHostTrust> = None;
     // 「对后续冲突执行相同操作」的选择，本次连接内有效。
     let mut upload_policy: Option<UploadDecision> = None;
 
@@ -168,45 +174,100 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
             SftpCommand::Connect(config) => {
                 info!("正在连接 {}", config.endpoint());
                 // 旧连接先释放，避免两条 SSH 会话同时挂在服务器上。
+                cancel_all(&cancels);
+                cancel_pending_uploads(&pending, &cancels, &events);
                 session = None;
-                clear_cancels(&cancels);
-                clear_pending(&pending);
+                pending_host = None;
                 upload_policy = None;
 
-                match session::connect(&config).await {
+                match session::connect(&config, HostKeyPolicy::KnownHosts).await {
                     Ok(active) => {
                         let home = active.home.clone();
                         info!("已连接 {}，登录目录 {home}", config.endpoint());
                         session = Some(active);
                         let _ = events.send(SftpEvent::Connected { home });
                     }
+                    Err(ConnectError::HostKey(challenge)) => {
+                        let prompt = HostKeyPrompt {
+                            endpoint: challenge.endpoint.clone(),
+                            algorithm: challenge.algorithm.clone(),
+                            fingerprint: challenge.fingerprint.clone(),
+                            changed_line: challenge.changed_line,
+                        };
+                        pending_host = Some(PendingHostTrust {
+                            config,
+                            challenge: *challenge,
+                        });
+                        let _ = events.send(SftpEvent::HostKeyPrompt(prompt));
+                    }
                     Err(err) => {
                         error!("连接失败：{err:#}");
-                        let _ = events.send(SftpEvent::error(
-                            ErrorContext::Connect,
-                            format!("{err:#}"),
-                        ));
+                        let _ = events
+                            .send(SftpEvent::error(ErrorContext::Connect, format!("{err:#}")));
                     }
                 }
             }
 
             SftpCommand::Disconnect => {
+                cancel_all(&cancels);
+                cancel_pending_uploads(&pending, &cancels, &events);
                 session = None;
-                clear_cancels(&cancels);
-                clear_pending(&pending);
+                pending_host = None;
                 upload_policy = None;
                 let _ = events.send(SftpEvent::Disconnected);
+            }
+
+            SftpCommand::ResolveHostKey(decision) => {
+                let Some(waiting) = pending_host.take() else {
+                    debug!("主机密钥决定来晚了，忽略");
+                    continue;
+                };
+
+                if decision == HostKeyDecision::Reject {
+                    let _ = events.send(SftpEvent::error(
+                        ErrorContext::Connect,
+                        "已取消连接：未信任服务器主机密钥",
+                    ));
+                    continue;
+                }
+
+                if decision == HostKeyDecision::TrustAndSave
+                    && let Err(message) = session::remember_host_key(
+                        &waiting.config,
+                        &waiting.challenge.key,
+                        waiting.challenge.changed_line,
+                    )
+                {
+                    let _ = events.send(SftpEvent::error(ErrorContext::Connect, message));
+                    continue;
+                }
+
+                match session::connect(&waiting.config, HostKeyPolicy::Exact(waiting.challenge.key))
+                    .await
+                {
+                    Ok(active) => {
+                        let home = active.home.clone();
+                        info!("已确认主机密钥，登录目录 {home}");
+                        session = Some(active);
+                        let _ = events.send(SftpEvent::Connected { home });
+                    }
+                    Err(err) => {
+                        let _ = events
+                            .send(SftpEvent::error(ErrorContext::Connect, format!("{err:#}")));
+                    }
+                }
             }
 
             // ---------------------------------------------------------------
             // 目录
             // ---------------------------------------------------------------
-            SftpCommand::ListDir { request_id, path } => {
+            SftpCommand::ListDir {
+                request_id,
+                path,
+                fallback,
+            } => {
                 let Some(active) = session.as_ref() else {
-                    let _ = events.send(SftpEvent::error(
-                        ErrorContext::List,
-                        "尚未连接到服务器",
-                    ));
+                    let _ = events.send(SftpEvent::error(ErrorContext::List, "尚未连接到服务器"));
                     continue;
                 };
 
@@ -214,11 +275,16 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let events = events.clone();
                 // 读目录可能慢（大目录、高延迟链路），不能卡住命令循环。
                 tokio::spawn(async move {
-                    match guard("读取目录", session::list_dir(&sftp, &path)).await {
-                        Ok(entries) => {
+                    match guard(
+                        "读取目录",
+                        session::list_dir_or_fallback(&sftp, &path, fallback.as_deref()),
+                    )
+                    .await
+                    {
+                        Ok((listed_path, entries)) => {
                             let _ = events.send(SftpEvent::DirListed {
                                 request_id,
-                                path,
+                                path: listed_path,
                                 entries,
                             });
                         }
@@ -254,10 +320,8 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let registry = cancels.clone();
                 let events = events.clone();
                 tokio::spawn(async move {
-                    transfer::run_download(
-                        sftp, id, remote, local, total, resume, cancel, events,
-                    )
-                    .await;
+                    transfer::run_download(sftp, id, remote, local, total, resume, cancel, events)
+                        .await;
                     unregister_cancel(&registry, id);
                 });
             }
@@ -330,7 +394,10 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let decision = if !probe.has_conflict() {
                     UploadDecision::Overwrite
                 } else if let Some(policy) = upload_policy {
-                    debug!("上传 {remote} 有冲突，按既定策略「{}」处理", policy.as_str());
+                    debug!(
+                        "上传 {remote} 有冲突，按既定策略「{}」处理",
+                        policy.as_str()
+                    );
                     policy
                 } else {
                     debug!("上传 {remote} 有冲突，等待用户确认");
@@ -387,6 +454,38 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 );
             }
 
+            SftpCommand::UploadOverwrite {
+                id,
+                local,
+                remote,
+                total,
+            } => {
+                let Some(active) = session.as_ref() else {
+                    let _ = events.send(SftpEvent::TransferCompleted {
+                        id,
+                        outcome: TransferOutcome::Failed("尚未连接到服务器".to_string()),
+                    });
+                    continue;
+                };
+
+                let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+                register_cancel(&cancels, id, cancel.clone());
+                spawn_upload(
+                    id,
+                    PendingUpload {
+                        local,
+                        remote,
+                        total,
+                        resume: false,
+                        cancel,
+                    },
+                    UploadDecision::Overwrite,
+                    active.sftp.clone(),
+                    &cancels,
+                    &events,
+                );
+            }
+
             SftpCommand::DownloadDir {
                 id,
                 remote,
@@ -414,7 +513,13 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let events = events.clone();
                 tokio::spawn(async move {
                     transfer::run_download_dir(
-                        sftp, id, remote, local, on_existing, cancel, events,
+                        sftp,
+                        id,
+                        remote,
+                        local,
+                        on_existing,
+                        cancel,
+                        events,
                     )
                     .await;
                     unregister_cancel(&registry, id);
@@ -448,10 +553,8 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let registry = cancels.clone();
                 let events = events.clone();
                 tokio::spawn(async move {
-                    transfer::run_upload_dir(
-                        sftp, id, local, remote, on_existing, cancel, events,
-                    )
-                    .await;
+                    transfer::run_upload_dir(sftp, id, local, remote, on_existing, cancel, events)
+                        .await;
                     unregister_cancel(&registry, id);
                 });
             }
@@ -563,12 +666,55 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
             // ---------------------------------------------------------------
             // 文件操作：短、快、需要保序，直接在当前循环里 await
             // ---------------------------------------------------------------
-            SftpCommand::Mkdir { path } => {
+            SftpCommand::ReadText { path } => {
+                let Some(active) = session.as_ref() else {
+                    let _ =
+                        events.send(SftpEvent::error(ErrorContext::ReadText, "尚未连接到服务器"));
+                    continue;
+                };
+
+                let operation = async {
+                    transfer::read_remote_text(&active.sftp, &path)
+                        .await
+                        .map_err(|err| format!("{err:#}"))
+                };
+                match guard("读取文本文件", operation).await {
+                    Ok(content) => {
+                        let _ = events.send(SftpEvent::TextLoaded { path, content });
+                    }
+                    Err(message) => {
+                        let _ = events.send(SftpEvent::error(ErrorContext::ReadText, message));
+                    }
+                }
+            }
+
+            SftpCommand::WriteText { path, content } => {
                 let Some(active) = session.as_ref() else {
                     let _ = events.send(SftpEvent::error(
-                        ErrorContext::Mkdir,
+                        ErrorContext::WriteText,
                         "尚未连接到服务器",
                     ));
+                    continue;
+                };
+
+                let operation = async {
+                    transfer::write_remote_text(&active.sftp, &path, &content)
+                        .await
+                        .map_err(|err| format!("{err:#}"))
+                };
+                match guard("保存文本文件", operation).await {
+                    Ok(()) => {
+                        let _ = events.send(SftpEvent::TextSaved { path });
+                    }
+                    Err(message) => {
+                        let _ = events.send(SftpEvent::error(ErrorContext::WriteText, message));
+                    }
+                }
+            }
+
+            SftpCommand::Mkdir { path } => {
+                let Some(active) = session.as_ref() else {
+                    let _ = events.send(SftpEvent::error(ErrorContext::Mkdir, "尚未连接到服务器"));
                     continue;
                 };
 
@@ -584,10 +730,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
 
             SftpCommand::Remove { path, is_dir } => {
                 let Some(active) = session.as_ref() else {
-                    let _ = events.send(SftpEvent::error(
-                        ErrorContext::Remove,
-                        "尚未连接到服务器",
-                    ));
+                    let _ = events.send(SftpEvent::error(ErrorContext::Remove, "尚未连接到服务器"));
                     continue;
                 };
 
@@ -603,10 +746,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
 
             SftpCommand::Rename { from, to } => {
                 let Some(active) = session.as_ref() else {
-                    let _ = events.send(SftpEvent::error(
-                        ErrorContext::Rename,
-                        "尚未连接到服务器",
-                    ));
+                    let _ = events.send(SftpEvent::error(ErrorContext::Rename, "尚未连接到服务器"));
                     continue;
                 };
 
@@ -620,7 +760,11 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 }
             }
 
-            SftpCommand::Shutdown => break,
+            SftpCommand::Shutdown => {
+                cancel_all(&cancels);
+                cancel_pending_uploads(&pending, &cancels, &events);
+                break;
+            }
         }
     }
 
@@ -632,7 +776,10 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
 // ---------------------------------------------------------------------------
 
 /// 给一次网络操作套上超时：卡住的连接不应该让界面永远转圈。
-async fn guard<T>(label: &str, operation: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+async fn guard<T>(
+    label: &str,
+    operation: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
     match tokio::time::timeout(OP_TIMEOUT, operation).await {
         Ok(result) => result,
         Err(_) => Err(format!(
@@ -694,14 +841,27 @@ fn unregister_cancel(registry: &CancelRegistry, id: TransferId) {
     }
 }
 
-fn clear_cancels(registry: &CancelRegistry) {
-    if let Ok(mut map) = registry.lock() {
-        map.clear();
+fn cancel_all(registry: &CancelRegistry) {
+    if let Ok(map) = registry.lock() {
+        for flag in map.values() {
+            flag.store(true, Ordering::Relaxed);
+        }
     }
 }
 
-fn clear_pending(registry: &PendingRegistry) {
+fn cancel_pending_uploads(
+    registry: &PendingRegistry,
+    cancels: &CancelRegistry,
+    events: &flume::Sender<SftpEvent>,
+) {
     if let Ok(mut map) = registry.lock() {
-        map.clear();
+        for (id, job) in map.drain() {
+            job.cancel.store(true, Ordering::Relaxed);
+            unregister_cancel(cancels, id);
+            let _ = events.send(SftpEvent::TransferCompleted {
+                id,
+                outcome: TransferOutcome::Cancelled,
+            });
+        }
     }
 }

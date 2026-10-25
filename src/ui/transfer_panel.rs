@@ -1,12 +1,15 @@
 //! 底部传输队列：每个任务一行，带进度条、速率与取消按钮。
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, button::{Button, ButtonVariants as _},
-    h_flex, progress::Progress, v_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    progress::Progress,
+    v_flex,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use gpui_kit::assets::IconName;
 
 use crate::sftp::session::format_size;
 use crate::sftp::types::{TransferDirection, TransferId, TransferOutcome};
@@ -187,8 +190,7 @@ impl TransferQueue {
     /// 否则队列里没了行、传输还在后台跑。
     pub fn dismiss(&mut self, id: TransferId, cx: &mut Context<Self>) {
         let before = self.items.len();
-        self.items
-            .retain(|item| item.id != id || item.is_active());
+        self.items.retain(|item| item.id != id || item.is_active());
         if self.items.len() != before {
             cx.notify();
         }
@@ -254,11 +256,9 @@ impl TransferQueue {
                             .xsmall()
                             .icon(IconName::ChevronDown)
                             .tooltip("收起队列")
-                            .on_click(
-                                cx.listener(|_, _, _, cx| {
-                                    cx.emit(TransferQueueEvent::ToggleCollapsed)
-                                }),
-                            ),
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(TransferQueueEvent::ToggleCollapsed)
+                            })),
                     ),
             )
             .into_any_element()
@@ -312,14 +312,10 @@ impl TransferQueue {
             .py_2()
             .border_b_1()
             .border_color(theme.border.opacity(0.5))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .child(match item.direction {
-                        TransferDirection::Upload => IconName::Upload,
-                        TransferDirection::Download => IconName::Download,
-                    }),
-            )
+            .child(div().flex_shrink_0().child(match item.direction {
+                TransferDirection::Upload => IconName::Upload,
+                TransferDirection::Download => IconName::Download,
+            }))
             .child(
                 v_flex()
                     .flex_1()

@@ -1,4 +1,4 @@
-//! 顶部工具栏：只有连接表单（Host / Port / Username / Password）+ 连接状态。
+//! 顶部工具栏：收藏夹 + 连接表单（Host / Port / Username / Password）+ 连接状态。
 //!
 //! 文件操作（上传 / 下载 / 新建目录 / 删除 / 刷新）不再占一行按钮，全部收进
 //! 两个文件面板的右键菜单 —— 见 `file_pane::menu_spec`。
@@ -9,24 +9,29 @@
 use std::path::PathBuf;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::actions::Cancel;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
+    menu::{DropdownMenu as _, PopupMenuItem},
+    notification::Notification,
     v_flex,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use crate::sftp::types::{AuthMethod, DEFAULT_SSH_PORT, SessionConfig};
 use crate::session::store::{self, SavedAuth, SavedProfile};
+use crate::sftp::types::{AuthMethod, DEFAULT_SSH_PORT, SessionConfig};
 use crate::ui::SessionState;
 
 #[derive(Clone, Debug)]
 pub enum ToolbarEvent {
     Connect(SessionConfig),
     Disconnect,
+    ProfilesChanged(Vec<SavedProfile>),
+    OpenSettings,
 }
 
 impl EventEmitter<ToolbarEvent> for Toolbar {}
@@ -48,6 +53,7 @@ pub struct Toolbar {
     key_path: Entity<InputState>,
     /// 加密私钥的口令。只在私钥模式下显示，且**从不落盘**。
     key_passphrase: Entity<InputState>,
+    profiles: Vec<SavedProfile>,
     use_key: bool,
     remember: bool,
     state: SessionState,
@@ -55,7 +61,7 @@ pub struct Toolbar {
 }
 
 impl Toolbar {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(profiles: Vec<SavedProfile>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             host: cx.new(|cx| InputState::new(window, cx).placeholder("主机名或 IP")),
             port: cx.new(|cx| InputState::new(window, cx).default_value("22")),
@@ -67,12 +73,15 @@ impl Toolbar {
                     .placeholder("用户名")
             }),
             password: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("密码")),
-            key_path: cx.new(|cx| InputState::new(window, cx).placeholder("留空自动查找 ~/.ssh/id_ed25519")),
+            key_path: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("留空自动查找 ~/.ssh/id_ed25519")
+            }),
             key_passphrase: cx.new(|cx| {
                 InputState::new(window, cx)
                     .masked(true)
                     .placeholder("口令（可选）")
             }),
+            profiles,
             use_key: false,
             remember: true,
             state: SessionState::Disconnected,
@@ -93,15 +102,19 @@ impl Toolbar {
         cx.notify();
     }
 
+    pub fn set_profiles(&mut self, profiles: Vec<SavedProfile>, cx: &mut Context<Self>) {
+        self.profiles = profiles;
+        cx.notify();
+    }
+
     /// 用上次成功的连接回填表单。
     pub fn prefill(&mut self, profile: &SavedProfile, window: &mut Window, cx: &mut Context<Self>) {
         let host = profile.host.clone();
         let port = profile.port.to_string();
         let username = profile.username.clone();
-        let key_path = match &profile.auth {
-            SavedAuth::Key { path } => Some(path.clone()),
-            SavedAuth::Password => None,
-        };
+        self.use_key = matches!(profile.auth, SavedAuth::Key { .. });
+        self.remember = true;
+        self.error = None;
 
         self.host
             .update(cx, |state, cx| state.set_value(host, window, cx));
@@ -109,16 +122,76 @@ impl Toolbar {
             .update(cx, |state, cx| state.set_value(port, window, cx));
         self.username
             .update(cx, |state, cx| state.set_value(username, window, cx));
-        if let Some(path) = key_path {
-            self.use_key = true;
+        self.password
+            .update(cx, |state, cx| state.set_value(String::new(), window, cx));
+        self.key_passphrase
+            .update(cx, |state, cx| state.set_value(String::new(), window, cx));
+        if let SavedAuth::Key { path } = &profile.auth {
             self.key_path
-                .update(cx, |state, cx| state.set_value(path, window, cx));
+                .update(cx, |state, cx| state.set_value(path.clone(), window, cx));
         }
         cx.notify();
     }
 
+    fn connect_profile(
+        &mut self,
+        profile: &SavedProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state == SessionState::Connecting {
+            return;
+        }
+        self.prefill(profile, window, cx);
+        self.start_connect(cx);
+    }
+
+    fn start_connect(&mut self, cx: &mut Context<Self>) {
+        match self.build_config(cx) {
+            Ok(config) => {
+                self.error = None;
+                self.state = SessionState::Connecting;
+                cx.notify();
+                cx.emit(ToolbarEvent::Connect(config));
+            }
+            Err(message) => {
+                self.error = Some(message);
+                cx.notify();
+            }
+        }
+    }
+
+    fn remove_profile(
+        &mut self,
+        profile: &SavedProfile,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let mut profiles = self.profiles.clone();
+        let Some(removed) = store::remove_profile(&mut profiles, &profile.username, &profile.host)
+        else {
+            return Ok(());
+        };
+        store::save_profiles(&profiles)?;
+
+        if matches!(removed.auth, SavedAuth::Password) {
+            let config = SessionConfig {
+                host: removed.host,
+                port: removed.port,
+                username: removed.username,
+                auth: AuthMethod::Password(String::new()),
+            };
+            store::forget_password(&config);
+        }
+
+        self.profiles = profiles.clone();
+        cx.notify();
+        cx.emit(ToolbarEvent::ProfilesChanged(profiles));
+        Ok(())
+    }
+
     /// 直接把一组凭证填进表单（演示模式用），不读也不写钥匙串。
     #[cfg(feature = "demo-server")]
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_credentials(
         &mut self,
         host: &str,
@@ -134,8 +207,9 @@ impl Toolbar {
         self.error = None;
         self.state = SessionState::Disconnected;
 
-        self.host
-            .update(cx, |state, cx| state.set_value(host.to_string(), window, cx));
+        self.host.update(cx, |state, cx| {
+            state.set_value(host.to_string(), window, cx)
+        });
         self.port.update(cx, |state, cx| {
             state.set_value(port.to_string(), window, cx)
         });
@@ -242,6 +316,8 @@ impl Toolbar {
         let connected = self.state == SessionState::Connected;
         let connecting = self.state == SessionState::Connecting;
         let use_key = self.use_key;
+        let profiles = self.profiles.clone();
+        let toolbar = cx.entity().downgrade();
 
         let password_or_key = if use_key {
             Input::new(&self.key_path).id("toolbar-key").w_full()
@@ -269,6 +345,104 @@ impl Toolbar {
                     ),
             )
             .child(
+                Button::new("favorites")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Bookmark)
+                    .accessibility_label("收藏夹")
+                    .tooltip("收藏夹")
+                    .disabled(connecting)
+                    .dropdown_menu(move |menu, _window, _cx| {
+                        if profiles.is_empty() {
+                            return menu.min_w(px(180.)).item(
+                                PopupMenuItem::new("暂无收藏，连接成功后会自动添加").disabled(true),
+                            );
+                        }
+
+                        profiles.iter().enumerate().fold(
+                            menu.min_w(px(260.)).max_h(px(320.)).scrollable(true),
+                            |menu, (index, profile)| {
+                                let profile = profile.clone();
+                                let item_toolbar = toolbar.clone();
+                                let delete_profile = profile.clone();
+                                let delete_toolbar = toolbar.clone();
+                                let icon = match profile.auth {
+                                    SavedAuth::Password => IconName::Lock,
+                                    SavedAuth::Key { .. } => IconName::KeyRound,
+                                };
+                                let label = format!(
+                                    "{}@{}:{}",
+                                    profile.username, profile.host, profile.port
+                                );
+                                let delete_label = format!("删除收藏 {label}");
+
+                                menu.item(
+                                    PopupMenuItem::element(move |_, _| {
+                                        let delete_profile = delete_profile.clone();
+                                        let delete_toolbar = delete_toolbar.clone();
+                                        h_flex()
+                                            .group("favorite-row")
+                                            .flex_1()
+                                            .min_w_0()
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .child(SharedString::from(label.clone())),
+                                            )
+                                            .child(
+                                                Button::new(format!("delete-favorite-{index}"))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::X)
+                                                    .invisible()
+                                                    .group_hover("favorite-row", |this| {
+                                                        this.visible()
+                                                    })
+                                                    .focus(|this| this.visible())
+                                                    .accessibility_label(delete_label.clone())
+                                                    .tooltip("删除收藏")
+                                                    .on_click(move |_, window, cx| {
+                                                        cx.stop_propagation();
+                                                        let result = delete_toolbar.update(
+                                                            cx,
+                                                            |toolbar, cx| {
+                                                                toolbar.remove_profile(
+                                                                    &delete_profile,
+                                                                    cx,
+                                                                )
+                                                            },
+                                                        );
+                                                        if let Ok(Err(message)) = result {
+                                                            window.push_notification(
+                                                                Notification::error(message),
+                                                                cx,
+                                                            );
+                                                        }
+                                                        window
+                                                            .dispatch_action(Box::new(Cancel), cx);
+                                                    }),
+                                            )
+                                    })
+                                    .icon(icon)
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            let profile = profile.clone();
+                                            let _ = item_toolbar.update(cx, |toolbar, cx| {
+                                                toolbar.connect_profile(&profile, window, cx)
+                                            });
+                                        },
+                                    ),
+                                )
+                            },
+                        )
+                    }),
+            )
+            .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
@@ -289,23 +463,15 @@ impl Toolbar {
                             .w(px(150.))
                             .child(Input::new(&self.username).id("toolbar-user").w_full()),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(150.))
-                            .child(password_or_key),
-                    )
+                    .child(div().flex_1().min_w(px(150.)).child(password_or_key))
                     // 私钥模式才出现的口令框：加密私钥没有它根本连不上。
                     .when(use_key, |this| {
                         this.child(
-                            div()
-                                .w(px(120.))
-                                .flex_shrink_0()
-                                .child(
-                                    Input::new(&self.key_passphrase)
-                                        .id("toolbar-passphrase")
-                                        .w_full(),
-                                ),
+                            div().w(px(120.)).flex_shrink_0().child(
+                                Input::new(&self.key_passphrase)
+                                    .id("toolbar-passphrase")
+                                    .w_full(),
+                            ),
                         )
                     })
                     .child(
@@ -347,6 +513,15 @@ impl Toolbar {
                     ),
             )
             .child(
+                Button::new("settings")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Settings)
+                    .accessibility_label("设置")
+                    .tooltip("设置")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ToolbarEvent::OpenSettings))),
+            )
+            .child(
                 Button::new("connect")
                     .when(connected, |this| this.outline())
                     .when(!connected, |this| this.primary())
@@ -367,18 +542,7 @@ impl Toolbar {
                             cx.emit(ToolbarEvent::Disconnect);
                         }
                         SessionState::Connecting => {}
-                        SessionState::Disconnected => match toolbar.build_config(cx) {
-                            Ok(config) => {
-                                toolbar.error = None;
-                                toolbar.state = SessionState::Connecting;
-                                cx.notify();
-                                cx.emit(ToolbarEvent::Connect(config));
-                            }
-                            Err(message) => {
-                                toolbar.error = Some(message);
-                                cx.notify();
-                            }
-                        },
+                        SessionState::Disconnected => toolbar.start_connect(cx),
                     })),
             )
             // 连接状态（`user@host`）不在这里：它已经挪到窗口标题栏，

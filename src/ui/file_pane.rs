@@ -5,20 +5,26 @@
 //! * 顶部面包屑 + 「上级」/「显示隐藏文件」/「刷新」按钮；
 //! * 双击进入目录、双击文件抛 [`FilePaneEvent::Activate`]；
 //! * 右键弹出 [`gpui_kit::component::menu::PopupMenu`]，把用户选的动作包成
-//!   [`FilePaneEvent`] 交给上层（上传/下载/新建目录/重命名/删除，刷新则就地处理）。
+//!   [`FilePaneEvent`] 交给上层（上传/下载/编辑/复制路径/新建目录/重命名/删除，刷新则就地处理）。
 //!
 //! 列表顶部还有一行 `..`，等价于「返回上一级」。
 
-use std::path::{Path, PathBuf};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Selectable as _, Sizable as _,
+    ActiveTheme as _, InteractiveElementExt as _, Selectable as _, Sizable as _,
     breadcrumb::{Breadcrumb, BreadcrumbItem},
     button::{Button, ButtonVariants as _},
     h_flex,
-    menu::PopupMenuItem,
     menu::PopupMenu,
+    menu::PopupMenuItem,
+    scroll::ScrollableMask,
     table::{Column, DataTable, TableDelegate, TableEvent, TableState},
     v_flex,
 };
@@ -44,9 +50,15 @@ pub enum FileAction {
     Upload,
     /// 远程条目 → 当前本地目录。落在目录上时整棵递归下载。
     Download,
+    /// 使用设置中的编辑方式打开文件；远端文件保存后自动同步。
+    Edit,
+    /// 把一个或多个绝对路径复制到系统剪贴板。
+    CopyPath,
+    /// 在 Finder 中显示本地条目。
+    RevealInFinder,
     Rename,
     Delete,
-    /// 在远端当前目录下建目录。与右键落在哪一行无关。
+    /// 在当前面板目录下建目录。与右键落在哪一行无关。
     NewFolder,
     /// 重新读当前目录。纯面板本地动作，不惊动上层。
     Refresh,
@@ -56,10 +68,15 @@ pub enum FileAction {
 pub enum FilePaneEvent {
     /// 远端面板请求切换目录（本地面板自己处理，不发这个事件）。
     Navigate(String),
-    /// 双击了一个文件：由上层决定是上传还是下载。
+    /// 本地目录已经成功读取，上层可以安全地把它记为下次启动目录。
+    DirectoryLoaded(String),
+    /// 双击了一个文件：由上层按编辑器设置打开。
     Activate(FileEntry),
-    /// 右键菜单选了针对某个条目的动作。
-    Action { entry: FileEntry, action: FileAction },
+    /// 右键菜单选了条目动作；上传/下载/复制路径可一次携带当前多选集合。
+    Action {
+        entries: Vec<FileEntry>,
+        action: FileAction,
+    },
     /// 右键菜单选了不针对条目的动作（目前只有「新建目录」）。
     PaneAction(FileAction),
     /// 外部文件被拖到面板上（Finder 拖拽释放）。只可能来自远端面板。
@@ -73,45 +90,50 @@ pub struct FilePane {
     path: String,
     loading: bool,
     error: Option<SharedString>,
-    /// 是否处于 Mock 模式：true 时 `reload` 重新生成假数据，不碰磁盘也不发指令。
-    mock: bool,
     /// 是否已连接。决定右键菜单里的动作是否可点。
     online: bool,
     /// 是否显示以 `.` 开头的隐藏文件。只影响渲染，不重新读盘。
     show_hidden: bool,
     /// 正在被拖到本面板上的外部文件。`None` 表示没有拖拽悬停。
     drop_hover: Option<Vec<std::path::PathBuf>>,
+    /// 当前帧里可见行的窗口坐标。框选时直接做矩形相交，不猜表头/滚动偏移。
+    row_bounds: Rc<RefCell<BTreeMap<usize, Bounds<Pixels>>>>,
+    /// 表格区域的窗口坐标，用于把全局鼠标坐标换成局部框选矩形。
+    selection_surface: Rc<Cell<Option<Bounds<Pixels>>>>,
+    marquee: Option<MarqueeSelection>,
+    /// macOS 上 Control 不是 GPUI 的 secondary modifier，表格会额外合成一次普通单击。
+    /// 这个标记让该次行事件只清理表格自身高亮，不覆盖我们维护的多选集合。
+    preserve_selection_on_table_click: bool,
+    /// 长路径地址栏的水平滚动状态。
+    address_scroll: ScrollHandle,
+    /// 切换目录后在下一帧将地址栏定位到末端，确保当前目录可见。
+    reveal_address_end: bool,
     table: Entity<TableState<FileTable>>,
     _subscription: Subscription,
+}
+
+#[derive(Clone)]
+struct MarqueeSelection {
+    start: Point<Pixels>,
+    current: Point<Pixels>,
+    initial_rows: BTreeSet<usize>,
+    start_row: Option<usize>,
+    active: bool,
 }
 
 impl FilePane {
     /// 真实数据源：本地面板立刻读磁盘，远端面板等待上层喂 `set_entries`。
     pub fn new(side: PaneSide, path: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::build(side, path, false, window, cx)
+        Self::build(side, path, window, cx)
     }
 
-    /// Mock 数据源：骨架阶段用来把布局填满，连接成功后由 `use_live_data` 切换。
-    pub fn new_mock(
-        side: PaneSide,
-        path: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::build(side, path, true, window, cx)
-    }
-
-    fn build(
-        side: PaneSide,
-        path: String,
-        mock: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    fn build(side: PaneSide, path: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // 表格的右键菜单要回调面板，只能拿弱引用 —— 强引用会和 `table` 形成环。
         let weak = cx.weak_entity();
         // 面板和 delegate 各存一份开关，构造时从这里取，避免两处默认值走偏。
         let show_hidden = false;
+        let row_bounds = Rc::new(RefCell::new(BTreeMap::new()));
+        let selection_surface = Rc::new(Cell::new(None));
 
         let table = cx.new(|cx| {
             TableState::new(
@@ -124,37 +146,53 @@ impl FilePane {
                     online: false,
                     side,
                     pane: weak,
+                    selected_rows: BTreeSet::new(),
+                    selection_anchor: None,
+                    row_bounds: row_bounds.clone(),
                 },
                 window,
                 cx,
             )
             .row_selectable(true)
+            // Control / Command / Shift 由 delegate 的多选状态处理，表格自己的单选不能覆盖它。
+            .select_on_modifier_click(false)
             .col_selectable(false)
             .cell_selectable(false)
         });
 
-        let subscription = cx.subscribe_in(&table, window, |pane, _table, event: &TableEvent, _window, cx| {
-            if let TableEvent::DoubleClickedRow(row) = event {
-                pane.activate_row(*row, cx);
-            }
-        });
+        let subscription = cx.subscribe_in(
+            &table,
+            window,
+            |pane, _table, event: &TableEvent, _window, cx| {
+                match event {
+                    TableEvent::DoubleClickedRow(row) => pane.activate_row(*row, cx),
+                    // 键盘上下移动仍然能进入我们的多选状态；Control / Command / Shift
+                    // 点击则在面板的 MouseDown 阶段接管。
+                    TableEvent::SelectRow(row) => pane.select_single_row(*row, cx),
+                    _ => {}
+                }
+            },
+        );
 
         let mut pane = Self {
             side,
             path,
             loading: false,
             error: None,
-            mock,
             online: false,
             show_hidden,
             drop_hover: None,
+            row_bounds,
+            selection_surface,
+            marquee: None,
+            preserve_selection_on_table_click: false,
+            address_scroll: ScrollHandle::new(),
+            reveal_address_end: true,
             table,
             _subscription: subscription,
         };
 
-        if mock {
-            pane.apply_mock(cx);
-        } else if side == PaneSide::Local {
+        if side == PaneSide::Local {
             pane.reload(cx);
         }
 
@@ -168,6 +206,10 @@ impl FilePane {
     /// 当前可见的条目数（隐藏文件是否计入取决于 [`Self::show_hidden`]）。
     pub fn entries_count(&self, cx: &App) -> usize {
         self.table.read(cx).delegate().entries.len()
+    }
+
+    fn selected_count(&self, cx: &App) -> usize {
+        self.table.read(cx).delegate().selected_rows.len()
     }
 
     /// 连接状态变化时由上层调用，用于启用/禁用右键菜单里的动作。
@@ -190,32 +232,46 @@ impl FilePane {
         let show_hidden = !self.show_hidden;
         self.show_hidden = show_hidden;
         self.table.update(cx, |state, cx| {
-            state.delegate_mut().set_show_hidden(show_hidden);
+            let delegate = state.delegate_mut();
+            delegate.set_show_hidden(show_hidden);
+            delegate.clear_selection();
             // 行号会整体平移，留着旧选中会指到另一个文件上。
             state.clear_selection(cx);
             state.refresh(cx);
         });
+        self.row_bounds.borrow_mut().clear();
         cx.notify();
     }
 
     /// 上层把远端目录内容塞进来。
     pub fn set_entries(&mut self, path: String, entries: Vec<FileEntry>, cx: &mut Context<Self>) {
-        self.path = path;
+        self.set_path(path);
         self.loading = false;
         self.error = None;
         let parent = self.parent_entry();
         self.table.update(cx, |state, cx| {
-            state.delegate_mut().set_entries(entries);
-            state.delegate_mut().parent = parent;
-            state.delegate_mut().loading = false;
+            let delegate = state.delegate_mut();
+            delegate.set_entries(entries);
+            delegate.parent = parent;
+            delegate.loading = false;
+            delegate.clear_selection();
+            state.clear_selection(cx);
             state.refresh(cx);
         });
+        self.row_bounds.borrow_mut().clear();
         cx.notify();
     }
 
     pub fn begin_loading(&mut self, path: String, cx: &mut Context<Self>) {
-        self.path = path;
+        self.set_path(path);
         self.set_loading(true, cx);
+    }
+
+    fn set_path(&mut self, path: String) {
+        if self.path != path {
+            self.path = path;
+            self.reveal_address_end = true;
+        }
     }
 
     pub fn set_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -233,52 +289,15 @@ impl FilePane {
         cx.notify();
     }
 
-    /// 从 Mock 切换到真实数据源（连接成功后调用）。
-    pub fn use_live_data(&mut self, cx: &mut Context<Self>) {
-        self.mock = false;
-        self.reload(cx);
-    }
-
-    /// 只切模式、不重新加载。远端面板的目录由上层主动请求，
-    /// 这样调用方（比如 `Workspace::go_live`）在持有父实体借用时不会被同步回调打断。
-    pub fn leave_mock(&mut self, cx: &mut Context<Self>) {
-        if self.mock {
-            self.mock = false;
-            cx.notify();
-        }
-    }
-
-    /// 用假数据填充表格，路径保持不变。
-    fn apply_mock(&mut self, cx: &mut Context<Self>) {
-        let entries = match self.side {
-            PaneSide::Local => crate::ui::mock::local_entries(&self.path),
-            PaneSide::Remote => crate::ui::mock::remote_entries(&self.path),
-        };
-        self.loading = false;
-        self.error = None;
-        let parent = self.parent_entry();
-        self.table.update(cx, |state, cx| {
-            state.delegate_mut().set_entries(entries);
-            state.delegate_mut().parent = parent;
-            state.delegate_mut().loading = false;
-            state.refresh(cx);
-        });
-        cx.notify();
-    }
-
-    /// 本地面板读磁盘；远端面板交给上层发指令。Mock 模式下重新生成假数据。
+    /// 本地面板读磁盘；远端面板交给上层发指令。
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        if self.mock {
-            self.apply_mock(cx);
-            return;
-        }
-
         match self.side {
             PaneSide::Remote => {
                 cx.emit(FilePaneEvent::Navigate(self.path.clone()));
             }
             PaneSide::Local => {
                 let path = PathBuf::from(&self.path);
+                let requested_path = path.clone();
                 self.set_loading(true, cx);
 
                 let task = cx
@@ -288,22 +307,31 @@ impl FilePane {
                 cx.spawn(async move |this, cx| {
                     let result = task.await;
                     let _ = this.update(cx, |pane, cx| {
-                        // 期间可能已经切到 Mock 模式，迟到的磁盘结果直接丢弃。
-                        if pane.mock {
+                        // 期间可能已经导航到别处，迟到结果不能覆盖新目录。
+                        if Path::new(&pane.path) != requested_path {
                             return;
                         }
                         pane.loading = false;
                         let parent = pane.parent_entry();
                         pane.table.update(cx, |state, cx| {
-                            state.delegate_mut().loading = false;
-                            state.delegate_mut().parent = parent;
+                            let delegate = state.delegate_mut();
+                            delegate.loading = false;
+                            delegate.parent = parent;
                             if let Ok(entries) = &result {
-                                state.delegate_mut().set_entries(entries.clone());
+                                delegate.set_entries(entries.clone());
                             }
+                            delegate.clear_selection();
+                            state.clear_selection(cx);
                             state.refresh(cx);
                         });
-                        if let Err(message) = result {
-                            pane.error = Some(message.into());
+                        pane.row_bounds.borrow_mut().clear();
+                        let loaded = result.is_ok();
+                        match result {
+                            Ok(_) => pane.error = None,
+                            Err(message) => pane.error = Some(message.into()),
+                        }
+                        if loaded {
+                            cx.emit(FilePaneEvent::DirectoryLoaded(pane.path.clone()));
                         }
                         cx.notify();
                     });
@@ -314,15 +342,9 @@ impl FilePane {
     }
 
     pub fn navigate(&mut self, path: String, cx: &mut Context<Self>) {
-        if self.mock {
-            self.path = path;
-            self.reload(cx);
-            return;
-        }
-
         match self.side {
             PaneSide::Local => {
-                self.path = path;
+                self.set_path(path);
                 self.reload(cx);
             }
             PaneSide::Remote => {
@@ -361,26 +383,288 @@ impl FilePane {
         }
     }
 
+    fn select_single_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.preserve_selection_on_table_click) {
+            // macOS 的 Control 点击不属于 TableState 认识的 modifier click，MouseUp
+            // 会再发一个普通 SelectRow。多选已在 MouseDown 完成，这里只清原生高亮。
+            self.marquee = None;
+            self.table.update(cx, |state, cx| {
+                state.clear_selection(cx);
+                state.refresh(cx);
+            });
+            cx.notify();
+            return;
+        }
+        if self.marquee.take().is_some_and(|marquee| marquee.active) {
+            // 按下和松开落在同一行时，TableState 即使经过拖动仍会合成 click。
+            // 保留框选集合，并清掉它刚加上的单选高亮。
+            self.table.update(cx, |state, cx| {
+                state.clear_selection(cx);
+                state.refresh(cx);
+            });
+            cx.notify();
+            return;
+        }
+        // 同一行内 MouseUp 会被 TableState 的 click 截住；它最终选中行时顺手
+        // 清掉 MouseDown 建立的候选框选状态。
+        self.marquee = None;
+        self.table.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            delegate.selected_rows.clear();
+            if delegate
+                .entry_at(row)
+                .is_some_and(|entry| !is_parent_row(&entry))
+            {
+                delegate.selected_rows.insert(row);
+                delegate.selection_anchor = Some(row);
+            } else {
+                delegate.selection_anchor = None;
+            }
+            state.refresh(cx);
+        });
+        cx.notify();
+    }
+
+    fn click_row(&mut self, row: usize, toggle: bool, shift: bool, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            if delegate
+                .entry_at(row)
+                .is_none_or(|entry| is_parent_row(&entry))
+            {
+                delegate.clear_selection();
+            } else if shift {
+                let anchor = delegate.selection_anchor.unwrap_or(row);
+                delegate.selected_rows = selectable_row_range(
+                    anchor,
+                    row,
+                    delegate.rows_len(),
+                    delegate.parent.is_some(),
+                );
+            } else if toggle {
+                if !delegate.selected_rows.remove(&row) {
+                    delegate.selected_rows.insert(row);
+                }
+                delegate.selection_anchor = Some(row);
+            } else {
+                delegate.selected_rows.clear();
+                delegate.selected_rows.insert(row);
+                delegate.selection_anchor = Some(row);
+            }
+            // 鼠标维护的是多选集合，旧的键盘单选高亮不能继续留在另一行。
+            state.clear_selection(cx);
+            state.refresh(cx);
+        });
+        cx.notify();
+    }
+
+    /// DataTable 的右键菜单只认识真实行；在捕获阶段把表格正文空白标记为一个
+    /// 越界行，让它现有的菜单容器继续负责定位、聚焦与关闭。
+    fn prepare_blank_context_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(surface) = self.selection_surface.get() else {
+            return;
+        };
+        if !surface.contains(&position) {
+            return;
+        }
+
+        let visible = self.table.read(cx).visible_range().rows().clone();
+        let bounds = self.row_bounds.borrow();
+        if bounds
+            .iter()
+            .any(|(row, bounds)| visible.contains(row) && bounds.contains(&position))
+        {
+            return;
+        }
+        // 表头不是目录空白区；没有任何条目时使用组件默认的 32px 表头高度。
+        let body_top = bounds
+            .iter()
+            .filter(|(row, _)| visible.contains(row))
+            .map(|(_, bounds)| bounds.top())
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(surface.top() + px(32.));
+        drop(bounds);
+        if position.y < body_top {
+            return;
+        }
+
+        let blank_row = self.table.read(cx).delegate().rows_len();
+        self.table.update(cx, |state, cx| {
+            state.set_right_clicked_row(Some(blank_row), cx);
+        });
+    }
+
+    fn begin_marquee(
+        &mut self,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        self.marquee = None;
+        self.preserve_selection_on_table_click = false;
+        let Some(surface) = self.selection_surface.get() else {
+            return;
+        };
+        if !surface.contains(&position) {
+            return;
+        }
+
+        // 表头不参与框选。第一条可见行的 top 最可靠；空目录则用组件默认 32px 表头。
+        let body_top = self
+            .row_bounds
+            .borrow()
+            .values()
+            .map(Bounds::top)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(surface.top() + px(32.));
+        if position.y < body_top {
+            return;
+        }
+
+        let visible = self.table.read(cx).visible_range().rows().clone();
+        let start_row = self
+            .row_bounds
+            .borrow()
+            .iter()
+            .find(|(row, bounds)| visible.contains(row) && bounds.contains(&position))
+            .map(|(row, _)| *row);
+        let secondary = modifiers.secondary();
+        let toggle = secondary || modifiers.control;
+        if (toggle || modifiers.shift)
+            && let Some(row) = start_row
+        {
+            // TableState 会吞掉带修饰键的 click；在 MouseDown 就完成多选，
+            // 同时不进入框选状态，避免 MouseUp 被行事件截住后留下悬空手势。
+            self.preserve_selection_on_table_click = toggle && !secondary && !modifiers.shift;
+            self.click_row(row, toggle, modifiers.shift, cx);
+            return;
+        }
+        let initial_rows = if toggle {
+            self.table.read(cx).delegate().selected_rows.clone()
+        } else {
+            BTreeSet::new()
+        };
+        self.marquee = Some(MarqueeSelection {
+            start: position,
+            current: position,
+            initial_rows,
+            start_row,
+            active: false,
+        });
+    }
+
+    fn update_marquee(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(surface) = self.selection_surface.get() else {
+            return;
+        };
+        let Some(marquee) = self.marquee.as_mut() else {
+            return;
+        };
+
+        marquee.current = point(
+            clamp_pixel(position.x, surface.left(), surface.right()),
+            clamp_pixel(position.y, surface.top(), surface.bottom()),
+        );
+        let dx = (marquee.current.x - marquee.start.x).as_f32();
+        let dy = (marquee.current.y - marquee.start.y).as_f32();
+        let became_active = !marquee.active && dx * dx + dy * dy >= 16.0;
+        if !marquee.active && !became_active {
+            return;
+        }
+        marquee.active = true;
+
+        let rect = marquee_bounds(marquee.start, marquee.current);
+        let visible = self.table.read(cx).visible_range().rows().clone();
+        let hit_rows: BTreeSet<usize> = self
+            .row_bounds
+            .borrow()
+            .iter()
+            .filter(|(row, bounds)| visible.contains(row) && rect.intersects(bounds))
+            .map(|(row, _)| *row)
+            .collect();
+        let initial_rows = marquee.initial_rows.clone();
+
+        self.table.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            delegate.selected_rows = initial_rows
+                .into_iter()
+                .chain(hit_rows)
+                .filter(|row| {
+                    delegate
+                        .entry_at(*row)
+                        .is_some_and(|entry| !is_parent_row(&entry))
+                })
+                .collect();
+            if became_active {
+                state.clear_selection(cx);
+            }
+            state.refresh(cx);
+        });
+        cx.notify();
+    }
+
+    fn end_marquee(&mut self, cx: &mut Context<Self>) {
+        let Some(marquee) = self.marquee.take() else {
+            return;
+        };
+
+        if !marquee.active {
+            if marquee.start_row.is_none() {
+                self.table.update(cx, |state, cx| {
+                    state.delegate_mut().clear_selection();
+                    state.clear_selection(cx);
+                    state.refresh(cx);
+                });
+            }
+        }
+        cx.notify();
+    }
+
     /// 右键菜单选中后由表格回调进来。
     ///
     /// 刷新是本面板自己的事（本地面板重读磁盘、远端面板重发一次 `Navigate`），
     /// 所以在这里就地处理；其余动作都交给上层翻译成网络指令。
     fn request(&mut self, action: FileAction, entry: FileEntry, cx: &mut Context<Self>) {
         match action {
+            FileAction::Refresh | FileAction::NewFolder => self.request_pane(action, cx),
+            FileAction::Upload
+            | FileAction::Download
+            | FileAction::Edit
+            | FileAction::CopyPath
+            | FileAction::RevealInFinder
+            | FileAction::Rename
+            | FileAction::Delete => {
+                let entries = if matches!(
+                    action,
+                    FileAction::Upload | FileAction::Download | FileAction::CopyPath
+                ) {
+                    let selected = self.table.read(cx).delegate().selected_entries();
+                    if selected.iter().any(|selected| selected.path == entry.path) {
+                        selected
+                    } else {
+                        vec![entry]
+                    }
+                } else {
+                    vec![entry]
+                };
+                cx.emit(FilePaneEvent::Action { entries, action });
+            }
+        }
+    }
+
+    fn request_pane(&mut self, action: FileAction, cx: &mut Context<Self>) {
+        match action {
             FileAction::Refresh => self.reload(cx),
             FileAction::NewFolder => cx.emit(FilePaneEvent::PaneAction(action)),
-            FileAction::Upload | FileAction::Download | FileAction::Rename | FileAction::Delete => {
-                cx.emit(FilePaneEvent::Action { entry, action });
-            }
+            _ => {}
         }
     }
 
     /// 构造 `..` 行；已经在根目录时返回 `None`。
     fn parent_entry(&self) -> Option<FileEntry> {
         let parent = match self.side {
-            PaneSide::Local => {
-                crate::sftp::session::local_parent(Path::new(&self.path)).map(|p| p.to_string_lossy().to_string())
-            }
+            PaneSide::Local => crate::sftp::session::local_parent(Path::new(&self.path))
+                .map(|p| p.to_string_lossy().to_string()),
             PaneSide::Remote => Some(remote_parent(&self.path)),
         }?;
 
@@ -462,10 +746,23 @@ impl FilePane {
         }
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let weak = cx.entity().downgrade();
         let crumb_count = self.crumbs().len();
+        let pane_ix = match self.side {
+            PaneSide::Local => 0usize,
+            PaneSide::Remote => 1,
+        };
+
+        if std::mem::take(&mut self.reveal_address_end) {
+            let scroll = self.address_scroll.clone();
+            let weak = weak.clone();
+            window.on_next_frame(move |_, cx| {
+                scroll.set_offset(point(-scroll.max_offset().x, px(0.)));
+                let _ = weak.update(cx, |_, cx| cx.notify());
+            });
+        }
 
         let mut breadcrumb = Breadcrumb::new();
         for (ix, (label, target)) in self.crumbs().into_iter().enumerate() {
@@ -473,19 +770,26 @@ impl FilePane {
             let is_last = ix + 1 == crumb_count;
             breadcrumb = breadcrumb.child(
                 BreadcrumbItem::new(label)
+                    .flex_none()
+                    .whitespace_nowrap()
                     .disabled(is_last)
                     .on_click(move |_, _, cx| {
                         let _ = weak.update(cx, |pane, cx| pane.navigate(target.clone(), cx));
                     }),
             );
         }
+        let breadcrumb = breadcrumb.flex_none().w_auto().min_w_full();
 
         let count = self.entries_count(cx);
+        let selected = self.selected_count(cx);
         let count_label = if self.loading {
             "加载中…".to_string()
+        } else if selected > 0 {
+            format!("{count} 项 · 已选 {selected} 项")
         } else {
             format!("{count} 项")
         };
+        let current_path = self.path.clone();
 
         h_flex()
             .w_full()
@@ -505,7 +809,26 @@ impl FilePane {
                         PaneSide::Local => IconName::HardDrive,
                         PaneSide::Remote => IconName::Server,
                     })
-                    .child(div().flex_1().min_w_0().overflow_hidden().child(breadcrumb)),
+                    .child(
+                        div()
+                            .id(("pane-address", pane_ix))
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .id(("pane-address-scroll", pane_ix))
+                                    .size_full()
+                                    .flex()
+                                    .flex_row()
+                                    .overflow_x_scroll()
+                                    .lock_scroll_axis()
+                                    .track_scroll(&self.address_scroll)
+                                    .child(breadcrumb),
+                            )
+                            // 鼠标普通滚轮也可以横向查看长路径；触控板仍保留原生横向手势。
+                            .child(ScrollableMask::vertical_wheel(&self.address_scroll)),
+                    ),
             )
             .child(
                 h_flex()
@@ -517,23 +840,26 @@ impl FilePane {
                             .text_color(theme.muted_foreground)
                             .child(SharedString::from(count_label)),
                     )
-                    .when(self.mock, |this| {
-                        this.child(
-                            div()
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(theme.border)
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("示例数据"),
-                        )
-                    })
+                    .child(
+                        Button::new(("pane-copy-path", pane_ix))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Copy)
+                            .tooltip("复制当前路径")
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    current_path.clone(),
+                                ));
+                            }),
+                    )
                     .child(
                         Button::new((
                             "pane-hidden",
-                            if self.side == PaneSide::Remote { 1usize } else { 0 },
+                            if self.side == PaneSide::Remote {
+                                1usize
+                            } else {
+                                0
+                            },
                         ))
                         .ghost()
                         .xsmall()
@@ -559,38 +885,46 @@ impl FilePane {
                     .child(
                         Button::new((
                             "pane-up",
-                            if self.side == PaneSide::Remote { 1usize } else { 0 },
+                            if self.side == PaneSide::Remote {
+                                1usize
+                            } else {
+                                0
+                            },
                         ))
                         .ghost()
-                            .xsmall()
-                            .icon(IconName::ArrowUp)
-                            .tooltip("上级目录")
-                            .on_click({
-                                let weak = weak.clone();
-                                move |_, _, cx| {
-                                    let _ = weak.update(cx, |pane, cx| pane.go_up(cx));
-                                }
-                            }),
+                        .xsmall()
+                        .icon(IconName::ArrowUp)
+                        .tooltip("上级目录")
+                        .on_click({
+                            let weak = weak.clone();
+                            move |_, _, cx| {
+                                let _ = weak.update(cx, |pane, cx| pane.go_up(cx));
+                            }
+                        }),
                     )
                     .child(
                         Button::new((
                             "pane-refresh",
-                            if self.side == PaneSide::Remote { 1usize } else { 0 },
+                            if self.side == PaneSide::Remote {
+                                1usize
+                            } else {
+                                0
+                            },
                         ))
                         .ghost()
-                            .xsmall()
-                            .icon(IconName::RefreshCw)
-                            .tooltip("刷新")
-                            .on_click(move |_, _, cx| {
-                                let _ = weak.update(cx, |pane, cx| pane.reload(cx));
-                            }),
+                        .xsmall()
+                        .icon(IconName::RefreshCw)
+                        .tooltip("刷新")
+                        .on_click(move |_, _, cx| {
+                            let _ = weak.update(cx, |pane, cx| pane.reload(cx));
+                        }),
                     ),
             )
     }
 }
 
 impl Render for FilePane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         // 拖拽结束（Esc 取消、拖到别处）后 `active_drag` 会被清空，高亮跟着消失。
         let dropping = self.drop_hover.is_some() && cx.has_active_drag();
@@ -599,13 +933,79 @@ impl Render for FilePane {
             PaneSide::Remote => 1,
         };
         let weak = cx.entity().downgrade();
+        let surface_bounds = self.selection_surface.clone();
+        let marquee = self.marquee.clone();
+
+        let selection_surface = {
+            let down_weak = weak.clone();
+            let move_weak = weak.clone();
+            let up_weak = weak.clone();
+            let context_weak = weak.clone();
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(DataTable::new(&self.table))
+                .child(
+                    canvas(
+                        move |bounds, _, _| surface_bounds.set(Some(bounds)),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+                .when_some(
+                    marquee
+                        .filter(|marquee| marquee.active)
+                        .and_then(|marquee| self.selection_surface.get().map(|s| (marquee, s))),
+                    |this, (marquee, surface)| {
+                        let rect = marquee_bounds(marquee.start, marquee.current);
+                        this.child(
+                            div()
+                                .absolute()
+                                .left(rect.left() - surface.left())
+                                .top(rect.top() - surface.top())
+                                .w(rect.size.width)
+                                .h(rect.size.height)
+                                .border_1()
+                                .border_color(theme.primary)
+                                .bg(theme.primary.opacity(0.12)),
+                        )
+                    },
+                )
+                .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                    let modifiers = event.modifiers;
+                    let _ = down_weak.update(cx, |pane, cx| {
+                        pane.begin_marquee(event.position, modifiers, cx)
+                    });
+                })
+                .on_mouse_move(move |event, _, cx| {
+                    if event.dragging() {
+                        let _ = move_weak
+                            .update(cx, |pane, cx| pane.update_marquee(event.position, cx));
+                    }
+                })
+                .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                    let _ = up_weak.update(cx, |pane, cx| pane.end_marquee(cx));
+                })
+                // 子级 DataTable 会在冒泡阶段截住右键；捕获阶段先辨认正文空白，
+                // 这样有条目和完全空目录时都能稳定打开面板菜单。
+                .capture_any_mouse_down(move |event, _, cx| {
+                    if event.button == MouseButton::Right {
+                        let _ = context_weak.update(cx, |pane, cx| {
+                            pane.prepare_blank_context_menu(event.position, cx)
+                        });
+                    }
+                })
+        };
 
         v_flex()
             .size_full()
             .min_w_0()
             .bg(theme.background)
             .id(("pane-root", pane_ix))
-            .child(self.render_header(cx))
+            .child(self.render_header(window, cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -622,7 +1022,7 @@ impl Render for FilePane {
                                 .child(error),
                         )
                     })
-                    .child(div().flex_1().min_h_0().child(DataTable::new(&self.table))),
+                    .child(selection_surface),
             )
             // 拖放目标：只有远端面板接收外部文件。
             .when(self.side == PaneSide::Remote, |this| {
@@ -635,36 +1035,31 @@ impl Render for FilePane {
                 .on_mouse_up(MouseButton::Left, move |_, _window, cx| {
                     let _ = drop_weak.update(cx, |pane, cx| pane.commit_drop(cx));
                 })
-                    // 悬停时给一个明显的高亮 + 提示，让用户知道松手会上传到哪里。
-                    .when(dropping, |this| {
-                        this.border_2()
-                            .border_color(theme.primary)
+                // 悬停时给一个明显的高亮 + 提示，让用户知道松手会上传到哪里。
+                .when(dropping, |this| {
+                    this.border_2().border_color(theme.primary).child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme.primary.opacity(0.06))
                             .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(theme.primary.opacity(0.06))
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .px_3()
-                                            .py_1p5()
-                                            .rounded_md()
-                                            .bg(theme.background)
-                                            .border_1()
-                                            .border_color(theme.primary)
-                                            .text_sm()
-                                            .child(IconName::Upload)
-                                            .child(SharedString::from(format!(
-                                                "松手上传到 {}",
-                                                self.path
-                                            ))),
-                                    ),
-                            )
-                    })
+                                h_flex()
+                                    .gap_2()
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(theme.background)
+                                    .border_1()
+                                    .border_color(theme.primary)
+                                    .text_sm()
+                                    .child(IconName::Upload)
+                                    .child(SharedString::from(format!("松手上传到 {}", self.path))),
+                            ),
+                    )
+                })
             })
     }
 }
@@ -686,6 +1081,9 @@ pub struct FileTable {
     online: bool,
     side: PaneSide,
     pane: WeakEntity<FilePane>,
+    selected_rows: BTreeSet<usize>,
+    selection_anchor: Option<usize>,
+    row_bounds: Rc<RefCell<BTreeMap<usize, Bounds<Pixels>>>>,
 }
 
 impl FileTable {
@@ -722,6 +1120,23 @@ impl FileTable {
         self.apply_visibility();
     }
 
+    fn rows_len(&self) -> usize {
+        self.entries.len() + usize::from(self.parent.is_some())
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected_rows.clear();
+        self.selection_anchor = None;
+    }
+
+    fn selected_entries(&self) -> Vec<FileEntry> {
+        self.selected_rows
+            .iter()
+            .filter_map(|row| self.entry_at(*row))
+            .filter(|entry| !is_parent_row(entry))
+            .collect()
+    }
+
     /// 右键菜单项。`entry` 由调用方克隆进来，点击时闭包自己再克隆一份。
     fn action_item(pane: &WeakEntity<FilePane>, spec: MenuSpec, entry: FileEntry) -> PopupMenuItem {
         let pane = pane.clone();
@@ -732,6 +1147,18 @@ impl FileTable {
             .on_click(move |_, _, cx| {
                 let entry = entry.clone();
                 let _ = pane.update(cx, |pane, cx| pane.request(action, entry, cx));
+            })
+    }
+
+    /// 空白区域没有条目，只提供作用于当前目录的动作。
+    fn pane_action_item(pane: &WeakEntity<FilePane>, spec: MenuSpec) -> PopupMenuItem {
+        let pane = pane.clone();
+        let action = spec.action;
+        PopupMenuItem::new(spec.label)
+            .icon(spec.icon)
+            .disabled(spec.disabled)
+            .on_click(move |_, _, cx| {
+                let _ = pane.update(cx, |pane, cx| pane.request_pane(action, cx));
             })
     }
 }
@@ -750,13 +1177,34 @@ pub struct MenuSpec {
     pub separator_before: bool,
 }
 
+/// 面板空白区域的右键菜单：动作只针对当前目录，不借用任何文件条目。
+pub fn pane_menu_spec(side: PaneSide, online: bool) -> Vec<MenuSpec> {
+    vec![
+        MenuSpec {
+            label: "新建目录…",
+            icon: IconName::FolderPlus,
+            action: FileAction::NewFolder,
+            disabled: side == PaneSide::Remote && !online,
+            separator_before: false,
+        },
+        MenuSpec {
+            label: "刷新列表",
+            icon: IconName::RefreshCw,
+            action: FileAction::Refresh,
+            disabled: false,
+            separator_before: true,
+        },
+    ]
+}
+
 /// 某一侧、某个条目该有哪些右键菜单项。
 ///
 /// 这里承接了原先工具栏上那一排按钮（上传 / 下载 / 新建目录 / 删除 / 刷新）：
 ///
-/// * 本地：`上传到当前远程目录`（目录则是 `上传文件夹到当前远程目录`）+ `刷新列表`；
+/// * 本地：上传 / 编辑 / 在 Finder 中显示 / 复制路径 / 新建目录 / 重命名 /
+///   移到废纸篓 / 刷新；
 /// * 远端：`下载到当前本地目录`（目录则是 `下载文件夹到当前本地目录`）/
-///   `新建目录…` / `重命名…` / `删除` / `刷新列表`。
+///   编辑 / 复制路径 / 新建目录 / 重命名 / 永久删除 / 刷新。
 ///
 /// 两侧的目录都能整棵递归传：worker 侧一边递归建目录 + 上传，另一边递归
 /// 建本地目录 + 下载。未连接时网络动作置灰。
@@ -766,6 +1214,10 @@ pub fn menu_spec(side: PaneSide, online: bool, entry: &FileEntry) -> Vec<MenuSpe
     let offline = !online;
     let is_dir = entry.is_dir();
     let is_entry = !is_parent_row(entry);
+
+    if !is_entry {
+        return pane_menu_spec(side, online);
+    }
 
     let refresh = MenuSpec {
         label: "刷新列表",
@@ -791,6 +1243,52 @@ pub fn menu_spec(side: PaneSide, online: bool, entry: &FileEntry) -> Vec<MenuSpe
                     disabled: offline,
                     separator_before: false,
                 });
+                if !is_dir {
+                    items.push(MenuSpec {
+                        label: "编辑…",
+                        icon: IconName::Pencil,
+                        action: FileAction::Edit,
+                        disabled: false,
+                        separator_before: false,
+                    });
+                }
+                items.push(MenuSpec {
+                    label: "在访达中显示",
+                    icon: IconName::FolderOpen,
+                    action: FileAction::RevealInFinder,
+                    disabled: false,
+                    separator_before: true,
+                });
+                items.push(MenuSpec {
+                    label: "复制路径",
+                    icon: IconName::Copy,
+                    action: FileAction::CopyPath,
+                    disabled: false,
+                    separator_before: false,
+                });
+            }
+            items.push(MenuSpec {
+                label: "新建目录…",
+                icon: IconName::FolderPlus,
+                action: FileAction::NewFolder,
+                disabled: false,
+                separator_before: is_entry,
+            });
+            if is_entry {
+                items.push(MenuSpec {
+                    label: "重命名…",
+                    icon: IconName::FilePen,
+                    action: FileAction::Rename,
+                    disabled: false,
+                    separator_before: false,
+                });
+                items.push(MenuSpec {
+                    label: "移到废纸篓",
+                    icon: IconName::Trash,
+                    action: FileAction::Delete,
+                    disabled: false,
+                    separator_before: true,
+                });
             }
             items.push(refresh);
             items
@@ -810,6 +1308,22 @@ pub fn menu_spec(side: PaneSide, online: bool, entry: &FileEntry) -> Vec<MenuSpe
                     disabled: offline,
                     separator_before: false,
                 });
+                if !is_dir {
+                    items.push(MenuSpec {
+                        label: "编辑…",
+                        icon: IconName::Pencil,
+                        action: FileAction::Edit,
+                        disabled: offline,
+                        separator_before: false,
+                    });
+                }
+                items.push(MenuSpec {
+                    label: "复制路径",
+                    icon: IconName::Copy,
+                    action: FileAction::CopyPath,
+                    disabled: false,
+                    separator_before: true,
+                });
             }
             items.push(MenuSpec {
                 label: "新建目录…",
@@ -821,17 +1335,17 @@ pub fn menu_spec(side: PaneSide, online: bool, entry: &FileEntry) -> Vec<MenuSpe
             if is_entry {
                 items.push(MenuSpec {
                     label: "重命名…",
-                    icon: IconName::Pencil,
+                    icon: IconName::FilePen,
                     action: FileAction::Rename,
                     disabled: offline,
-                    separator_before: true,
+                    separator_before: false,
                 });
                 items.push(MenuSpec {
-                    label: "删除",
+                    label: "永久删除",
                     icon: IconName::Trash,
                     action: FileAction::Delete,
                     disabled: offline,
-                    separator_before: false,
+                    separator_before: true,
                 });
             }
             items.push(refresh);
@@ -890,7 +1404,9 @@ impl TableDelegate for FileTable {
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
         match col_ix {
-            0 => Column::new("name", "名称").width(px(190.)).min_width(px(120.)),
+            0 => Column::new("name", "名称")
+                .width(px(190.))
+                .min_width(px(120.)),
             1 => Column::new("size", "大小")
                 .width(px(76.))
                 .text_right()
@@ -904,6 +1420,36 @@ impl TableDelegate for FileTable {
 
     fn loading(&self, _: &App) -> bool {
         self.loading
+    }
+
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        let row_bounds = self.row_bounds.clone();
+        div()
+            .id(("row", row_ix))
+            .relative()
+            .child(
+                canvas(
+                    move |bounds, _, _| {
+                        row_bounds.borrow_mut().insert(row_ix, bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .when(self.selected_rows.contains(&row_ix), |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(cx.theme().tokens.table_active),
+                )
+            })
     }
 
     fn render_td(
@@ -925,9 +1471,7 @@ impl TableDelegate for FileTable {
                     cell = cell.child(Self::icon_for(&entry)).child(
                         div()
                             .truncate()
-                            .when(parent_row, |this| {
-                                this.text_color(theme.muted_foreground)
-                            })
+                            .when(parent_row, |this| this.text_color(theme.muted_foreground))
                             .child(SharedString::from(entry.name.clone())),
                     );
                 }
@@ -974,11 +1518,30 @@ impl TableDelegate for FileTable {
         row_ix: usize,
         menu: PopupMenu,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         let Some(entry) = self.entry_at(row_ix) else {
+            self.clear_selection();
+            cx.notify();
+            let mut menu = menu;
+            for spec in pane_menu_spec(self.side, self.online) {
+                if spec.separator_before {
+                    menu = menu.separator();
+                }
+                menu = menu.item(Self::pane_action_item(&self.pane, spec));
+            }
             return menu;
         };
+
+        // Finder 风格：右键已选条目保留整批；右键未选条目则只选它。
+        if !self.selected_rows.contains(&row_ix) {
+            self.clear_selection();
+            if !is_parent_row(&entry) {
+                self.selected_rows.insert(row_ix);
+                self.selection_anchor = Some(row_ix);
+            }
+            cx.notify();
+        }
 
         let mut menu = menu;
         for spec in menu_spec(self.side, self.online, &entry) {
@@ -989,6 +1552,37 @@ impl TableDelegate for FileTable {
         }
         menu
     }
+}
+
+fn clamp_pixel(value: Pixels, min: Pixels, max: Pixels) -> Pixels {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
+
+fn marquee_bounds(a: Point<Pixels>, b: Point<Pixels>) -> Bounds<Pixels> {
+    let left = if a.x < b.x { a.x } else { b.x };
+    let top = if a.y < b.y { a.y } else { b.y };
+    let right = if a.x > b.x { a.x } else { b.x };
+    let bottom = if a.y > b.y { a.y } else { b.y };
+    Bounds::new(point(left, top), size(right - left, bottom - top))
+}
+
+fn selectable_row_range(
+    anchor: usize,
+    row: usize,
+    rows_len: usize,
+    has_parent: bool,
+) -> BTreeSet<usize> {
+    let start = anchor.min(row);
+    let end = anchor.max(row).min(rows_len.saturating_sub(1));
+    (start..=end)
+        .filter(|row| !(has_parent && *row == 0))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,14 +1654,23 @@ mod tests {
     /// 行号映射：有 `..` 时第 0 行是上级目录，数据整体后移一位。
     #[test]
     fn row_entry_offsets_rows_when_parent_row_present() {
-        let entries = vec![entry("a", EntryKind::File), entry("b", EntryKind::Directory)];
+        let entries = vec![
+            entry("a", EntryKind::File),
+            entry("b", EntryKind::Directory),
+        ];
         let parent = entry(PARENT_ROW_NAME, EntryKind::Directory);
 
         assert!(is_parent_row(
             &row_entry(Some(&parent), &entries, 0).expect("第 0 行")
         ));
-        assert_eq!(row_entry(Some(&parent), &entries, 1).expect("第 1 行").name, "a");
-        assert_eq!(row_entry(Some(&parent), &entries, 2).expect("第 2 行").name, "b");
+        assert_eq!(
+            row_entry(Some(&parent), &entries, 1).expect("第 1 行").name,
+            "a"
+        );
+        assert_eq!(
+            row_entry(Some(&parent), &entries, 2).expect("第 2 行").name,
+            "b"
+        );
         assert!(row_entry(Some(&parent), &entries, 3).is_none());
     }
 
@@ -1079,33 +1682,349 @@ mod tests {
         assert!(row_entry(None, &entries, 1).is_none());
     }
 
-    /// 本地文件：上传 + 刷新列表，连接后才可上传。
     #[test]
-    fn local_menu_offers_upload_and_refresh() {
+    fn shift_range_never_selects_the_parent_row() {
+        assert_eq!(
+            selectable_row_range(3, 0, 5, true),
+            BTreeSet::from([1, 2, 3])
+        );
+        assert_eq!(
+            selectable_row_range(0, 2, 3, false),
+            BTreeSet::from([0, 1, 2])
+        );
+    }
+
+    #[test]
+    fn marquee_bounds_are_normalized_in_every_drag_direction() {
+        let forward = marquee_bounds(point(px(10.), px(20.)), point(px(40.), px(70.)));
+        let reverse = marquee_bounds(point(px(40.), px(70.)), point(px(10.), px(20.)));
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.origin, point(px(10.), px(20.)));
+        assert_eq!(forward.size, size(px(30.), px(50.)));
+    }
+
+    #[::gpui::test]
+    fn long_address_bar_scrolls_to_the_current_directory(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let path = format!(
+            "/{}",
+            (0..24)
+                .map(|ix| format!("very-long-directory-{ix:02}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        let window = cx.open_window(size(px(480.), px(320.)), |window, cx| {
+            FilePane::new(PaneSide::Remote, path, window, cx)
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let pane = window.root(&mut cx).expect("文件面板根视图");
+
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+
+        pane.read_with(&cx, |pane, _| {
+            let max = pane.address_scroll.max_offset().x;
+            assert!(max > px(0.), "长路径应产生水平滚动范围");
+            assert_eq!(pane.address_scroll.offset().x, -max);
+        });
+    }
+
+    #[::gpui::test]
+    fn right_clicking_table_whitespace_opens_the_pane_menu(cx: &mut gpui::TestAppContext) {
+        let new_folder_requested = Rc::new(Cell::new(false));
+        cx.update(gpui_kit::init);
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let mut pane = FilePane::new(PaneSide::Remote, "/home".to_string(), window, cx);
+            pane.set_online(true, cx);
+            pane.set_entries(
+                "/home".to_string(),
+                vec![entry("one.txt", EntryKind::File)],
+                cx,
+            );
+            pane
+        });
+        cx.update(|_, cx| {
+            let requested = new_folder_requested.clone();
+            cx.subscribe(&pane, move |_, event: &FilePaneEvent, _| {
+                if matches!(event, FilePaneEvent::PaneAction(FileAction::NewFolder)) {
+                    requested.set(true);
+                }
+            })
+            .detach();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let press = pane.read_with(cx, |pane, _| {
+            let surface = pane.selection_surface.get().expect("表格区域已布局");
+            let rows = pane.row_bounds.borrow();
+            let rows_bottom = rows
+                .values()
+                .map(Bounds::bottom)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("至少有上级目录和一个文件行");
+            let position = point(surface.left() + px(20.), rows_bottom + px(20.));
+            assert!(surface.contains(&position), "测试点必须落在表格空白区域");
+            assert!(rows.values().all(|bounds| !bounds.contains(&position)));
+            position
+        });
+
+        cx.simulate_mouse_down(press, MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(press, MouseButton::Right, Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        pane.read_with(cx, |pane, cx| {
+            let table = pane.table.read(cx);
+            assert_eq!(
+                table.right_clicked_row(),
+                Some(table.delegate().rows_len()),
+                "空白区应被标记为面板菜单，而不是丢掉右键"
+            );
+        });
+
+        let first_item = point(press.x + px(30.), press.y + px(17.));
+        cx.simulate_mouse_move(first_item, None, Modifiers::default());
+        cx.simulate_click(first_item, Modifiers::default());
+        cx.run_until_parked();
+        assert!(new_folder_requested.get(), "面板菜单第一项应可点击");
+    }
+
+    #[::gpui::test]
+    fn dragging_across_rows_selects_every_intersected_entry(cx: &mut gpui::TestAppContext) {
+        let emitted = Rc::new(RefCell::new(Vec::<String>::new()));
+        cx.update(gpui_kit::init);
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let mut pane = FilePane::new(PaneSide::Remote, "/home".to_string(), window, cx);
+            pane.set_entries(
+                "/home".to_string(),
+                vec![
+                    entry("one", EntryKind::File),
+                    entry("two", EntryKind::File),
+                    entry("three", EntryKind::Directory),
+                    entry("four", EntryKind::File),
+                ],
+                cx,
+            );
+            pane
+        });
+        cx.update(|_, cx| {
+            let emitted = emitted.clone();
+            cx.subscribe(&pane, move |_, event: &FilePaneEvent, _| {
+                if let FilePaneEvent::Action {
+                    entries,
+                    action: FileAction::Download,
+                } = event
+                {
+                    emitted
+                        .borrow_mut()
+                        .extend(entries.iter().map(|entry| entry.name.clone()));
+                }
+            })
+            .detach();
+        });
+
+        let (first, third) = pane.read_with(cx, |pane, _| {
+            let bounds = pane.row_bounds.borrow();
+            let first = bounds.get(&1).copied().expect("第一个文件行已渲染");
+            let third = bounds.get(&3).copied().expect("第三个文件行已渲染");
+            (first, third)
+        });
+        let start = point(first.right() - px(8.), first.top() + px(8.));
+        let end = point(third.left() + px(8.), third.bottom() - px(8.));
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+
+        pane.read_with(cx, |pane, cx| {
+            let selected: Vec<_> = pane
+                .table
+                .read(cx)
+                .delegate()
+                .selected_entries()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert_eq!(selected, ["one", "two", "three"]);
+            assert_eq!(pane.selected_count(cx), 3);
+            assert!(pane.marquee.is_none(), "松手后框选矩形应消失");
+        });
+
+        let clicked = pane.read_with(cx, |pane, cx| {
+            pane.table
+                .read(cx)
+                .delegate()
+                .entry_at(2)
+                .expect("框选内的条目")
+        });
+        pane.update(cx, |pane, cx| {
+            pane.request(FileAction::Download, clicked, cx)
+        });
+        assert_eq!(*emitted.borrow(), ["one", "two", "three"]);
+    }
+
+    #[::gpui::test]
+    fn control_click_adds_and_removes_files_from_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let mut pane = FilePane::new(PaneSide::Remote, "/home".to_string(), window, cx);
+            pane.set_entries(
+                "/home".to_string(),
+                vec![
+                    entry("one", EntryKind::File),
+                    entry("two", EntryKind::File),
+                    entry("three", EntryKind::File),
+                ],
+                cx,
+            );
+            pane
+        });
+
+        let (first, third) = pane.read_with(cx, |pane, _| {
+            let bounds = pane.row_bounds.borrow();
+            (
+                bounds.get(&1).copied().expect("第一个文件行已渲染"),
+                bounds.get(&3).copied().expect("第三个文件行已渲染"),
+            )
+        });
+        cx.simulate_click(first.center(), Modifiers::default());
+        cx.simulate_mouse_down(third.center(), MouseButton::Left, Modifiers::control());
+        pane.read_with(cx, |pane, _| {
+            assert!(pane.marquee.is_none(), "Control 单击不应进入框选状态");
+        });
+        cx.simulate_mouse_up(third.center(), MouseButton::Left, Modifiers::control());
+        pane.read_with(cx, |pane, cx| {
+            let selected: Vec<_> = pane
+                .table
+                .read(cx)
+                .delegate()
+                .selected_entries()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert_eq!(selected, ["one", "three"]);
+        });
+
+        cx.simulate_click(first.center(), Modifiers::control());
+        pane.read_with(cx, |pane, cx| {
+            let selected: Vec<_> = pane
+                .table
+                .read(cx)
+                .delegate()
+                .selected_entries()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert_eq!(selected, ["three"], "Control 点击已选项应减选");
+        });
+    }
+
+    #[::gpui::test]
+    fn shift_click_selects_the_contiguous_row_range(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let mut pane = FilePane::new(PaneSide::Remote, "/home".to_string(), window, cx);
+            pane.set_entries(
+                "/home".to_string(),
+                vec![
+                    entry("one", EntryKind::File),
+                    entry("two", EntryKind::File),
+                    entry("three", EntryKind::File),
+                ],
+                cx,
+            );
+            pane
+        });
+
+        let (first, third) = pane.read_with(cx, |pane, _| {
+            let bounds = pane.row_bounds.borrow();
+            (
+                bounds.get(&1).copied().expect("第一个文件行已渲染"),
+                bounds.get(&3).copied().expect("第三个文件行已渲染"),
+            )
+        });
+        cx.simulate_click(first.center(), Modifiers::default());
+        cx.simulate_click(third.center(), Modifiers::shift());
+
+        pane.read_with(cx, |pane, cx| {
+            let selected: Vec<_> = pane
+                .table
+                .read(cx)
+                .delegate()
+                .selected_entries()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert_eq!(selected, ["one", "two", "three"]);
+        });
+    }
+
+    /// 本地文件具备完整的文件管理菜单；只有上传依赖远端连接。
+    #[test]
+    fn local_menu_offers_edit_reveal_copy_and_file_management() {
         let file = entry("a.txt", EntryKind::File);
 
         let online = menu_spec(PaneSide::Local, true, &file);
         let labels: Vec<_> = online.iter().map(|item| item.label).collect();
-        assert_eq!(labels, ["上传到当前远程目录", "刷新列表"]);
-        assert_eq!(online[0].action, FileAction::Upload);
-        assert!(!online[0].disabled);
-        assert!(!online[1].disabled, "刷新不需要连接");
+        assert_eq!(
+            labels,
+            [
+                "上传到当前远程目录",
+                "编辑…",
+                "在访达中显示",
+                "复制路径",
+                "新建目录…",
+                "重命名…",
+                "移到废纸篓",
+                "刷新列表"
+            ]
+        );
+        let actions: Vec<_> = online.iter().map(|item| item.action).collect();
+        assert_eq!(
+            actions,
+            [
+                FileAction::Upload,
+                FileAction::Edit,
+                FileAction::RevealInFinder,
+                FileAction::CopyPath,
+                FileAction::NewFolder,
+                FileAction::Rename,
+                FileAction::Delete,
+                FileAction::Refresh,
+            ]
+        );
+        assert!(online.iter().all(|item| !item.disabled));
 
         let offline = menu_spec(PaneSide::Local, false, &file);
         assert!(offline[0].disabled, "未连接时上传应置灰");
-        assert!(!offline[1].disabled, "未连接也能刷新本地列表");
+        assert!(
+            offline.iter().skip(1).all(|item| !item.disabled),
+            "本地编辑和文件管理不应依赖远端连接"
+        );
     }
 
-    /// 远端文件：下载 / 新建目录 / 重命名 / 删除 / 刷新，分段清晰。
+    /// 远端文件：下载 / 编辑 / 复制路径 / 新建目录 / 重命名 / 永久删除 / 刷新。
     #[test]
-    fn remote_menu_lists_download_new_folder_rename_delete_refresh() {
+    fn remote_menu_lists_copy_path_and_file_management_actions() {
         let file = entry("a.txt", EntryKind::File);
         let spec = menu_spec(PaneSide::Remote, true, &file);
 
         let labels: Vec<_> = spec.iter().map(|item| item.label).collect();
         assert_eq!(
             labels,
-            ["下载到当前本地目录", "新建目录…", "重命名…", "删除", "刷新列表"]
+            [
+                "下载到当前本地目录",
+                "编辑…",
+                "复制路径",
+                "新建目录…",
+                "重命名…",
+                "永久删除",
+                "刷新列表"
+            ]
         );
 
         let actions: Vec<_> = spec.iter().map(|item| item.action).collect();
@@ -1113,6 +2032,8 @@ mod tests {
             actions,
             [
                 FileAction::Download,
+                FileAction::Edit,
+                FileAction::CopyPath,
                 FileAction::NewFolder,
                 FileAction::Rename,
                 FileAction::Delete,
@@ -1123,8 +2044,8 @@ mod tests {
         assert!(spec.iter().all(|item| !item.disabled));
         assert_eq!(
             spec.iter().filter(|item| item.separator_before).count(),
-            3,
-            "新建目录前、重命名前、刷新前各一条分隔线"
+            4,
+            "复制路径、新建目录、永久删除和刷新各自按用途分组"
         );
     }
 
@@ -1137,9 +2058,31 @@ mod tests {
         assert!(!remote[0].disabled, "目录可以整棵下载");
         assert_eq!(remote[0].action, FileAction::Download);
         assert_eq!(remote[0].label, "下载文件夹到当前本地目录");
-        assert!(!remote[1].disabled, "新建目录与选中项无关");
-        assert!(!remote[2].disabled, "目录可以重命名");
-        assert!(!remote[3].disabled, "目录可以删除");
+        assert!(
+            remote.iter().all(|item| item.action != FileAction::Edit),
+            "目录不能用文本编辑器打开"
+        );
+        assert!(
+            remote
+                .iter()
+                .find(|item| item.action == FileAction::NewFolder)
+                .is_some_and(|item| !item.disabled),
+            "新建目录与选中项无关"
+        );
+        assert!(
+            remote
+                .iter()
+                .find(|item| item.action == FileAction::Rename)
+                .is_some_and(|item| !item.disabled),
+            "目录可以重命名"
+        );
+        assert!(
+            remote
+                .iter()
+                .find(|item| item.action == FileAction::Delete)
+                .is_some_and(|item| !item.disabled),
+            "目录可以删除"
+        );
 
         let local = menu_spec(PaneSide::Local, true, &dir);
         assert!(!local[0].disabled, "目录可以整棵上传");
@@ -1191,6 +2134,8 @@ mod tests {
 
         let local = menu_spec(PaneSide::Local, true, &parent);
         let labels: Vec<_> = local.iter().map(|item| item.label).collect();
-        assert_eq!(labels, ["刷新列表"]);
+        assert_eq!(labels, ["新建目录…", "刷新列表"]);
+        assert!(!local[0].separator_before, "第一项前不该有分隔线");
+        assert!(local[1].separator_before);
     }
 }

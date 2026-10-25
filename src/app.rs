@@ -11,12 +11,19 @@
 
 use std::path::PathBuf;
 
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, WindowExt as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    notification::Notification,
+    radio::{Radio, RadioGroup},
+    v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::session::store::{self, AppSettings, RemoteOpenBehavior, SavedAuth, SavedProfile};
 use crate::sftp::types::AuthMethod;
-use crate::session::store::{self, SavedAuth, SavedProfile};
 use crate::ui::SessionState;
 use crate::ui::file_pane::FilePane;
 use crate::ui::toolbar::{Toolbar, ToolbarEvent};
@@ -31,14 +38,23 @@ pub struct ScpApp {
     remote: Entity<FilePane>,
     transfers: Entity<TransferQueue>,
     profiles: Vec<SavedProfile>,
+    settings: AppSettings,
     _subscriptions: Vec<Subscription>,
+}
+
+struct SettingsDraft {
+    remote_open_behavior: RemoteOpenBehavior,
+    editor_path: Option<PathBuf>,
+    error: Option<SharedString>,
 }
 
 impl ScpApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let toolbar = cx.new(|cx| Toolbar::new(window, cx));
+        let profiles = store::load_profiles();
+        let settings = store::load_settings();
+        let toolbar = cx.new(|cx| Toolbar::new(profiles.clone(), window, cx));
         // 工作区在构造时就启动 SftpWorker 与事件泵。
-        let workspace = cx.new(|cx| Workspace::new(window, cx));
+        let workspace = cx.new(|cx| Workspace::new(settings.clone(), window, cx));
 
         let (local, remote, transfers) = {
             let ws = workspace.read(cx);
@@ -47,7 +63,7 @@ impl ScpApp {
 
         let mut subscriptions = Vec::new();
 
-        // 工具栏 → 工作区。只动 workspace，不回头动 toolbar（它正被更新）。
+        // 工具栏 → 工作区 / 根实体。不回头动 toolbar（它正被更新）。
         //
         // 标题栏也在这里改：手动「断开」不会让工作区发 `SessionStateChanged`，
         // 不在这儿兜一下，标题会一直挂着上一个连接。
@@ -62,12 +78,18 @@ impl ScpApp {
                         config.username, config.host
                     ));
                     let config = config.clone();
-                    app.workspace.update(cx, |workspace, cx| workspace.connect(config, cx));
+                    app.workspace
+                        .update(cx, |workspace, cx| workspace.connect(config, cx));
                 }
                 ToolbarEvent::Disconnect => {
-                    app.workspace.update(cx, |workspace, cx| workspace.disconnect(cx));
+                    app.workspace
+                        .update(cx, |workspace, cx| workspace.disconnect(cx));
                     window.set_window_title("macscp");
                 }
+                ToolbarEvent::ProfilesChanged(profiles) => {
+                    app.profiles = profiles.clone();
+                }
+                ToolbarEvent::OpenSettings => app.open_settings(window, cx),
             },
         ));
 
@@ -101,7 +123,6 @@ impl ScpApp {
             },
         ));
 
-        let profiles = store::load_profiles();
         let mut app = Self {
             toolbar,
             workspace,
@@ -109,6 +130,7 @@ impl ScpApp {
             remote,
             transfers,
             profiles,
+            settings,
             _subscriptions: subscriptions,
         };
 
@@ -184,6 +206,9 @@ impl ScpApp {
             auth,
         };
         store::upsert_profile(&mut self.profiles, profile);
+        let profiles = self.profiles.clone();
+        self.toolbar
+            .update(cx, |toolbar, cx| toolbar.set_profiles(profiles, cx));
         if let Err(err) = store::save_profiles(&self.profiles) {
             log::warn!("保存连接配置失败：{err}");
         }
@@ -214,6 +239,237 @@ impl ScpApp {
             SessionState::Disconnected => "macscp".to_string(),
         };
         window.set_window_title(&title);
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = cx.new(|_| SettingsDraft {
+            remote_open_behavior: self.settings.remote_open_behavior,
+            editor_path: self.settings.editor_path.clone(),
+            error: None,
+        });
+        let app = cx.entity().downgrade();
+
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let theme = cx.theme().clone();
+            let (selected, editor_path, error) = {
+                let snapshot = draft.read(cx);
+                (
+                    match snapshot.remote_open_behavior {
+                        RemoteOpenBehavior::SystemDefault => 0,
+                        RemoteOpenBehavior::CustomEditor => 1,
+                        RemoteOpenBehavior::BuiltInTextEditor => 2,
+                    },
+                    snapshot.editor_path.clone(),
+                    snapshot.error.clone(),
+                )
+            };
+
+            let mode_draft = draft.clone();
+            let browse_draft = draft.clone();
+            let save_draft = draft.clone();
+            let save_app = app.clone();
+
+            dialog
+                .title("设置")
+                .w(px(520.))
+                .close_button(false)
+                .overlay_closable(false)
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("默认编辑器"),
+                                )
+                                .child(
+                                    RadioGroup::vertical("remote-open-behavior")
+                                        .selected_index(Some(selected))
+                                        .on_click(move |index, _, cx| {
+                                            mode_draft.update(cx, |draft, cx| {
+                                                draft.remote_open_behavior = match *index {
+                                                    0 => RemoteOpenBehavior::SystemDefault,
+                                                    1 => RemoteOpenBehavior::CustomEditor,
+                                                    _ => RemoteOpenBehavior::BuiltInTextEditor,
+                                                };
+                                                draft.error = None;
+                                                cx.notify();
+                                            });
+                                        })
+                                        .child(
+                                            Radio::new("system-editor")
+                                                .label("系统默认应用"),
+                                        )
+                                        .child(
+                                            Radio::new("custom-editor")
+                                                .label("指定编辑器（忽略文件类型）"),
+                                        )
+                                        .child(
+                                            Radio::new("built-in-editor")
+                                                .label("内置文本编辑器"),
+                                        ),
+                                )
+                                .when(
+                                    selected == 1,
+                                    |this| {
+                                        let path_text = editor_path
+                                            .as_ref()
+                                            .map(|path| path.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "尚未选择编辑器".to_string());
+                                        this.child(
+                                            h_flex()
+                                                .w_full()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .px_3()
+                                                        .py_2()
+                                                        .rounded_md()
+                                                        .border_1()
+                                                        .border_color(theme.border)
+                                                        .text_sm()
+                                                        .text_ellipsis()
+                                                        .overflow_hidden()
+                                                        .child(SharedString::from(path_text)),
+                                                )
+                                                .child(
+                                                    Button::new("choose-editor")
+                                                        .label("选择应用或命令…")
+                                                        .on_click(move |_, _, cx| {
+                                                            let receiver = cx.prompt_for_paths(
+                                                                PathPromptOptions {
+                                                                    files: true,
+                                                                    directories: true,
+                                                                    multiple: false,
+                                                                    prompt: Some(
+                                                                        "选择默认编辑器".into(),
+                                                                    ),
+                                                                },
+                                                            );
+                                                            let draft = browse_draft.clone();
+                                                            cx.spawn(async move |cx| {
+                                                                match receiver.await {
+                                                                    Ok(Ok(Some(paths))) => {
+                                                                        if let Some(path) =
+                                                                            paths.into_iter().next()
+                                                                        {
+                                                                            draft.update(
+                                                                                cx,
+                                                                                |draft, cx| {
+                                                                                    draft.error = (!is_editor_path(&path)).then(|| {
+                                                                                        SharedString::from("请选择 .app 应用或可执行文件")
+                                                                                    });
+                                                                                    draft.editor_path = Some(path);
+                                                                                    cx.notify();
+                                                                                },
+                                                                            );
+                                                                        }
+                                                                    }
+                                                                    Ok(Err(err)) => {
+                                                                        draft.update(
+                                                                            cx,
+                                                                            |draft, cx| {
+                                                                                draft.error = Some(
+                                                                                    SharedString::from(
+                                                                                        format!(
+                                                                                            "无法选择编辑器：{err}"
+                                                                                        ),
+                                                                                    ),
+                                                                                );
+                                                                                cx.notify();
+                                                                            },
+                                                                        );
+                                                                    }
+                                                                    _ => {}
+                                                                }
+                                                            })
+                                                            .detach();
+                                                        }),
+                                                ),
+                                        )
+                                    },
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(
+                                            "外部编辑器会先把文件放入编辑缓存，打开后监测保存并自动同步到远程；内置编辑器单文件上限 2 MiB。",
+                                        ),
+                                ),
+                        )
+                        .when_some(error, |this, error| {
+                            this.child(div().text_xs().text_color(theme.danger).child(error))
+                        }),
+                )
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("settings-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("settings-save")
+                                .primary()
+                                .label("保存")
+                                .on_click(move |_, window, cx| {
+                                    let (behavior, editor_path) = {
+                                        let snapshot = save_draft.read(cx);
+                                        (
+                                            snapshot.remote_open_behavior,
+                                            snapshot.editor_path.clone(),
+                                        )
+                                    };
+                                    if behavior == RemoteOpenBehavior::CustomEditor
+                                        && editor_path.as_ref().is_none_or(|path| {
+                                            !is_editor_path(path)
+                                        })
+                                    {
+                                        save_draft.update(cx, |draft, cx| {
+                                            draft.error = Some(SharedString::from(
+                                                "请选择 .app 编辑器应用或可执行文件",
+                                            ));
+                                            cx.notify();
+                                        });
+                                        return;
+                                    }
+                                    let settings = AppSettings {
+                                        remote_open_behavior: behavior,
+                                        editor_path,
+                                    };
+                                    if let Err(message) = store::save_settings(&settings) {
+                                        save_draft.update(cx, |draft, cx| {
+                                            draft.error = Some(SharedString::from(message));
+                                            cx.notify();
+                                        });
+                                        return;
+                                    }
+
+                                    let _ = save_app.update(cx, |app, cx| {
+                                        app.settings = settings.clone();
+                                        app.workspace.update(cx, |workspace, cx| {
+                                            workspace.set_settings(settings.clone(), cx)
+                                        });
+                                    });
+                                    window.close_dialog(cx);
+                                    window.push_notification(
+                                        Notification::success("设置已保存"),
+                                        cx,
+                                    );
+                                }),
+                        ),
+                )
+        });
     }
 
     /// 演示模式：把内置服务器的地址填进表单并直接连上。
@@ -319,6 +575,14 @@ impl Render for ScpApp {
             .child(div().flex_1().min_h_0().child(self.workspace.clone()))
             .child(status)
     }
+}
+
+fn is_editor_path(path: &std::path::Path) -> bool {
+    path.is_file()
+        || (path.is_dir()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("app")))
 }
 
 /// 把 `~/xxx` 展开成真实路径；其它输入原样返回。

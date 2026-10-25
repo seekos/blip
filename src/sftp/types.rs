@@ -182,6 +182,24 @@ pub enum UploadDecision {
     Skip,
 }
 
+/// 首次见到 SSH 主机密钥或已记录的密钥发生变化时，用户的处理决定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostKeyDecision {
+    Reject,
+    TrustOnce,
+    TrustAndSave,
+}
+
+/// 展示给用户确认的 SSH 主机身份。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostKeyPrompt {
+    pub endpoint: String,
+    pub algorithm: String,
+    pub fingerprint: String,
+    /// `Some(line)` 表示 known_hosts 的这一行记录了不同密钥。
+    pub changed_line: Option<usize>,
+}
+
 impl UploadDecision {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -204,7 +222,7 @@ impl UploadDecision {
 /// 没得选的情况（远端干干净净）不需要问，直接按 [`ExistingPolicy::Overwrite`] 走。
 ///
 /// 和 [`UploadDecision`] 的区别：那个是「单个文件怎么办」，这个是「一整批怎么办」。
-/// 一批里剩下的半成品 `.filepart` 仍然会自动续传 —— 那不是覆盖，是接着上次传。
+/// 整批不会自动信任残留 `.filepart`：没有逐文件确认时，安全覆盖优先于按长度续传。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExistingPolicy {
     /// 覆盖同名文件（依旧先写 `.filepart` 再原子替换，目标文件不会被截断）。
@@ -238,9 +256,11 @@ pub enum SftpCommand {
     /// 断开当前会话，worker 继续等待下一条指令。
     Disconnect,
     /// 读取远端目录。`request_id` 由 UI 自增，用于丢弃迟到的响应。
+    /// `fallback` 只用于恢复上次目录：目标明确不存在时改读登录目录。
     ListDir {
         request_id: u64,
         path: String,
+        fallback: Option<String>,
     },
     /// 远端 → 本地。
     Download {
@@ -265,6 +285,15 @@ pub enum SftpCommand {
         /// 允许断点续传：远端 `.filepart` 比本地短时从它的大小接着传。
         resume: bool,
     },
+    /// 外部编辑器保存后的本地缓存 → 原远端路径。
+    ///
+    /// 这是用户正在编辑的同一份文件，直接安全覆盖，不再弹上传冲突确认。
+    UploadOverwrite {
+        id: TransferId,
+        local: PathBuf,
+        remote: String,
+        total: u64,
+    },
     /// 回答一次 [`SftpEvent::UploadConflict`]。
     ResolveUpload {
         id: TransferId,
@@ -272,6 +301,8 @@ pub enum SftpCommand {
         /// 本次会话内对后续所有冲突都用这个选择（弹窗里的「对后续冲突执行相同操作」）。
         apply_to_all: bool,
     },
+    /// 回答首次连接 / 主机密钥变化确认框。
+    ResolveHostKey(HostKeyDecision),
     /// 整目录下载：在 `local` 建目录，然后把 `remote` 里的内容递归取回来。
     ///
     /// 和 [`SftpCommand::UploadDir`] 完全对称，只是方向反过来。
@@ -300,21 +331,17 @@ pub enum SftpCommand {
     },
     /// 取消一个进行中的传输。
     Cancel(TransferId),
+    /// 读取一个小型远端文件，强制作为文本供应用内编辑器使用。
+    ReadText { path: String },
+    /// 用应用内编辑器的内容安全替换远端文件。
+    WriteText { path: String, content: String },
     /// 新建目录。
-    Mkdir {
-        path: String,
-    },
+    Mkdir { path: String },
     /// 删除文件或空目录。
-    Remove {
-        path: String,
-        is_dir: bool,
-    },
+    Remove { path: String, is_dir: bool },
     /// 重命名 / 移动。worker 侧已实现，UI 入口留待右键菜单接入。
     #[allow(dead_code)]
-    Rename {
-        from: String,
-        to: String,
-    },
+    Rename { from: String, to: String },
     /// 让 worker 线程退出（`SftpWorker::drop` 时自动发送）。
     Shutdown,
 }
@@ -332,6 +359,8 @@ pub enum ErrorContext {
     Mkdir,
     Remove,
     Rename,
+    ReadText,
+    WriteText,
     Runtime,
 }
 
@@ -343,6 +372,8 @@ impl ErrorContext {
             ErrorContext::Mkdir => "mkdir",
             ErrorContext::Remove => "remove",
             ErrorContext::Rename => "rename",
+            ErrorContext::ReadText => "read_text",
+            ErrorContext::WriteText => "write_text",
             ErrorContext::Runtime => "runtime",
         }
     }
@@ -358,7 +389,9 @@ impl fmt::Display for ErrorContext {
 #[derive(Debug)]
 pub enum SftpEvent {
     /// 连接 + 认证 + SFTP 握手全部成功。`home` 是服务器给出的登录目录。
-    Connected { home: String },
+    Connected {
+        home: String,
+    },
     Disconnected,
     /// 目录读取完成，`entries` 已按「文件夹优先、名称字母序」排好。
     DirListed {
@@ -390,6 +423,17 @@ pub enum SftpEvent {
     /// 上传前发现远端有同名文件或残留的 `.filepart`，等 UI 回答
     /// [`SftpCommand::ResolveUpload`]。在此之前不会写任何字节。
     UploadConflict(UploadConflict),
+    /// SSH 主机身份尚未被信任，等 UI 用模态框让用户确认。
+    HostKeyPrompt(HostKeyPrompt),
+    /// 远端文本文件已读取完成。
+    TextLoaded {
+        path: String,
+        content: String,
+    },
+    /// 远端文本文件已安全替换完成。
+    TextSaved {
+        path: String,
+    },
     /// 操作成功后的轻提示（建目录、删除、重命名）。
     Notice(String),
     /// 任何网络/协议异常最终都落到这里，绝不 panic、绝不静默吞掉。

@@ -86,6 +86,11 @@ fn absorb(
     entries: Vec<FileEntry>,
 ) {
     for entry in entries {
+        if !session::is_safe_entry_name(&entry.name) {
+            log::warn!("跳过服务器返回的危险文件名：{:?}", entry.name);
+            tree.skipped += 1;
+            continue;
+        }
         let child = relative.join(&entry.name);
         match entry.kind {
             EntryKind::Directory => {
@@ -169,6 +174,29 @@ mod tests {
         );
 
         assert_eq!(tree.files[0].relative, PathBuf::from("sub/c.bin"));
+    }
+
+    #[test]
+    fn absorb_rejects_server_names_that_escape_the_root() {
+        let mut tree = RemoteTree::default();
+        let mut pending = Vec::new();
+
+        absorb(
+            &mut tree,
+            &mut pending,
+            PathBuf::new(),
+            0,
+            vec![
+                entry("../owned", EntryKind::File, 5),
+                entry("/absolute", EntryKind::Directory, 0),
+                entry("safe.txt", EntryKind::File, 3),
+            ],
+        );
+
+        assert_eq!(tree.files.len(), 1);
+        assert_eq!(tree.files[0].relative, PathBuf::from("safe.txt"));
+        assert!(pending.is_empty());
+        assert_eq!(tree.skipped, 2);
     }
 
     /// 深度到顶的目录只记「跳过」，不再入栈 —— 这是「服务器把目录链接报成目录」

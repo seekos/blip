@@ -24,6 +24,7 @@ fn main() {
     // 否则所有 IconName 都会渲染成空白。
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
+        .with_quit_mode(QuitMode::LastWindowClosed)
         .run(|cx| {
         gpui_kit::init(cx);
 

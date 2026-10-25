@@ -9,15 +9,19 @@
 //!
 //! 布局本身很简单：`v_resizable`（上双栏 / 下队列），收起时换成普通 `v_flex`。
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::Command;
+use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
     notification::Notification,
     resizable::{h_resizable, resizable_panel, v_resizable},
     v_flex,
@@ -25,10 +29,11 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::session::store::{self, AppSettings, DirectoryHistory, RemoteOpenBehavior};
 use crate::sftp::session::{join_remote, remote_parent};
 use crate::sftp::types::{
-    ErrorContext, ExistingPolicy, FileEntry, SessionConfig, TransferDirection, TransferOutcome,
-    UploadConflict,
+    ErrorContext, ExistingPolicy, FileEntry, HostKeyDecision, HostKeyPrompt, SessionConfig,
+    TransferDirection, TransferOutcome, UploadConflict,
 };
 use crate::sftp::{SftpCommand, SftpEvent, SftpWorker};
 use crate::ui::SessionState;
@@ -54,6 +59,12 @@ pub struct Workspace {
     /// 传输队列是否收起：收起后只留底部一条标题栏。
     collapsed: bool,
     state: SessionState,
+    settings: AppSettings,
+    directory_history: DirectoryHistory,
+    /// 当前连接用来查找/更新远端目录历史的 `user@host`。
+    remote_endpoint: Option<(String, String)>,
+    /// 每次连接/断开都会推进；旧连接打开的编辑缓存绝不能写进新连接。
+    connection_generation: u64,
     /// 服务器给出的登录目录。
     home: Option<String>,
     last_error: Option<SharedString>,
@@ -66,6 +77,13 @@ pub struct Workspace {
     /// 目录往返；攒 [`REFRESH_DEBOUNCE`] 之后只刷一次。
     pending_refresh: PendingRefresh,
     refresh_timer: Option<Task<()>>,
+    /// 已发出读取指令、正在等待远端文本的条目。
+    pending_text_edit: Option<FileEntry>,
+    /// 当前文本编辑器的草稿。保存失败时保留，让用户可直接重试。
+    active_text_edit: Option<ActiveTextEdit>,
+    pending_external_edits: HashMap<u64, PendingExternalEdit>,
+    external_edits: HashMap<PathBuf, ActiveExternalEdit>,
+    pending_external_syncs: HashMap<u64, PendingExternalSync>,
     _subscriptions: Vec<Subscription>,
     _pump: Task<()>,
 }
@@ -77,6 +95,56 @@ struct PendingRefresh {
     remote: bool,
 }
 
+struct ActiveTextEdit {
+    target: TextEditTarget,
+    saving: bool,
+    error: Option<SharedString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TextEditTarget {
+    Remote(String),
+    Local(PathBuf),
+}
+
+impl TextEditTarget {
+    fn display_path(&self) -> String {
+        match self {
+            Self::Remote(path) => path.clone(),
+            Self::Local(path) => path.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+struct PendingExternalEdit {
+    remote: String,
+    local: PathBuf,
+    editor_path: Option<PathBuf>,
+    connection_generation: u64,
+}
+
+struct ActiveExternalEdit {
+    remote: String,
+    stamp: FileStamp,
+    revision: u64,
+    last_attempted_revision: u64,
+    uploading: bool,
+    pending_since: Option<Instant>,
+    connection_generation: u64,
+}
+
+struct PendingExternalSync {
+    local: PathBuf,
+    revision: u64,
+    connection_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
 impl PendingRefresh {
     fn is_empty(self) -> bool {
         !self.local && !self.remote
@@ -85,22 +153,22 @@ impl PendingRefresh {
 
 /// 传输完成到刷新列表之间的合并窗口。
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(300);
+const EXTERNAL_EDIT_POLL: Duration = Duration::from_millis(500);
+const EXTERNAL_EDIT_DEBOUNCE: Duration = Duration::from_millis(700);
 
 impl Workspace {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(settings: AppSettings, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let worker = SftpWorker::spawn();
 
-        let home = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/"))
+        let directory_history = store::load_directory_history();
+        let home = directory_history
+            .local_or(dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")))
             .to_string_lossy()
             .to_string();
 
-        // 左侧从一开始就读真实磁盘：本地浏览不需要连服务器。
-        // 右侧在连接成功前仍是 Mock，由 `go_live` 换成服务器数据。
+        // 左侧从一开始就读真实磁盘；右侧等连接成功后再显示服务器数据。
         let local = cx.new(|cx| FilePane::new(PaneSide::Local, home, window, cx));
-        let remote = cx.new(|cx| {
-            FilePane::new_mock(PaneSide::Remote, "/srv/app".to_string(), window, cx)
-        });
+        let remote = cx.new(|cx| FilePane::new(PaneSide::Remote, "/".to_string(), window, cx));
         // 队列一开始是空的：传输面板只显示真实任务。
         // （早期骨架阶段在这里塞过三条演示行，结果每次启动都「复活」，
         //  还会被误认为正在传输、点取消也没反应 —— 已经删掉。）
@@ -117,14 +185,15 @@ impl Workspace {
                     // 面板 emit 之前已经进了加载态，这里只负责发指令。
                     workspace.request_remote_listing(path.clone(), cx);
                 }
+                FilePaneEvent::DirectoryLoaded(_) => {}
                 FilePaneEvent::Activate(entry) => {
-                    workspace.download_entry(entry.clone(), window, cx)
+                    workspace.open_entry(PaneSide::Remote, entry.clone(), window, cx)
                 }
-                FilePaneEvent::Action { entry, action } => {
-                    workspace.handle_action(entry.clone(), *action, window, cx);
+                FilePaneEvent::Action { entries, action } => {
+                    workspace.handle_action(PaneSide::Remote, entries.clone(), *action, window, cx);
                 }
                 FilePaneEvent::PaneAction(action) => {
-                    workspace.handle_pane_action(*action, window, cx);
+                    workspace.handle_pane_action(PaneSide::Remote, *action, window, cx);
                 }
                 // Finder 拖进来的东西：文件直接上传，文件夹整棵上传。
                 FilePaneEvent::DropFiles(paths) => {
@@ -133,18 +202,21 @@ impl Workspace {
             },
         ));
 
-        // 本地面板：双击文件 = 上传；右键菜单同理。目录导航它自己处理。
+        // 本地面板：双击文件用设置中的编辑方式打开；上传仍只走右键菜单/拖放。
         subscriptions.push(cx.subscribe_in(
             &local,
             window,
             |workspace, _pane, event: &FilePaneEvent, window, cx| match event {
                 FilePaneEvent::Navigate(_) => {}
-                FilePaneEvent::Activate(entry) => workspace.upload_entry(entry.clone(), window, cx),
-                FilePaneEvent::Action { entry, action } => {
-                    workspace.handle_action(entry.clone(), *action, window, cx);
+                FilePaneEvent::DirectoryLoaded(path) => workspace.remember_local_directory(path),
+                FilePaneEvent::Activate(entry) => {
+                    workspace.open_entry(PaneSide::Local, entry.clone(), window, cx)
+                }
+                FilePaneEvent::Action { entries, action } => {
+                    workspace.handle_action(PaneSide::Local, entries.clone(), *action, window, cx);
                 }
                 FilePaneEvent::PaneAction(action) => {
-                    workspace.handle_pane_action(*action, window, cx);
+                    workspace.handle_pane_action(PaneSide::Local, *action, window, cx);
                 }
                 // 本地面板不是拖放目标。
                 FilePaneEvent::DropFiles(_) => {}
@@ -185,15 +257,29 @@ impl Workspace {
             transfers,
             collapsed: false,
             state: SessionState::Disconnected,
+            settings,
+            directory_history,
+            remote_endpoint: None,
+            connection_generation: 0,
             home: None,
             last_error: None,
             request_seq: 0,
             next_transfer_id: 1,
             pending_refresh: PendingRefresh::default(),
             refresh_timer: None,
+            pending_text_edit: None,
+            active_text_edit: None,
+            pending_external_edits: HashMap::new(),
+            external_edits: HashMap::new(),
+            pending_external_syncs: HashMap::new(),
             _subscriptions: subscriptions,
             _pump: pump,
         }
+    }
+
+    pub fn set_settings(&mut self, settings: AppSettings, cx: &mut Context<Self>) {
+        self.settings = settings;
+        cx.notify();
     }
 
     // -----------------------------------------------------------------------
@@ -236,40 +322,66 @@ impl Workspace {
         if self.state == SessionState::Connecting {
             return;
         }
+        self.connection_generation = self.connection_generation.wrapping_add(1);
         self.state = SessionState::Connecting;
         self.last_error = None;
+        self.remote_endpoint = Some((config.host.clone(), config.username.clone()));
         self.worker.send(SftpCommand::Connect(config));
         cx.notify();
     }
 
     /// 由工具栏的「断开」触发，理由同上：不 emit。
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.connection_generation = self.connection_generation.wrapping_add(1);
         self.worker.send(SftpCommand::Disconnect);
         self.state = SessionState::Disconnected;
         self.home = None;
+        self.remote_endpoint = None;
         self.set_online(false, cx);
         cx.notify();
     }
 
-    /// 连接成功后把两个面板切到真实数据源。
-    ///
-    /// 远端面板只切模式、不在这里触发 `Navigate` —— 本实体此刻正被借用，
-    /// 同步回调会撞上独占租约。目录由下面主动请求。
-    fn go_live(&mut self, home: String, cx: &mut Context<Self>) {
+    /// 连接成功后启用两个面板，并让远端面板进入恢复目录的加载态。
+    fn go_live(&mut self, path: String, cx: &mut Context<Self>) {
         self.local.update(cx, |pane, cx| {
-            pane.use_live_data(cx);
             pane.set_online(true, cx);
         });
         self.remote.update(cx, |pane, cx| {
-            pane.leave_mock(cx);
             pane.set_online(true, cx);
-            pane.begin_loading(home.clone(), cx);
+            pane.begin_loading(path.clone(), cx);
         });
     }
 
     fn set_online(&mut self, online: bool, cx: &mut Context<Self>) {
-        self.local.update(cx, |pane, cx| pane.set_online(online, cx));
-        self.remote.update(cx, |pane, cx| pane.set_online(online, cx));
+        self.local
+            .update(cx, |pane, cx| pane.set_online(online, cx));
+        self.remote.update(cx, |pane, cx| {
+            pane.set_online(online, cx);
+            if !online {
+                pane.set_entries("/".to_string(), Vec::new(), cx);
+            }
+        });
+    }
+
+    fn remember_local_directory(&mut self, path: &str) {
+        if self.directory_history.remember_local(PathBuf::from(path)) {
+            self.save_directory_history();
+        }
+    }
+
+    fn remember_remote_directory(&mut self, path: String) {
+        let Some((host, username)) = self.remote_endpoint.as_ref() else {
+            return;
+        };
+        if self.directory_history.remember_remote(host, username, path) {
+            self.save_directory_history();
+        }
+    }
+
+    fn save_directory_history(&self) {
+        if let Err(err) = store::save_directory_history(&self.directory_history) {
+            log::warn!("保存目录历史失败：{err}");
+        }
     }
 
     fn emit_state(&mut self, cx: &mut Context<Self>) {
@@ -282,13 +394,24 @@ impl Workspace {
 
     fn handle_event(&mut self, event: SftpEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
+            SftpEvent::HostKeyPrompt(prompt) => {
+                self.ask_host_key(prompt, window, cx);
+            }
+
             SftpEvent::Connected { home } => {
                 self.state = SessionState::Connected;
                 self.home = Some(home.clone());
                 self.last_error = None;
 
-                self.go_live(home.clone(), cx);
-                self.request_remote_listing(home, cx);
+                let remembered = self.remote_endpoint.as_ref().and_then(|(host, username)| {
+                    self.directory_history
+                        .remote_for(host, username)
+                        .map(str::to_owned)
+                });
+                let initial_path = remembered.unwrap_or_else(|| home.clone());
+                let fallback = (initial_path != home).then_some(home);
+                self.go_live(initial_path.clone(), cx);
+                self.request_remote_listing_with_fallback(initial_path, fallback, cx);
 
                 self.emit_state(cx);
                 self.toast(window, cx, Notification::success("已连接到服务器"));
@@ -347,8 +470,10 @@ impl Workspace {
             }
 
             SftpEvent::Disconnected => {
+                self.connection_generation = self.connection_generation.wrapping_add(1);
                 self.state = SessionState::Disconnected;
                 self.home = None;
+                self.remote_endpoint = None;
                 self.set_online(false, cx);
                 self.emit_state(cx);
             }
@@ -360,6 +485,7 @@ impl Workspace {
             } => {
                 // 迟到的响应直接丢弃：用户可能已经又点进了别的目录。
                 if request_id == self.request_seq {
+                    self.remember_remote_directory(path.clone());
                     self.remote
                         .update(cx, |pane, cx| pane.set_entries(path, entries, cx));
                 }
@@ -370,9 +496,8 @@ impl Workspace {
                 resumed_from,
                 total,
             } => {
-                self.transfers.update(cx, |queue, cx| {
-                    queue.started(id, resumed_from, total, cx)
-                });
+                self.transfers
+                    .update(cx, |queue, cx| queue.started(id, resumed_from, total, cx));
             }
 
             SftpEvent::TransferProgress {
@@ -381,11 +506,14 @@ impl Workspace {
                 total,
                 speed,
             } => {
-                self.transfers
-                    .update(cx, |queue, cx| queue.progress(id, transferred, total, speed, cx));
+                self.transfers.update(cx, |queue, cx| {
+                    queue.progress(id, transferred, total, speed, cx)
+                });
             }
 
             SftpEvent::TransferCompleted { id, outcome } => {
+                let pending_external_edit = self.pending_external_edits.remove(&id);
+                let pending_external_sync = self.pending_external_syncs.remove(&id);
                 let failed = matches!(outcome, TransferOutcome::Failed(_));
                 // 传输结束会改动某一侧的目录：上传多一个文件、下载多一个文件，
                 // 取消则会留下 `.filepart` / 半成品。两种都值得刷一下列表。
@@ -396,10 +524,43 @@ impl Workspace {
                 let direction = self.transfers.read(cx).direction_of(id);
 
                 self.transfers
-                    .update(cx, |queue, cx| queue.finished(id, outcome, cx));
+                    .update(cx, |queue, cx| queue.finished(id, outcome.clone(), cx));
 
-                if touched && let Some(direction) = direction {
+                if touched
+                    && pending_external_edit.is_none()
+                    && let Some(direction) = direction
+                {
                     self.schedule_refresh(direction, cx);
+                }
+
+                if let Some(edit) = pending_external_edit {
+                    if matches!(outcome, TransferOutcome::Completed)
+                        && edit.connection_generation == self.connection_generation
+                        && self.state == SessionState::Connected
+                    {
+                        self.launch_external_editor(edit, window, cx);
+                    } else if let Some(parent) = edit.local.parent() {
+                        let _ = std::fs::remove_dir_all(parent);
+                    }
+                }
+
+                if let Some(sync) = pending_external_sync {
+                    let current_connection =
+                        sync.connection_generation == self.connection_generation;
+                    if current_connection
+                        && let Some(edit) = self.external_edits.get_mut(&sync.local)
+                    {
+                        edit.uploading = false;
+                        if matches!(outcome, TransferOutcome::Completed) {
+                            edit.pending_since = (edit.revision > sync.revision).then(Instant::now);
+                        } else {
+                            // 这次失败后不反复重试并刷屏；再次保存会产生新 revision。
+                            edit.pending_since = None;
+                        }
+                    }
+                    if current_connection && matches!(outcome, TransferOutcome::Completed) {
+                        self.toast(window, cx, Notification::success("修改已同步到远程"));
+                    }
                 }
                 if failed {
                     self.toast(window, cx, Notification::error("传输失败"));
@@ -411,6 +572,38 @@ impl Workspace {
                 self.transfers
                     .update(cx, |queue, cx| queue.awaiting_decision(conflict.id, cx));
                 self.ask_upload_conflict(conflict, window, cx);
+            }
+
+            SftpEvent::TextLoaded { path, content } => {
+                let Some(entry) = self
+                    .pending_text_edit
+                    .as_ref()
+                    .filter(|entry| entry.path == path)
+                    .cloned()
+                else {
+                    return;
+                };
+                self.pending_text_edit = None;
+                self.open_text_editor(
+                    TextEditTarget::Remote(entry.path),
+                    entry.name,
+                    content,
+                    window,
+                    cx,
+                );
+            }
+
+            SftpEvent::TextSaved { path } => {
+                if self
+                    .active_text_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.target == TextEditTarget::Remote(path.clone()))
+                {
+                    self.active_text_edit = None;
+                    window.close_dialog(cx);
+                    self.toast(window, cx, Notification::success("文件已保存"));
+                    self.reload_remote(cx);
+                }
             }
 
             SftpEvent::Notice(message) => {
@@ -429,7 +622,19 @@ impl Workspace {
                     ErrorContext::List => {
                         // 目录读取失败时，面板要退出加载态并把错误显示在自己的列表上方。
                         let message = SharedString::from(message.clone());
-                        self.remote.update(cx, |pane, cx| pane.set_error(message, cx));
+                        self.remote
+                            .update(cx, |pane, cx| pane.set_error(message, cx));
+                    }
+                    ErrorContext::ReadText => {
+                        self.pending_text_edit = None;
+                    }
+                    ErrorContext::WriteText => {
+                        if let Some(edit) = self.active_text_edit.as_mut()
+                            && matches!(edit.target, TextEditTarget::Remote(_))
+                        {
+                            edit.saving = false;
+                            edit.error = Some(SharedString::from(message.clone()));
+                        }
                     }
                     _ => {}
                 }
@@ -450,12 +655,27 @@ impl Workspace {
 
     /// 只发 `ListDir` 指令，不动面板状态（调用方通常已经在面板的更新上下文里）。
     fn request_remote_listing(&mut self, path: String, cx: &mut Context<Self>) {
+        self.request_remote_listing_with_fallback(path, None, cx);
+    }
+
+    /// 恢复上次目录时携带登录目录作为后备。worker 只在服务器
+    /// 明确返回 `NoSuchFile` 时才读后备目录，权限错误不会被掩盖。
+    fn request_remote_listing_with_fallback(
+        &mut self,
+        path: String,
+        fallback: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.state != SessionState::Connected {
             return;
         }
         self.request_seq += 1;
         let request_id = self.request_seq;
-        self.worker.send(SftpCommand::ListDir { request_id, path });
+        self.worker.send(SftpCommand::ListDir {
+            request_id,
+            path,
+            fallback,
+        });
         cx.notify();
     }
 
@@ -468,12 +688,6 @@ impl Workspace {
         self.remote
             .update(cx, |pane, cx| pane.begin_loading(path.clone(), cx));
         self.request_remote_listing(path, cx);
-    }
-
-    /// 刷新两侧面板。
-    pub fn refresh_all(&mut self, cx: &mut Context<Self>) {
-        self.local.update(cx, |pane, cx| pane.reload(cx));
-        self.reload_remote(cx);
     }
 
     /// 传输结束后把「该刷新的面板」记下来，攒够一个合并窗口再真的去刷。
@@ -555,61 +769,187 @@ impl Workspace {
         });
     }
 
-    fn upload_entry(&mut self, entry: FileEntry, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state != SessionState::Connected {
-            self.warn("请先连接服务器", cx);
-            return;
-        }
-        if entry.is_dir() {
-            // 目录整棵传。远端同名文件怎么办必须先问一句 —— 文件夹上传不会
-            // 中途弹冲突框（那样一个目录能弹几百次），策略只能一次定下来。
-            self.confirm_folder_transfer(
-                FolderDirection::Upload,
-                vec![FolderTarget::new(&entry.path)],
-                window,
-                cx,
-            );
-            return;
-        }
-
-        let remote_dir = self.remote.read(cx).path().to_string();
-        let id = self.next_transfer_id;
-        self.next_transfer_id += 1;
-
-        self.transfers.update(cx, |queue, cx| {
-            queue.enqueue(
-                id,
-                entry.name.clone(),
-                TransferDirection::Upload,
-                entry.size,
-                cx,
+    /// 首次连接或服务器密钥变化时，必须由用户核对指纹后明确选择。
+    /// 这是应用内模态框，不使用浏览器式 `alert/confirm/prompt`。
+    fn ask_host_key(&mut self, prompt: HostKeyPrompt, window: &mut Window, cx: &mut Context<Self>) {
+        let sender = self.worker.sender();
+        let theme = cx.theme().clone();
+        let changed = prompt.changed_line.is_some();
+        let title = if changed {
+            "服务器身份已变化"
+        } else {
+            "确认服务器身份"
+        };
+        let explanation = if let Some(line) = prompt.changed_line {
+            format!(
+                "安全警告：此服务器的主机密钥与 known_hosts 第 {line} 行不一致。除非你确认服务器刚更换过密钥，否则应拒绝连接。"
             )
-        });
-        self.worker.send(SftpCommand::Upload {
-            id,
-            local: PathBuf::from(&entry.path),
-            remote: join_remote(&remote_dir, &entry.name),
-            total: entry.size,
-            resume: true,
+        } else {
+            "这是首次连接到该服务器。请通过可信渠道核对下面的 SHA-256 指纹。".to_string()
+        };
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let reject_sender = sender.clone();
+            let once_sender = sender.clone();
+            let save_sender = sender.clone();
+            let theme = theme.clone();
+
+            let reject =
+                Button::new("host-key-reject")
+                    .label("拒绝连接")
+                    .on_click(move |_, window, cx| {
+                        let _ = reject_sender
+                            .send(SftpCommand::ResolveHostKey(HostKeyDecision::Reject));
+                        window.close_dialog(cx);
+                    });
+            let reject = if changed {
+                reject.primary()
+            } else {
+                reject.outline()
+            };
+
+            let save =
+                Button::new("host-key-save")
+                    .label("信任并保存")
+                    .on_click(move |_, window, cx| {
+                        let _ = save_sender
+                            .send(SftpCommand::ResolveHostKey(HostKeyDecision::TrustAndSave));
+                        window.close_dialog(cx);
+                    });
+            let save = if changed {
+                save.danger()
+            } else {
+                save.primary()
+            };
+
+            dialog
+                .title(title)
+                .w(px(560.))
+                .overlay_closable(false)
+                .close_button(false)
+                .keyboard(false)
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(if changed {
+                                    theme.danger
+                                } else {
+                                    theme.foreground
+                                })
+                                .child(SharedString::from(explanation.clone())),
+                        )
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .gap_1()
+                                .p_3()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(if changed { theme.danger } else { theme.border })
+                                .bg(theme.muted.opacity(0.3))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("服务器"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .child(SharedString::from(prompt.endpoint.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .mt_2()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(SharedString::from(format!(
+                                            "算法：{} · SHA-256 指纹",
+                                            prompt.algorithm
+                                        ))),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.primary)
+                                        .child(SharedString::from(prompt.fingerprint.clone())),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("“仅本次信任”不会修改 ~/.ssh/known_hosts。"),
+                        ),
+                )
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(reject)
+                        .child(
+                            Button::new("host-key-once")
+                                .outline()
+                                .label("仅本次信任")
+                                .on_click(move |_, window, cx| {
+                                    let _ = once_sender.send(SftpCommand::ResolveHostKey(
+                                        HostKeyDecision::TrustOnce,
+                                    ));
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(save),
+                )
         });
     }
 
-    fn download_entry(&mut self, entry: FileEntry, window: &mut Window, cx: &mut Context<Self>) {
+    fn upload_entries(
+        &mut self,
+        entries: Vec<FileEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.upload_paths(
+            entries
+                .into_iter()
+                .map(|entry| PathBuf::from(entry.path))
+                .collect(),
+            window,
+            cx,
+        );
+    }
+
+    fn download_entries(
+        &mut self,
+        entries: Vec<FileEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.state != SessionState::Connected {
             self.warn("请先连接服务器", cx);
             return;
         }
-        if entry.is_dir() {
-            // 目录整棵取回，同样先问一次「本地同名文件怎么办」。
-            self.confirm_folder_transfer(
-                FolderDirection::Download,
-                vec![FolderTarget::new(&entry.path)],
-                window,
-                cx,
-            );
-            return;
+
+        let mut directories = Vec::new();
+        for entry in entries {
+            if entry.is_dir() {
+                directories.push(FolderTarget::new(&entry.path));
+            } else {
+                self.queue_download(entry, cx);
+            }
         }
 
+        if !directories.is_empty() {
+            // 一次选中多个文件夹也只问一次，整批共用同名文件处理策略。
+            self.confirm_folder_transfer(FolderDirection::Download, directories, window, cx);
+        }
+    }
+
+    fn queue_download(&mut self, entry: FileEntry, cx: &mut Context<Self>) {
         let local_dir = self.local.read(cx).path().to_string();
         let id = self.next_transfer_id;
         self.next_transfer_id += 1;
@@ -657,7 +997,10 @@ impl Workspace {
 
         if !dirs.is_empty() {
             // 一次拖进多个文件夹也只问一次：策略是整批共用的。
-            let targets = dirs.iter().map(|dir| FolderTarget::new(&*dir.to_string_lossy())).collect();
+            let targets = dirs
+                .iter()
+                .map(|dir| FolderTarget::new(&*dir.to_string_lossy()))
+                .collect();
             self.confirm_folder_transfer(FolderDirection::Upload, targets, window, cx);
         }
     }
@@ -719,87 +1062,89 @@ impl Workspace {
 
             // 默认 448px 装不下 `…/T/macscp-demo-download/demo-pkg` 这种长路径，
             // 会折成三四段；加宽一点，路径基本能一行放下。
-            dialog.title(title).w(px(520.)).child(
-                v_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(div().text_sm().child(SharedString::from(headline.clone())))
-                    // 目标路径单独一行：长路径折行时也不会把标题那句挤成两截。
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.primary)
-                            .child(SharedString::from(target.clone())),
-                    )
-                    .when(!names.is_empty(), |this| {
-                        this.child(
+            dialog
+                .title(title)
+                .w(px(520.))
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(div().text_sm().child(SharedString::from(headline.clone())))
+                        // 目标路径单独一行：长路径折行时也不会把标题那句挤成两截。
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.primary)
+                                .child(SharedString::from(target.clone())),
+                        )
+                        .when(!names.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(SharedString::from(names.clone())),
+                            )
+                        })
+                        .child(
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child(SharedString::from(names.clone())),
+                                .child(SharedString::from(note)),
                         )
-                    })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(SharedString::from(note)),
-                    )
-                    // 两条路各自说明后果，别让用户猜「跳过」是跳过整个文件夹还是跳过文件。
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(bullets[0])
-                            .child(bullets[1]),
-                    ),
-            )
-            .footer(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("folder-cancel")
-                            .label("取消")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .child(
-                        Button::new("folder-skip")
-                            .outline()
-                            .label("跳过同名文件")
-                            .on_click(move |_, window, cx| {
-                                let (weak, targets) = skip.clone();
-                                let _ = weak.update(cx, |workspace, cx| {
-                                    workspace
-                                        .start_folder_transfer(
+                        // 两条路各自说明后果，别让用户猜「跳过」是跳过整个文件夹还是跳过文件。
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(bullets[0])
+                                .child(bullets[1]),
+                        ),
+                )
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("folder-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("folder-skip")
+                                .outline()
+                                .label("跳过同名文件")
+                                .on_click(move |_, window, cx| {
+                                    let (weak, targets) = skip.clone();
+                                    let _ = weak.update(cx, |workspace, cx| {
+                                        workspace.start_folder_transfer(
                                             direction,
                                             targets,
                                             ExistingPolicy::Skip,
                                             cx,
                                         )
-                                });
-                                window.close_dialog(cx);
-                            }),
-                    )
-                    .child(
-                        Button::new("folder-overwrite")
-                            .primary()
-                            .label("覆盖同名文件")
-                            .on_click(move |_, window, cx| {
-                                let (weak, targets) = overwrite.clone();
-                                let _ = weak.update(cx, |workspace, cx| {
-                                    workspace.start_folder_transfer(
-                                        direction,
-                                        targets,
-                                        ExistingPolicy::Overwrite,
-                                        cx,
-                                    )
-                                });
-                                window.close_dialog(cx);
-                            }),
-                    ),
-            )
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("folder-overwrite")
+                                .primary()
+                                .label("覆盖同名文件")
+                                .on_click(move |_, window, cx| {
+                                    let (weak, targets) = overwrite.clone();
+                                    let _ = weak.update(cx, |workspace, cx| {
+                                        workspace.start_folder_transfer(
+                                            direction,
+                                            targets,
+                                            ExistingPolicy::Overwrite,
+                                            cx,
+                                        )
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
         });
     }
 
@@ -887,36 +1232,760 @@ impl Workspace {
     // 右键菜单动作
     // -----------------------------------------------------------------------
 
+    /// 双击两侧文件都表示“打开”，传输只由明确的上传/下载动作触发。
+    fn open_entry(
+        &mut self,
+        side: PaneSide,
+        entry: FileEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match side {
+            PaneSide::Local => self.edit_local_entry(entry, window, cx),
+            PaneSide::Remote => match self.settings.remote_open_behavior {
+                RemoteOpenBehavior::BuiltInTextEditor => self.request_text_edit(entry, window, cx),
+                RemoteOpenBehavior::SystemDefault | RemoteOpenBehavior::CustomEditor => {
+                    self.request_external_edit(entry, window, cx)
+                }
+            },
+        }
+    }
+
     fn handle_action(
         &mut self,
-        entry: FileEntry,
+        side: PaneSide,
+        entries: Vec<FileEntry>,
         action: FileAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match action {
-            FileAction::Upload => self.upload_entry(entry, window, cx),
-            FileAction::Download => self.download_entry(entry, window, cx),
-            FileAction::Rename => self.open_rename_dialog(entry, window, cx),
-            FileAction::Delete => self.confirm_delete(entry, window, cx),
-            FileAction::NewFolder => self.new_folder(window, cx),
+            FileAction::Upload => self.upload_entries(entries, window, cx),
+            FileAction::Download => self.download_entries(entries, window, cx),
+            FileAction::Edit => {
+                let Some(entry) = entries.into_iter().next() else {
+                    return;
+                };
+                self.open_entry(side, entry, window, cx);
+            }
+            FileAction::CopyPath => {
+                let paths: Vec<_> = entries.into_iter().map(|entry| entry.path).collect();
+                if paths.is_empty() {
+                    return;
+                }
+                cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
+                self.toast(
+                    window,
+                    cx,
+                    Notification::success(if paths.len() == 1 {
+                        "路径已复制".to_string()
+                    } else {
+                        format!("已复制 {} 个路径", paths.len())
+                    }),
+                );
+            }
+            FileAction::RevealInFinder => {
+                if side == PaneSide::Local
+                    && let Some(entry) = entries.into_iter().next()
+                {
+                    cx.reveal_path(Path::new(&entry.path));
+                    self.toast(window, cx, Notification::info("已在访达中显示"));
+                }
+            }
+            FileAction::Rename => {
+                if let Some(entry) = entries.into_iter().next() {
+                    match side {
+                        PaneSide::Local => self.open_local_rename_dialog(entry, window, cx),
+                        PaneSide::Remote => self.open_rename_dialog(entry, window, cx),
+                    }
+                }
+            }
+            FileAction::Delete => {
+                if let Some(entry) = entries.into_iter().next() {
+                    match side {
+                        PaneSide::Local => self.confirm_local_trash(entry, window, cx),
+                        PaneSide::Remote => self.confirm_delete(entry, window, cx),
+                    }
+                }
+            }
+            FileAction::NewFolder => match side {
+                PaneSide::Local => self.new_local_folder(window, cx),
+                PaneSide::Remote => self.new_folder(window, cx),
+            },
             // 刷新通常由面板自己就地处理（`FilePane::request`），走到这里
-            // 只可能是将来别的入口复用这个动作：那就两侧都刷。
-            FileAction::Refresh => self.refresh_all(cx),
+            // 只可能是将来别的入口复用这个动作。
+            FileAction::Refresh => match side {
+                PaneSide::Local => self.local.update(cx, |pane, cx| pane.reload(cx)),
+                PaneSide::Remote => self.reload_remote(cx),
+            },
         }
+    }
+
+    fn edit_local_entry(&mut self, entry: FileEntry, window: &mut Window, cx: &mut Context<Self>) {
+        if entry.is_dir() {
+            return;
+        }
+        let path = PathBuf::from(&entry.path);
+        match self.settings.remote_open_behavior {
+            RemoteOpenBehavior::BuiltInTextEditor => {
+                if entry.size > crate::sftp::transfer::MAX_EDITABLE_TEXT_SIZE {
+                    self.toast(
+                        window,
+                        cx,
+                        Notification::error("文件超过 2 MiB，请使用外部编辑器"),
+                    );
+                    return;
+                }
+                match std::fs::read(&path) {
+                    Ok(bytes)
+                        if bytes.len() as u64 <= crate::sftp::transfer::MAX_EDITABLE_TEXT_SIZE =>
+                    {
+                        self.open_text_editor(
+                            TextEditTarget::Local(path),
+                            entry.name,
+                            crate::sftp::transfer::decode_text_for_editor(&bytes),
+                            window,
+                            cx,
+                        );
+                    }
+                    Ok(_) => self.toast(
+                        window,
+                        cx,
+                        Notification::error("文件超过 2 MiB，请使用外部编辑器"),
+                    ),
+                    Err(err) => self.toast(
+                        window,
+                        cx,
+                        Notification::error(format!("读取 {} 失败：{err}", path.display())),
+                    ),
+                }
+            }
+            RemoteOpenBehavior::SystemDefault | RemoteOpenBehavior::CustomEditor => {
+                let editor_path = match self.settings.remote_open_behavior {
+                    RemoteOpenBehavior::CustomEditor => {
+                        let Some(editor) = self.settings.editor_path.as_deref() else {
+                            self.toast(window, cx, Notification::error("请先在设置中选择编辑器"));
+                            return;
+                        };
+                        Some(editor)
+                    }
+                    _ => None,
+                };
+                match open_external_editor(&path, editor_path) {
+                    Ok(()) => {
+                        self.toast(window, cx, Notification::success("已用编辑器打开本地文件"))
+                    }
+                    Err(message) => self.toast(window, cx, Notification::error(message)),
+                }
+            }
+        }
+    }
+
+    fn request_external_edit(
+        &mut self,
+        entry: FileEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state != SessionState::Connected {
+            self.toast(window, cx, Notification::error("请先连接服务器"));
+            return;
+        }
+        if entry.is_dir() {
+            return;
+        }
+
+        let editor_path = match self.settings.remote_open_behavior {
+            RemoteOpenBehavior::SystemDefault => None,
+            RemoteOpenBehavior::CustomEditor => {
+                let Some(path) = self.settings.editor_path.clone() else {
+                    self.toast(window, cx, Notification::error("请先在设置中选择编辑器"));
+                    return;
+                };
+                Some(path)
+            }
+            RemoteOpenBehavior::BuiltInTextEditor => {
+                self.request_text_edit(entry, window, cx);
+                return;
+            }
+        };
+
+        let id = self.next_transfer_id;
+        self.next_transfer_id += 1;
+        let local = match external_edit_cache_path(id, &entry.name) {
+            Ok(path) => path,
+            Err(message) => {
+                self.toast(window, cx, Notification::error(message));
+                return;
+            }
+        };
+
+        self.transfers.update(cx, |queue, cx| {
+            queue.enqueue(
+                id,
+                format!("编辑 {}", entry.name),
+                TransferDirection::Download,
+                entry.size,
+                cx,
+            )
+        });
+        self.pending_external_edits.insert(
+            id,
+            PendingExternalEdit {
+                remote: entry.path.clone(),
+                local: local.clone(),
+                editor_path,
+                connection_generation: self.connection_generation,
+            },
+        );
+        self.worker.send(SftpCommand::Download {
+            id,
+            remote: entry.path,
+            local,
+            total: entry.size,
+            resume: false,
+        });
+        cx.notify();
+    }
+
+    fn launch_external_editor(
+        &mut self,
+        edit: PendingExternalEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let stamp = match file_stamp(&edit.local) {
+            Ok(stamp) => stamp,
+            Err(message) => {
+                self.toast(window, cx, Notification::error(message));
+                return;
+            }
+        };
+        if let Err(message) = open_external_editor(&edit.local, edit.editor_path.as_deref()) {
+            self.toast(window, cx, Notification::error(message));
+            return;
+        }
+
+        let local = edit.local.clone();
+        self.external_edits.insert(
+            local.clone(),
+            ActiveExternalEdit {
+                remote: edit.remote,
+                stamp,
+                revision: 0,
+                last_attempted_revision: 0,
+                uploading: false,
+                pending_since: None,
+                connection_generation: edit.connection_generation,
+            },
+        );
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(EXTERNAL_EDIT_POLL).await;
+                if this
+                    .update(cx, |workspace, cx| workspace.poll_external_edit(&local, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        self.toast(
+            window,
+            cx,
+            Notification::info("已用外部编辑器打开，保存后将自动同步"),
+        );
+    }
+
+    fn poll_external_edit(&mut self, local: &Path, cx: &mut Context<Self>) {
+        let Ok(stamp) = file_stamp(local) else {
+            return;
+        };
+        let now = Instant::now();
+        let dispatch = {
+            let Some(edit) = self.external_edits.get_mut(local) else {
+                return;
+            };
+            if stamp != edit.stamp {
+                edit.stamp = stamp;
+                edit.revision += 1;
+                edit.pending_since = Some(now);
+                return;
+            }
+            if self.state != SessionState::Connected
+                || edit.connection_generation != self.connection_generation
+                || edit.uploading
+                || edit.revision == edit.last_attempted_revision
+                || edit
+                    .pending_since
+                    .is_none_or(|changed| now.duration_since(changed) < EXTERNAL_EDIT_DEBOUNCE)
+            {
+                return;
+            }
+
+            edit.uploading = true;
+            edit.last_attempted_revision = edit.revision;
+            edit.pending_since = None;
+            Some((edit.remote.clone(), edit.revision, stamp.len))
+        };
+
+        let Some((remote, revision, total)) = dispatch else {
+            return;
+        };
+        let id = self.next_transfer_id;
+        self.next_transfer_id += 1;
+        let name = local
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "远程文件".to_string());
+        self.transfers.update(cx, |queue, cx| {
+            queue.enqueue(
+                id,
+                format!("同步 {name}"),
+                TransferDirection::Upload,
+                total,
+                cx,
+            )
+        });
+        self.pending_external_syncs.insert(
+            id,
+            PendingExternalSync {
+                local: local.to_path_buf(),
+                revision,
+                connection_generation: self.connection_generation,
+            },
+        );
+        self.worker.send(SftpCommand::UploadOverwrite {
+            id,
+            local: local.to_path_buf(),
+            remote,
+            total,
+        });
+        cx.notify();
+    }
+
+    fn request_text_edit(&mut self, entry: FileEntry, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state != SessionState::Connected {
+            self.toast(window, cx, Notification::error("请先连接服务器"));
+            return;
+        }
+        if entry.is_dir() {
+            return;
+        }
+        if self.pending_text_edit.is_some() {
+            self.toast(window, cx, Notification::info("正在读取文件，请稍候"));
+            return;
+        }
+        if entry.size > crate::sftp::transfer::MAX_EDITABLE_TEXT_SIZE {
+            self.toast(
+                window,
+                cx,
+                Notification::error("文件超过 2 MiB，请下载后使用本地编辑器"),
+            );
+            return;
+        }
+
+        self.pending_text_edit = Some(entry.clone());
+        self.worker.send(SftpCommand::ReadText { path: entry.path });
+        cx.notify();
+    }
+
+    fn open_text_editor(
+        &mut self,
+        target: TextEditTarget,
+        name: String,
+        content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| TextareaState::new(window, cx).default_value(content));
+        self.active_text_edit = Some(ActiveTextEdit {
+            target: target.clone(),
+            saving: false,
+            error: None,
+        });
+
+        let workspace = cx.entity().downgrade();
+        let display_path = target.display_path();
+        let focus_on_mount = Rc::new(Cell::new(true));
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let editor = editor.clone();
+            let target = target.clone();
+            let display_path = display_path.clone();
+            let save_owner = workspace.clone();
+            let cancel_owner = workspace.clone();
+            let close_owner = workspace.clone();
+            let close_target = target.clone();
+            let focus_on_mount = focus_on_mount.clone();
+            let theme = cx.theme().clone();
+            let (saving, error) = workspace
+                .read_with(cx, |workspace, _| {
+                    workspace
+                        .active_text_edit
+                        .as_ref()
+                        .filter(|edit| edit.target == target)
+                        .map(|edit| (edit.saving, edit.error.clone()))
+                })
+                .ok()
+                .flatten()
+                .unwrap_or((false, None));
+
+            if focus_on_mount.replace(false) {
+                let editor = editor.clone();
+                window.defer(cx, move |window, cx| {
+                    editor.focus_handle(cx).focus(window, cx);
+                });
+            }
+
+            dialog
+                .title(SharedString::from(format!("编辑 {name}")))
+                .w(px(760.))
+                .max_w(px(960.))
+                .close_button(false)
+                .overlay_closable(false)
+                .keyboard(!saving)
+                .on_close(move |_, _, cx| {
+                    let _ = close_owner.update(cx, |workspace, cx| {
+                        if workspace
+                            .active_text_edit
+                            .as_ref()
+                            .is_some_and(|edit| edit.target == close_target)
+                        {
+                            workspace.active_text_edit = None;
+                            cx.notify();
+                        }
+                    });
+                })
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(SharedString::from(display_path.clone())),
+                        )
+                        .child(
+                            Textarea::new(&editor)
+                                .aria_label("文件内容")
+                                .w_full()
+                                .h(px(420.))
+                                .disabled(saving),
+                        )
+                        .when_some(error, |this, error| {
+                            this.child(div().text_xs().text_color(theme.danger).child(error))
+                        }),
+                )
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("text-editor-cancel")
+                                .label("取消")
+                                .disabled(saving)
+                                .on_click(move |_, window, cx| {
+                                    let _ = cancel_owner.update(cx, |workspace, cx| {
+                                        workspace.active_text_edit = None;
+                                        cx.notify();
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("text-editor-save")
+                                .primary()
+                                .label(if saving { "保存中…" } else { "保存" })
+                                .loading(saving)
+                                .on_click(move |_, window, cx| {
+                                    let content = editor.read(cx).value().to_string();
+                                    let target = target.clone();
+                                    if content.len() as u64
+                                        > crate::sftp::transfer::MAX_EDITABLE_TEXT_SIZE
+                                    {
+                                        let _ = save_owner.update(cx, |workspace, cx| {
+                                            if let Some(edit) = workspace.active_text_edit.as_mut()
+                                                && edit.target == target
+                                            {
+                                                edit.error = Some(SharedString::from(
+                                                    "编辑后的内容超过 2 MiB，无法保存",
+                                                ));
+                                                cx.notify();
+                                            }
+                                        });
+                                        return;
+                                    }
+
+                                    match target {
+                                        TextEditTarget::Remote(path) => {
+                                            let _ = save_owner.update(cx, |workspace, cx| {
+                                                let Some(edit) =
+                                                    workspace.active_text_edit.as_mut()
+                                                else {
+                                                    return;
+                                                };
+                                                if edit.target
+                                                    != TextEditTarget::Remote(path.clone())
+                                                    || edit.saving
+                                                {
+                                                    return;
+                                                }
+
+                                                edit.saving = true;
+                                                edit.error = None;
+                                                workspace
+                                                    .worker
+                                                    .send(SftpCommand::WriteText { path, content });
+                                                cx.notify();
+                                            });
+                                        }
+                                        TextEditTarget::Local(path) => {
+                                            match std::fs::write(&path, content) {
+                                                Ok(()) => {
+                                                    let _ =
+                                                        save_owner.update(cx, |workspace, cx| {
+                                                            if workspace
+                                                                .active_text_edit
+                                                                .as_ref()
+                                                                .is_some_and(|edit| {
+                                                                    edit.target
+                                                                        == TextEditTarget::Local(
+                                                                            path.clone(),
+                                                                        )
+                                                                })
+                                                            {
+                                                                workspace.active_text_edit = None;
+                                                                workspace
+                                                                    .local
+                                                                    .update(cx, |pane, cx| {
+                                                                        pane.reload(cx)
+                                                                    });
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    window.close_dialog(cx);
+                                                    window.push_notification(
+                                                        Notification::success("本地文件已保存"),
+                                                        cx,
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    let message = SharedString::from(format!(
+                                                        "保存 {} 失败：{err}",
+                                                        path.display()
+                                                    ));
+                                                    let _ =
+                                                        save_owner.update(cx, |workspace, cx| {
+                                                            if let Some(edit) =
+                                                                workspace.active_text_edit.as_mut()
+                                                                && edit.target
+                                                                    == TextEditTarget::Local(
+                                                                        path.clone(),
+                                                                    )
+                                                            {
+                                                                edit.error = Some(message.clone());
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }),
+                        ),
+                )
+        });
     }
 
     /// 不针对某个条目的菜单动作。目前只有「新建目录」。
     fn handle_pane_action(
         &mut self,
+        side: PaneSide,
         action: FileAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match action {
-            FileAction::NewFolder => self.new_folder(window, cx),
+            FileAction::NewFolder => match side {
+                PaneSide::Local => self.new_local_folder(window, cx),
+                PaneSide::Remote => self.new_folder(window, cx),
+            },
             other => log::warn!("忽略面板级动作：{other:?}"),
         }
+    }
+
+    fn open_local_rename_dialog(
+        &mut self,
+        entry: FileEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let from = PathBuf::from(&entry.path);
+        let Some(parent) = from.parent().map(Path::to_path_buf) else {
+            self.toast(window, cx, Notification::error("无法重命名该路径"));
+            return;
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(entry.name));
+        let local = self.local.clone();
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let input = input.clone();
+            let from = from.clone();
+            let parent = parent.clone();
+            let local = local.clone();
+
+            dialog
+                .title("重命名本地条目")
+                .child(Input::new(&input).w_full())
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("local-rename-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("local-rename-ok")
+                                .primary()
+                                .label("确定")
+                                .on_click(move |_, window, cx| {
+                                    let name = input.read(cx).value().trim().to_string();
+                                    if !crate::sftp::session::is_safe_entry_name(&name) {
+                                        window.push_notification(
+                                            Notification::error(
+                                                "名称不能为空，也不能是 .、..，且不能包含 /",
+                                            ),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    let to = parent.join(name);
+                                    if to == from {
+                                        window.close_dialog(cx);
+                                        return;
+                                    }
+                                    if to.exists() {
+                                        window.push_notification(
+                                            Notification::error("目标名称已经存在"),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    match std::fs::rename(&from, &to) {
+                                        Ok(()) => {
+                                            local.update(cx, |pane, cx| pane.reload(cx));
+                                            window.push_notification(
+                                                Notification::success("重命名成功"),
+                                                cx,
+                                            );
+                                            window.close_dialog(cx);
+                                        }
+                                        Err(err) => window.push_notification(
+                                            Notification::error(format!("重命名失败：{err}")),
+                                            cx,
+                                        ),
+                                    }
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn confirm_local_trash(
+        &mut self,
+        entry: FileEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let local = self.local.clone();
+        let path = PathBuf::from(entry.path);
+        let name = entry.name;
+
+        window.open_alert_dialog(cx, move |alert, _window, _cx| {
+            let local = local.clone();
+            let path = path.clone();
+            alert
+                .confirm()
+                .title("移到废纸篓")
+                .description(SharedString::from(format!(
+                    "将 {name} 移到废纸篓，可在访达中恢复。"
+                )))
+                .on_ok(move |_, window, cx| match move_local_to_trash(&path) {
+                    Ok(()) => {
+                        local.update(cx, |pane, cx| pane.reload(cx));
+                        window.push_notification(Notification::success("已移到废纸篓"), cx);
+                        true
+                    }
+                    Err(message) => {
+                        window.push_notification(Notification::error(message), cx);
+                        false
+                    }
+                })
+        });
+    }
+
+    fn new_local_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = PathBuf::from(self.local.read(cx).path());
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("新目录名称"));
+        let local = self.local.clone();
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let input = input.clone();
+            let dir = dir.clone();
+            let local = local.clone();
+
+            dialog
+                .title("新建本地目录")
+                .child(Input::new(&input).w_full())
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("local-new-folder-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("local-new-folder-ok")
+                                .primary()
+                                .label("创建")
+                                .on_click(move |_, window, cx| {
+                                    let name = input.read(cx).value().trim().to_string();
+                                    if !crate::sftp::session::is_safe_entry_name(&name) {
+                                        window.push_notification(
+                                            Notification::error(
+                                                "名称不能为空，也不能是 .、..，且不能包含 /",
+                                            ),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    match std::fs::create_dir(dir.join(name)) {
+                                        Ok(()) => {
+                                            local.update(cx, |pane, cx| pane.reload(cx));
+                                            window.push_notification(
+                                                Notification::success("目录已创建"),
+                                                cx,
+                                            );
+                                            window.close_dialog(cx);
+                                        }
+                                        Err(err) => window.push_notification(
+                                            Notification::error(format!("创建目录失败：{err}")),
+                                            cx,
+                                        ),
+                                    }
+                                }),
+                        ),
+                )
+        });
     }
 
     fn open_rename_dialog(
@@ -956,12 +2025,19 @@ impl Workspace {
                         .child(Button::new("rename-ok").primary().label("确定").on_click(
                             move |_, window, cx| {
                                 let name = input.read(cx).value().trim().to_string();
-                                if !name.is_empty() {
-                                    let _ = sender.send(SftpCommand::Rename {
-                                        from: from.clone(),
-                                        to: join_remote(&dir, &name),
-                                    });
+                                if !crate::sftp::session::is_safe_entry_name(&name) {
+                                    window.push_notification(
+                                        Notification::error(
+                                            "名称不能为空，也不能是 .、..，且不能包含 /",
+                                        ),
+                                        cx,
+                                    );
+                                    return;
                                 }
+                                let _ = sender.send(SftpCommand::Rename {
+                                    from: from.clone(),
+                                    to: join_remote(&dir, &name),
+                                });
                                 window.close_dialog(cx);
                             },
                         )),
@@ -1027,18 +2103,27 @@ impl Workspace {
                                 .label("取消")
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
-                        .child(Button::new("new-folder-ok").primary().label("创建").on_click(
-                            move |_, window, cx| {
-                                let name = input.read(cx).value().trim().to_string();
-                                if name.is_empty() {
-                                    return;
-                                }
-                                let _ = sender.send(SftpCommand::Mkdir {
-                                    path: join_remote(&dir, &name),
-                                });
-                                window.close_dialog(cx);
-                            },
-                        )),
+                        .child(
+                            Button::new("new-folder-ok")
+                                .primary()
+                                .label("创建")
+                                .on_click(move |_, window, cx| {
+                                    let name = input.read(cx).value().trim().to_string();
+                                    if !crate::sftp::session::is_safe_entry_name(&name) {
+                                        window.push_notification(
+                                            Notification::error(
+                                                "名称不能为空，也不能是 .、..，且不能包含 /",
+                                            ),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    let _ = sender.send(SftpCommand::Mkdir {
+                                        path: join_remote(&dir, &name),
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        ),
                 )
         });
     }
@@ -1048,6 +2133,12 @@ impl Workspace {
     // -----------------------------------------------------------------------
 
     fn render_split(&self) -> AnyElement {
+        let remote = if self.state == SessionState::Connected {
+            self.remote.clone().into_any_element()
+        } else {
+            div().size_full().into_any_element()
+        };
+
         h_resizable("workspace-horizontal")
             .child(
                 resizable_panel()
@@ -1055,7 +2146,7 @@ impl Workspace {
                     .size_range(px(300.)..px(2000.))
                     .child(self.local.clone()),
             )
-            .child(resizable_panel().child(self.remote.clone()))
+            .child(resizable_panel().child(remote))
             .into_any_element()
     }
 
@@ -1095,10 +2186,77 @@ impl Workspace {
                     .xsmall()
                     .icon(IconName::ChevronUp)
                     .tooltip("展开队列")
-                    .on_click(cx.listener(|workspace, _, _, cx| workspace.set_collapsed(false, cx))),
+                    .on_click(
+                        cx.listener(|workspace, _, _, cx| workspace.set_collapsed(false, cx)),
+                    ),
             )
             .into_any_element()
     }
+}
+
+fn external_edit_cache_path(id: u64, name: &str) -> Result<PathBuf, String> {
+    let file_name = Path::new(name)
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| std::ffi::OsStr::new("remote-file"));
+    let dir = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("macscp")
+        .join("external-edits")
+        .join(format!("{}-{id}", std::process::id()));
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("创建编辑缓存 {} 失败：{err}", dir.display()))?;
+    Ok(dir.join(file_name))
+}
+
+fn file_stamp(path: &Path) -> Result<FileStamp, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("读取编辑缓存 {} 失败：{err}", path.display()))?;
+    Ok(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn move_local_to_trash(path: &Path) -> Result<(), String> {
+    use objc2_foundation::{NSFileManager, NSURL};
+
+    let url = NSURL::from_file_path(path)
+        .ok_or_else(|| format!("无法识别本地路径：{}", path.display()))?;
+    NSFileManager::defaultManager()
+        .trashItemAtURL_resultingItemURL_error(&url, None)
+        .map_err(|err| format!("移到废纸篓失败：{err}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn move_local_to_trash(_path: &Path) -> Result<(), String> {
+    Err("当前系统不支持移到废纸篓".to_string())
+}
+
+fn open_external_editor(local: &Path, editor_path: Option<&Path>) -> Result<(), String> {
+    let mut command = match editor_path {
+        Some(editor_path)
+            if editor_path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("app")) =>
+        {
+            let mut command = Command::new("/usr/bin/open");
+            command.arg("-a").arg(editor_path);
+            command
+        }
+        Some(editor_path) => Command::new(editor_path),
+        None => Command::new("/usr/bin/open"),
+    };
+    command.arg(local);
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("启动编辑器失败：{err}"))?;
+    // `open` 很快就会退出；后台回收它，避免主线程等待或留下僵尸进程。
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 impl Render for Workspace {
@@ -1119,21 +2277,23 @@ impl Render for Workspace {
             v_flex()
                 .size_full()
                 .bg(theme.background)
-                .child(div().flex_1().min_h_0().child(
-                    v_resizable("workspace-vertical")
-                        .child(
-                            resizable_panel()
-                                .size(px(520.))
-                                .size_range(px(200.)..px(1600.))
-                                .child(split),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size(px(180.))
-                                .size_range(px(96.)..px(420.))
-                                .child(queue),
-                        ),
-                ))
+                .child(
+                    div().flex_1().min_h_0().child(
+                        v_resizable("workspace-vertical")
+                            .child(
+                                resizable_panel()
+                                    .size(px(520.))
+                                    .size_range(px(200.)..px(1600.))
+                                    .child(split),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size(px(180.))
+                                    .size_range(px(96.)..px(420.))
+                                    .child(queue),
+                            ),
+                    ),
+                )
                 .into_any_element()
         }
     }
@@ -1210,18 +2370,17 @@ impl FolderDirection {
     fn target(self, targets: &[FolderTarget], destination: &str) -> String {
         match (self, targets) {
             (FolderDirection::Upload, [one]) => join_remote(destination, &one.name),
-            (FolderDirection::Download, [one]) => {
-                PathBuf::from(destination).join(&one.name).display().to_string()
-            }
+            (FolderDirection::Download, [one]) => PathBuf::from(destination)
+                .join(&one.name)
+                .display()
+                .to_string(),
             (_, _) => destination.to_string(),
         }
     }
 
     fn note(self) -> &'static str {
         match self {
-            FolderDirection::Upload => {
-                "整棵目录会递归上传（符号链接跳过）。远端已存在的同名文件："
-            }
+            FolderDirection::Upload => "整棵目录会递归上传（符号链接跳过）。远端已存在的同名文件：",
             FolderDirection::Download => {
                 "整棵目录会递归下载（符号链接跳过）。本地已存在的同名文件："
             }
@@ -1319,7 +2478,9 @@ mod tests {
             "/Users/me/Downloads/demo-pkg"
         );
         assert!(
-            FolderDirection::Download.note().contains("本地已存在的同名文件"),
+            FolderDirection::Download
+                .note()
+                .contains("本地已存在的同名文件"),
             "下载问的是本地那份要不要覆盖"
         );
         assert_eq!(folder_names(&targets), "", "单个文件夹标题已点名，不用再列");
@@ -1340,7 +2501,9 @@ mod tests {
             "/home/tester/dist"
         );
         assert!(
-            FolderDirection::Upload.note().contains("远端已存在的同名文件"),
+            FolderDirection::Upload
+                .note()
+                .contains("远端已存在的同名文件"),
             "上传问的是远端那份要不要覆盖"
         );
     }
@@ -1365,4 +2528,3 @@ mod tests {
         assert_eq!(folder_names(&targets), "one、two、three 等 4 个");
     }
 }
-
