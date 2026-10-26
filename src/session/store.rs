@@ -2,12 +2,16 @@
 
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+use apple_native_keyring_store::protected::{AccessPolicy, Cred as ProtectedCredential};
 use serde::{Deserialize, Serialize};
 
 use crate::sftp::types::SessionConfig;
 
 /// Keychain 里的 service 名，所有条目共享。
 const KEYRING_SERVICE: &str = "com.macscp.credentials";
+#[cfg(target_os = "macos")]
+const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;
 const PROFILES_FILE: &str = "profiles.json";
 const SETTINGS_FILE: &str = "settings.json";
 const DIRECTORIES_FILE: &str = "directories.json";
@@ -264,30 +268,138 @@ pub fn save_directory_history(history: &DirectoryHistory) -> Result<(), String> 
     std::fs::write(directories_path(), json).map_err(|err| format!("写入目录历史失败：{err}"))
 }
 
-/// 把密码写进 Keychain。
-pub fn store_password(config: &SessionConfig, password: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &config.keyring_account())
-        .map_err(|err| format!("无法访问钥匙串：{err}"))?;
-    entry
-        .set_password(password)
-        .map_err(|err| format!("写入钥匙串失败：{err}"))
+#[cfg(target_os = "macos")]
+fn store_protected_password(account: &str, password: &str) -> keyring::Result<()> {
+    let entry = ProtectedCredential::build(
+        KEYRING_SERVICE,
+        account,
+        AccessPolicy::RequireUserPresence,
+        None,
+        false,
+    )?;
+    entry.set_password(password)
 }
 
-/// 从 Keychain 取密码；没有记录时返回 `Ok(None)`，权限或存储故障必须显式上报。
-pub fn load_password(config: &SessionConfig) -> Result<Option<String>, String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &config.keyring_account())
-        .map_err(|err| format!("无法访问钥匙串：{err}"))?;
-    match entry.get_password() {
+#[cfg(target_os = "macos")]
+fn load_protected_password(account: &str) -> keyring::Result<String> {
+    let entry = ProtectedCredential::build(
+        KEYRING_SERVICE,
+        account,
+        AccessPolicy::RequireUserPresence,
+        None,
+        false,
+    )?;
+    entry.get_password()
+}
+
+#[cfg(target_os = "macos")]
+fn delete_protected_password(account: &str) -> keyring::Result<()> {
+    let entry = ProtectedCredential::build(
+        KEYRING_SERVICE,
+        account,
+        AccessPolicy::RequireUserPresence,
+        None,
+        false,
+    )?;
+    entry.delete_credential()
+}
+
+#[cfg(target_os = "macos")]
+fn is_missing_protected_keychain_entitlement(err: &keyring::Error) -> bool {
+    let source = match err {
+        keyring::Error::PlatformFailure(source) | keyring::Error::NoStorageAccess(source) => source,
+        _ => return false,
+    };
+    source
+        .downcast_ref::<security_framework::base::Error>()
+        .is_some_and(|err| err.code() == ERR_SEC_MISSING_ENTITLEMENT)
+}
+
+fn legacy_entry(config: &SessionConfig) -> keyring::Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, &config.keyring_account())
+}
+
+fn store_legacy_password(config: &SessionConfig, password: &str) -> keyring::Result<()> {
+    legacy_entry(config)?.set_password(password)
+}
+
+fn load_legacy_password(config: &SessionConfig) -> keyring::Result<Option<String>> {
+    match legacy_entry(config)?.get_password() {
         Ok(password) => Ok(Some(password)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(format!("读取钥匙串失败：{err}")),
+        Err(err) => Err(err),
     }
+}
+
+fn delete_legacy_password(config: &SessionConfig) {
+    if let Ok(entry) = legacy_entry(config) {
+        let _ = entry.delete_credential();
+    }
+}
+
+/// 把密码写进 Keychain。macOS 上优先写入要求用户在场的受保护条目：系统会先
+/// 尝试 Touch ID，并允许用 Mac 登录密码回退。未签名的开发二进制没有受保护
+/// Keychain 权限，此时保留旧 Keychain 存储，避免 `cargo run` 无法记住密码。
+pub fn store_password(config: &SessionConfig, password: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let account = config.keyring_account();
+        match store_protected_password(&account, password) {
+            Ok(()) => {
+                delete_legacy_password(config);
+                return Ok(());
+            }
+            Err(err) if is_missing_protected_keychain_entitlement(&err) => {
+                log::warn!(
+                    "当前构建未获得受保护 Keychain 权限，密码暂存普通 Keychain；\
+                     使用带 provisioning profile 的签名应用后会自动迁移"
+                );
+            }
+            Err(err) => return Err(format!("写入 Touch ID 保护的钥匙串失败：{err}")),
+        }
+    }
+
+    store_legacy_password(config, password).map_err(|err| format!("写入钥匙串失败：{err}"))
+}
+
+/// 从 Keychain 取密码；受保护条目由系统执行 Touch ID 优先、登录密码回退。
+/// 旧版普通 Keychain 条目在首次成功读取后会自动迁移。
+pub fn load_password(config: &SessionConfig) -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let account = config.keyring_account();
+        match load_protected_password(&account) {
+            Ok(password) => return Ok(Some(password)),
+            Err(keyring::Error::NoEntry) => {}
+            Err(err) if is_missing_protected_keychain_entitlement(&err) => {
+                log::debug!("当前构建无受保护 Keychain 权限，改读普通 Keychain");
+            }
+            Err(err) => return Err(format!("Touch ID 验证或钥匙串读取失败：{err}")),
+        }
+
+        let password =
+            load_legacy_password(config).map_err(|err| format!("读取旧版钥匙串失败：{err}"))?;
+        if let Some(password) = password {
+            match store_protected_password(&account, &password) {
+                Ok(()) => delete_legacy_password(config),
+                Err(err) if is_missing_protected_keychain_entitlement(&err) => {}
+                Err(err) => log::warn!("旧版密码迁移到 Touch ID 钥匙串失败：{err}"),
+            }
+            return Ok(Some(password));
+        }
+        Ok(None)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    load_legacy_password(config).map_err(|err| format!("读取钥匙串失败：{err}"))
 }
 
 pub fn forget_password(config: &SessionConfig) {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &config.keyring_account()) {
-        let _ = entry.delete_credential();
+    #[cfg(target_os = "macos")]
+    {
+        let _ = delete_protected_password(&config.keyring_account());
     }
+    delete_legacy_password(config);
 }
 
 /// 记录/更新一条连接配置（按 user@host 去重，端口变化视为同一收藏）。
@@ -336,6 +448,27 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.contains("tester@"));
         assert!(a.ends_with(":22"));
+    }
+
+    /// 只有开发构建缺少 entitlement 时才允许回退普通 Keychain。用户取消
+    /// Touch ID/密码验证必须原样失败，否则一次“取消”就会绕过用户在场保护。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn protected_keychain_fallback_never_bypasses_cancelled_authentication() {
+        let missing_entitlement = keyring::Error::PlatformFailure(Box::new(
+            security_framework::base::Error::from_code(ERR_SEC_MISSING_ENTITLEMENT),
+        ));
+        assert!(is_missing_protected_keychain_entitlement(
+            &missing_entitlement
+        ));
+
+        let user_cancelled = keyring::Error::PlatformFailure(Box::new(
+            security_framework::base::Error::from_code(-128),
+        ));
+        assert!(!is_missing_protected_keychain_entitlement(&user_cancelled));
+        assert!(!is_missing_protected_keychain_entitlement(
+            &keyring::Error::NoEntry
+        ));
     }
 
     #[test]

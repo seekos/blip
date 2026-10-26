@@ -37,6 +37,19 @@ use crate::sftp::types::{EntryKind, FileEntry};
 /// 列表顶部「返回上一级」那一行的名字。POSIX 不允许真实文件叫这个名字。
 pub const PARENT_ROW_NAME: &str = "..";
 
+const FILE_TABLE_COLUMNS: usize = 4;
+
+fn default_column_widths() -> Vec<Pixels> {
+    vec![px(190.), px(76.), px(86.), px(136.)]
+}
+
+fn remember_column_widths(saved: &RefCell<Vec<Pixels>>, widths: &[Pixels]) {
+    // 只接受一整套宽度，避免组件版本或异常事件把列定义保存成残缺状态。
+    if widths.len() == FILE_TABLE_COLUMNS {
+        saved.replace(widths.to_vec());
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaneSide {
     Local,
@@ -134,6 +147,7 @@ impl FilePane {
         let show_hidden = false;
         let row_bounds = Rc::new(RefCell::new(BTreeMap::new()));
         let selection_surface = Rc::new(Cell::new(None));
+        let column_widths = Rc::new(RefCell::new(default_column_widths()));
 
         let table = cx.new(|cx| {
             TableState::new(
@@ -149,6 +163,7 @@ impl FilePane {
                     selected_rows: BTreeSet::new(),
                     selection_anchor: None,
                     row_bounds: row_bounds.clone(),
+                    column_widths: column_widths.clone(),
                 },
                 window,
                 cx,
@@ -160,15 +175,19 @@ impl FilePane {
             .cell_selectable(false)
         });
 
+        let remembered_widths = column_widths.clone();
         let subscription = cx.subscribe_in(
             &table,
             window,
-            |pane, _table, event: &TableEvent, _window, cx| {
+            move |pane, _table, event: &TableEvent, _window, cx| {
                 match event {
                     TableEvent::DoubleClickedRow(row) => pane.activate_row(*row, cx),
                     // 键盘上下移动仍然能进入我们的多选状态；Control / Command / Shift
                     // 点击则在面板的 MouseDown 阶段接管。
                     TableEvent::SelectRow(row) => pane.select_single_row(*row, cx),
+                    TableEvent::ColumnWidthsChanged(widths) => {
+                        remember_column_widths(&remembered_widths, widths);
+                    }
                     _ => {}
                 }
             },
@@ -1085,6 +1104,8 @@ pub struct FileTable {
     selected_rows: BTreeSet<usize>,
     selection_anchor: Option<usize>,
     row_bounds: Rc<RefCell<BTreeMap<usize, Bounds<Pixels>>>>,
+    /// 表格 `refresh()` 会重新读取 delegate 的列定义；这里保存用户拖拽后的宽度。
+    column_widths: Rc<RefCell<Vec<Pixels>>>,
 }
 
 impl FileTable {
@@ -1404,17 +1425,21 @@ impl TableDelegate for FileTable {
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
+        let width = self
+            .column_widths
+            .borrow()
+            .get(col_ix)
+            .copied()
+            .unwrap_or_else(|| default_column_widths()[col_ix.min(FILE_TABLE_COLUMNS - 1)]);
         match col_ix {
-            0 => Column::new("name", "名称")
-                .width(px(190.))
-                .min_width(px(120.)),
+            0 => Column::new("name", "名称").width(width).min_width(px(120.)),
             1 => Column::new("size", "大小")
-                .width(px(76.))
+                .width(width)
                 .text_right()
                 .resizable(false),
-            2 => Column::new("mode", "权限").width(px(86.)).resizable(false),
+            2 => Column::new("mode", "权限").width(width).resizable(false),
             _ => Column::new("modified", "修改时间")
-                .width(px(136.))
+                .width(width)
                 .resizable(false),
         }
     }
@@ -1703,6 +1728,54 @@ mod tests {
         assert_eq!(forward, reverse);
         assert_eq!(forward.origin, point(px(10.), px(20.)));
         assert_eq!(forward.size, size(px(30.), px(50.)));
+    }
+
+    #[::gpui::test]
+    fn resized_column_width_survives_table_refresh(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let mut pane = FilePane::new(PaneSide::Remote, "/home".to_string(), window, cx);
+            pane.set_entries(
+                "/home".to_string(),
+                vec![entry("one.txt", EntryKind::File)],
+                cx,
+            );
+            pane
+        });
+
+        let table = pane.read_with(cx, |pane, _| pane.table.clone());
+        table.update(cx, |_, cx| {
+            // 等价于用户松开列宽拖拽柄时表格发出的事件。
+            cx.emit(TableEvent::ColumnWidthsChanged(vec![
+                px(360.),
+                px(76.),
+                px(86.),
+                px(136.),
+            ]));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let blank = pane.read_with(cx, |pane, _| {
+            let surface = pane.selection_surface.get().expect("表格区域已布局");
+            let rows_bottom = pane
+                .row_bounds
+                .borrow()
+                .values()
+                .map(Bounds::bottom)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("应有上级目录行");
+            let position = point(surface.left() + px(20.), rows_bottom + px(20.));
+            assert!(surface.contains(&position));
+            position
+        });
+        cx.simulate_click(blank, Modifiers::default());
+
+        table.read_with(cx, |state, _| {
+            // 点击正文空白会清空选择并 refresh；拖拽后的宽度不能被默认值覆盖。
+            assert_eq!(state.col_width(0), Some(px(360.)));
+            assert_eq!(state.col_width(1), Some(px(76.)));
+        });
     }
 
     #[::gpui::test]

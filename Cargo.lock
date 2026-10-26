@@ -4308,6 +4308,7 @@ name = "macscp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "apple-native-keyring-store",
  "block2 0.6.2",
  "chrono",
  "dirs 6.0.0",
@@ -4323,6 +4324,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "russh",
  "russh-sftp",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2 0.10.9",
