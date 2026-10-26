@@ -1177,6 +1177,35 @@ mod tests {
         assert_eq!(vfs_mode(PATH).await, Some(0o100_640), "原权限必须保留");
     }
 
+    /// 多选删除必须由一条指令处理整批文件/目录，并只返回一条汇总结果。
+    #[tokio::test]
+    async fn worker_removes_multiple_selected_entries() {
+        const FILE: &str = "/home/tester/delete-one.txt";
+        const DIR: &str = "/home/tester/delete-dir";
+        const NESTED: &str = "/home/tester/delete-dir/nested.txt";
+
+        let _guard = vfs_lock().lock_owned().await;
+        vfs_reset().await;
+        vfs_write(FILE, b"one").await;
+        vfs_mkdir(DIR).await;
+        vfs_write(NESTED, b"nested").await;
+
+        let addr = spawn().await;
+        let worker = SftpWorker::spawn();
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
+        worker.send(SftpCommand::Remove {
+            entries: vec![(FILE.to_string(), false), (DIR.to_string(), true)],
+        });
+
+        match next_event(&worker).await {
+            SftpEvent::Notice(message) => assert_eq!(message, "已删除 2 项"),
+            other => panic!("期望批量删除成功通知，实际 {other:?}"),
+        }
+        assert!(!vfs_exists(FILE).await);
+        assert!(!vfs_exists(NESTED).await);
+        assert!(!vfs_exists(DIR).await);
+    }
+
     /// 连不上时必须收到带 `Connect` 上下文的 Error，而不是线程静默死掉。
     #[tokio::test]
     async fn worker_reports_connect_failure() {

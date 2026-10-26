@@ -309,7 +309,7 @@ impl TransferQueue {
             .w_full()
             .gap_3()
             .px_3()
-            .py_2()
+            .py_1p5()
             .border_b_1()
             .border_color(theme.border.opacity(0.5))
             .child(div().flex_shrink_0().child(match item.direction {
@@ -320,7 +320,7 @@ impl TransferQueue {
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_1()
+                    .gap_0p5()
                     .child(
                         h_flex()
                             .justify_between()
@@ -333,7 +333,7 @@ impl TransferQueue {
                                     .child(
                                         div()
                                             .truncate()
-                                            .text_sm()
+                                            .text_xs()
                                             .child(SharedString::from(item.name.clone())),
                                     )
                                     .when(resuming, |this| {
@@ -363,7 +363,13 @@ impl TransferQueue {
                     )
                     .child(
                         Progress::new(("transfer-progress", item.id))
+                            .with_size(px(2.))
                             .value(item.ratio())
+                            .accessibility_label(format!(
+                                "{} 传输进度 {:.0}%",
+                                item.name,
+                                item.ratio()
+                            ))
                             .color(match item.status {
                                 TransferStatus::Failed(_) => theme.danger,
                                 TransferStatus::Done => theme.success,

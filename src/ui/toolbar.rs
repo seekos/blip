@@ -8,6 +8,8 @@
 
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+use block2::RcBlock;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::actions::Cancel;
 use gpui_kit::component::{
@@ -21,6 +23,15 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+#[cfg(target_os = "macos")]
+use objc2::{MainThreadMarker, MainThreadOnly};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{
+    NSButton, NSControlStateValueOff, NSControlStateValueOn, NSModalResponse, NSModalResponseOK,
+    NSObjectNSKeyValueBindingCreation, NSOpenPanel, NSValueBinding, NSView,
+};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL, ns_string};
 
 use crate::session::store::{self, SavedAuth, SavedProfile};
 use crate::sftp::types::{AuthMethod, DEFAULT_SSH_PORT, SessionConfig};
@@ -50,7 +61,11 @@ pub struct Toolbar {
     port: Entity<InputState>,
     username: Entity<InputState>,
     password: Entity<InputState>,
-    key_path: Entity<InputState>,
+    /// 用户显式选择的私钥；`None` 时由连接层自动查找默认密钥。
+    key_path: Option<PathBuf>,
+    /// 下次打开私钥选择器时是否显示隐藏文件；也会跟随选择器内的开关更新。
+    show_hidden_key_files: bool,
+    choosing_key: bool,
     /// 加密私钥的口令。只在私钥模式下显示，且**从不落盘**。
     key_passphrase: Entity<InputState>,
     profiles: Vec<SavedProfile>,
@@ -73,9 +88,9 @@ impl Toolbar {
                     .placeholder("用户名")
             }),
             password: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("密码")),
-            key_path: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("留空自动查找 ~/.ssh/id_ed25519")
-            }),
+            key_path: None,
+            show_hidden_key_files: false,
+            choosing_key: false,
             key_passphrase: cx.new(|cx| {
                 InputState::new(window, cx)
                     .masked(true)
@@ -126,10 +141,10 @@ impl Toolbar {
             .update(cx, |state, cx| state.set_value(String::new(), window, cx));
         self.key_passphrase
             .update(cx, |state, cx| state.set_value(String::new(), window, cx));
-        if let SavedAuth::Key { path } = &profile.auth {
-            self.key_path
-                .update(cx, |state, cx| state.set_value(path.clone(), window, cx));
-        }
+        self.key_path = match &profile.auth {
+            SavedAuth::Key { path } if !path.trim().is_empty() => Some(PathBuf::from(path)),
+            _ => None,
+        };
         cx.notify();
     }
 
@@ -250,7 +265,11 @@ impl Toolbar {
     fn key_auth(&self, cx: &App) -> AuthMethod {
         let passphrase = self.key_passphrase.read(cx).value().trim().to_string();
         AuthMethod::PrivateKey {
-            path: expand_tilde(self.key_path.read(cx).value().trim()),
+            path: self
+                .key_path
+                .as_ref()
+                .map(|path| expand_tilde(&path.to_string_lossy()))
+                .unwrap_or_default(),
             passphrase: (!passphrase.is_empty()).then_some(passphrase),
         }
     }
@@ -320,9 +339,159 @@ impl Toolbar {
         let toolbar = cx.entity().downgrade();
 
         let password_or_key = if use_key {
-            Input::new(&self.key_path).id("toolbar-key").w_full()
+            let choosing_key = self.choosing_key;
+            let selected_path = self
+                .key_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string());
+            let key_label = selected_path
+                .clone()
+                .unwrap_or_else(|| "选择私钥文件…".to_string());
+            let key_tooltip = selected_path.clone().unwrap_or_else(|| {
+                "选择私钥文件；不选择时自动查找 ~/.ssh/id_ed25519 等默认密钥".to_string()
+            });
+            let select_label = selected_path
+                .as_ref()
+                .map(|path| format!("更换私钥文件，当前为 {path}"))
+                .unwrap_or_else(|| "选择私钥文件".to_string());
+            let select_toolbar = toolbar.clone();
+            let clear_toolbar = toolbar.clone();
+
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    Button::new("choose-key-file")
+                        .outline()
+                        .flex_1()
+                        .min_w_0()
+                        .icon(IconName::FileKey)
+                        .label(key_label)
+                        .accessibility_label(select_label)
+                        .tooltip(key_tooltip)
+                        .disabled(connected || connecting)
+                        .loading(choosing_key)
+                        .on_click(move |_, _, cx| {
+                            let picker_options = select_toolbar.update(cx, |toolbar, cx| {
+                                if toolbar.choosing_key {
+                                    return None;
+                                }
+                                toolbar.choosing_key = true;
+                                cx.notify();
+                                Some((
+                                    toolbar.show_hidden_key_files,
+                                    private_key_initial_directory(toolbar.key_path.as_deref()),
+                                ))
+                            });
+                            let Ok(Some((show_hidden_files, initial_directory))) = picker_options
+                            else {
+                                return;
+                            };
+
+                            #[cfg(target_os = "macos")]
+                            let receiver = prompt_for_private_key(
+                                show_hidden_files,
+                                initial_directory.as_deref(),
+                            );
+                            #[cfg(not(target_os = "macos"))]
+                            let receiver = cx.prompt_for_paths(PathPromptOptions {
+                                files: true,
+                                directories: false,
+                                multiple: false,
+                                prompt: Some("选择 SSH 私钥文件".into()),
+                            });
+
+                            let toolbar = select_toolbar.clone();
+                            #[cfg(target_os = "macos")]
+                            cx.spawn(async move |cx| match receiver.recv_async().await {
+                                Ok(Ok(selection)) => {
+                                    let _ = toolbar.update(cx, |toolbar, cx| {
+                                        toolbar.choosing_key = false;
+                                        toolbar.show_hidden_key_files = selection.show_hidden_files;
+                                        if let Some(path) = selection.path {
+                                            toolbar.key_path = Some(path);
+                                            toolbar.error = None;
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                                Ok(Err(message)) => {
+                                    let _ = toolbar.update(cx, |toolbar, cx| {
+                                        toolbar.choosing_key = false;
+                                        toolbar.error = Some(message.into());
+                                        cx.notify();
+                                    });
+                                }
+                                Err(_) => {
+                                    let _ = toolbar.update(cx, |toolbar, cx| {
+                                        toolbar.choosing_key = false;
+                                        toolbar.error =
+                                            Some("私钥文件选择器意外关闭，请重试".into());
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .detach();
+
+                            #[cfg(not(target_os = "macos"))]
+                            cx.spawn(async move |cx| match receiver.await {
+                                Ok(Ok(paths)) => {
+                                    let _ = toolbar.update(cx, |toolbar, cx| {
+                                        toolbar.choosing_key = false;
+                                        if let Some(path) =
+                                            paths.and_then(|paths| paths.into_iter().next())
+                                        {
+                                            toolbar.key_path = Some(path);
+                                            toolbar.error = None;
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                                Ok(Err(err)) => {
+                                    let _ = toolbar.update(cx, |toolbar, cx| {
+                                        toolbar.choosing_key = false;
+                                        toolbar.error = Some(SharedString::from(format!(
+                                            "无法选择私钥文件：{err}"
+                                        )));
+                                        cx.notify();
+                                    });
+                                }
+                                Err(_) => {
+                                    let _ = toolbar.update(cx, |toolbar, cx| {
+                                        toolbar.choosing_key = false;
+                                        toolbar.error =
+                                            Some("私钥文件选择器意外关闭，请重试".into());
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .detach();
+                        }),
+                )
+                .when(selected_path.is_some(), |this| {
+                    this.child(
+                        Button::new("clear-key-file")
+                            .ghost()
+                            .icon(IconName::X)
+                            .accessibility_label("清除私钥文件，改为自动查找")
+                            .tooltip("清除选择并自动查找默认密钥")
+                            .disabled(connected || connecting || choosing_key)
+                            .on_click(move |_, _, cx| {
+                                let _ = clear_toolbar.update(cx, |toolbar, cx| {
+                                    toolbar.key_path = None;
+                                    toolbar.error = None;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                })
+                .into_any_element()
         } else {
-            Input::new(&self.password).id("toolbar-password").w_full()
+            Input::new(&self.password)
+                .id("toolbar-password")
+                .w_full()
+                .into_any_element()
         };
         h_flex()
             .w_full()
@@ -479,6 +648,11 @@ impl Toolbar {
                             .ghost()
                             .xsmall()
                             .icon(IconName::KeyRound)
+                            .accessibility_label(if use_key {
+                                "切换为密码认证"
+                            } else {
+                                "切换为私钥认证"
+                            })
                             .tooltip(if use_key {
                                 "当前：私钥认证，点击切换为密码"
                             } else {
@@ -498,6 +672,11 @@ impl Toolbar {
                                 IconName::Lock
                             } else {
                                 IconName::LockOpen
+                            })
+                            .accessibility_label(if self.remember {
+                                "关闭连接信息记忆"
+                            } else {
+                                "记住连接信息"
                             })
                             .tooltip(match (use_key, self.remember) {
                                 (true, true) => "记住这台主机（私钥路径会保存，口令不会）",
@@ -595,4 +774,109 @@ fn expand_tilde(input: &str) -> PathBuf {
         return home.join(rest);
     }
     PathBuf::from(trimmed)
+}
+
+fn private_key_initial_directory(selected: Option<&std::path::Path>) -> Option<PathBuf> {
+    selected
+        .and_then(std::path::Path::parent)
+        .filter(|path| path.is_dir())
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| {
+            dirs::home_dir().and_then(|home| {
+                let ssh = home.join(".ssh");
+                ssh.is_dir().then_some(ssh).or(Some(home))
+            })
+        })
+}
+
+#[cfg(target_os = "macos")]
+struct PrivateKeyPickerResult {
+    path: Option<PathBuf>,
+    show_hidden_files: bool,
+}
+
+/// GPUI 的通用路径选择 API 没有“显示隐藏文件”选项，因此私钥选择在 macOS 上
+/// 使用原生 `NSOpenPanel`。面板内的复选框与 `showsHiddenFiles` 双向绑定，用户也可
+/// 随时用系统快捷键 Command-Shift-. 切换，两种方式会保持同步。
+#[cfg(target_os = "macos")]
+fn prompt_for_private_key(
+    show_hidden_files: bool,
+    initial_directory: Option<&std::path::Path>,
+) -> flume::Receiver<Result<PrivateKeyPickerResult, String>> {
+    let (done_tx, done_rx) = flume::bounded(1);
+    let Some(mtm) = MainThreadMarker::new() else {
+        let _ = done_tx.send(Err("只能从主线程打开私钥文件选择器".to_string()));
+        return done_rx;
+    };
+
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setCanChooseDirectories(false);
+    panel.setCanChooseFiles(true);
+    panel.setAllowsMultipleSelection(false);
+    panel.setCanCreateDirectories(false);
+    panel.setResolvesAliases(false);
+    panel.setShowsHiddenFiles(show_hidden_files);
+    panel.setPrompt(Some(&NSString::from_str("选择 SSH 私钥文件")));
+
+    if let Some(directory) = initial_directory {
+        let directory_url = NSURL::from_directory_path(directory);
+        panel.setDirectoryURL(directory_url.as_deref());
+    }
+
+    let show_hidden = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            ns_string!("显示隐藏文件（⌘⇧.）"),
+            None,
+            None,
+            mtm,
+        )
+    };
+    show_hidden.setState(if show_hidden_files {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    show_hidden.sizeToFit();
+    show_hidden.setFrameOrigin(NSPoint::new(0.0, 7.0));
+    unsafe {
+        show_hidden.bind_toObject_withKeyPath_options(
+            NSValueBinding,
+            &panel,
+            ns_string!("showsHiddenFiles"),
+            None,
+        );
+    }
+
+    // `NSOpenPanel` may collapse a bare control used as its accessory view. A
+    // fixed-size container gives AppKit an unambiguous layout area and keeps
+    // the checkbox visible in both expanded and compact panel layouts.
+    let accessory = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::ZERO, NSSize::new(260.0, 32.0)),
+    );
+    accessory.addSubview(&show_hidden);
+    panel.setAccessoryView(Some(&accessory));
+    panel.setAccessoryViewDisclosed(true);
+
+    let handler = RcBlock::new({
+        let panel = panel.clone();
+        let show_hidden = show_hidden.clone();
+        move |response: NSModalResponse| {
+            let path = (response == NSModalResponseOK).then(|| {
+                panel
+                    .URLs()
+                    .iter()
+                    .find(|url| url.isFileURL())
+                    .and_then(|url| url.to_file_path())
+            });
+            show_hidden.unbind(unsafe { NSValueBinding });
+            let _ = done_tx.send(Ok(PrivateKeyPickerResult {
+                path: path.flatten(),
+                show_hidden_files: panel.showsHiddenFiles(),
+            }));
+        }
+    });
+    panel.beginWithCompletionHandler(&handler);
+
+    done_rx
 }

@@ -46,8 +46,15 @@ dirs = "6"
 # 版本必须与 gpui 依赖树里的对齐（objc2 0.6 / objc2-app-kit 0.3），
 # 否则会同时链进两套 objc2，编译时间和二进制体积都会翻倍。
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSButton",
+    "NSImage",
+    "NSOpenPanel",
+    "NSView",
+] }
 objc2-foundation = { version = "0.3", features = [
     "NSData",
     "NSError",

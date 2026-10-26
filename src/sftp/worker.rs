@@ -728,19 +728,49 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 }
             }
 
-            SftpCommand::Remove { path, is_dir } => {
+            SftpCommand::Remove { entries } => {
                 let Some(active) = session.as_ref() else {
                     let _ = events.send(SftpEvent::error(ErrorContext::Remove, "尚未连接到服务器"));
                     continue;
                 };
 
-                match guard("删除", session::remove(&active.sftp, &path, is_dir)).await {
-                    Ok(()) => {
-                        let _ = events.send(SftpEvent::Notice(format!("已删除 {path}")));
+                let total = entries.len();
+                let mut deleted = 0;
+                let mut failures = Vec::new();
+                for (path, is_dir) in entries {
+                    match guard("删除", session::remove(&active.sftp, &path, is_dir)).await {
+                        Ok(()) => deleted += 1,
+                        Err(message) => failures.push(message),
                     }
-                    Err(message) => {
-                        let _ = events.send(SftpEvent::error(ErrorContext::Remove, message));
-                    }
+                }
+
+                if failures.is_empty() {
+                    let message = if deleted == 1 {
+                        "已删除 1 项".to_string()
+                    } else {
+                        format!("已删除 {deleted} 项")
+                    };
+                    let _ = events.send(SftpEvent::Notice(message));
+                } else {
+                    let preview = failures
+                        .iter()
+                        .take(2)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("；");
+                    let omitted = failures.len().saturating_sub(2);
+                    let omitted = if omitted > 0 {
+                        format!("；另有 {omitted} 项失败")
+                    } else {
+                        String::new()
+                    };
+                    let _ = events.send(SftpEvent::error(
+                        ErrorContext::Remove,
+                        format!(
+                            "删除完成 {deleted}/{total} 项；失败 {} 项：{preview}{omitted}",
+                            failures.len()
+                        ),
+                    ));
                 }
             }
 

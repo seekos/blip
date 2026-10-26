@@ -72,7 +72,7 @@ pub enum FilePaneEvent {
     DirectoryLoaded(String),
     /// 双击了一个文件：由上层按编辑器设置打开。
     Activate(FileEntry),
-    /// 右键菜单选了条目动作；上传/下载/复制路径可一次携带当前多选集合。
+    /// 右键菜单选了条目动作；批量动作会一次携带当前多选集合。
     Action {
         entries: Vec<FileEntry>,
         action: FileAction,
@@ -636,7 +636,10 @@ impl FilePane {
             | FileAction::Delete => {
                 let entries = if matches!(
                     action,
-                    FileAction::Upload | FileAction::Download | FileAction::CopyPath
+                    FileAction::Upload
+                        | FileAction::Download
+                        | FileAction::CopyPath
+                        | FileAction::Delete
                 ) {
                     let selected = self.table.read(cx).delegate().selected_entries();
                     if selected.iter().any(|selected| selected.path == entry.path) {
@@ -1864,6 +1867,55 @@ mod tests {
         pane.update(cx, |pane, cx| {
             pane.request(FileAction::Download, clicked, cx)
         });
+        assert_eq!(*emitted.borrow(), ["one", "two", "three"]);
+    }
+
+    #[::gpui::test]
+    fn delete_action_keeps_the_current_multi_selection(cx: &mut gpui::TestAppContext) {
+        let emitted = Rc::new(RefCell::new(Vec::<String>::new()));
+        cx.update(gpui_kit::init);
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let mut pane = FilePane::new(PaneSide::Remote, "/home".to_string(), window, cx);
+            pane.set_entries(
+                "/home".to_string(),
+                vec![
+                    entry("one", EntryKind::File),
+                    entry("two", EntryKind::File),
+                    entry("three", EntryKind::Directory),
+                ],
+                cx,
+            );
+            pane
+        });
+        cx.update(|_, cx| {
+            let emitted = emitted.clone();
+            cx.subscribe(&pane, move |_, event: &FilePaneEvent, _| {
+                if let FilePaneEvent::Action {
+                    entries,
+                    action: FileAction::Delete,
+                } = event
+                {
+                    emitted
+                        .borrow_mut()
+                        .extend(entries.iter().map(|entry| entry.name.clone()));
+                }
+            })
+            .detach();
+        });
+
+        let clicked = pane.update(cx, |pane, cx| {
+            pane.table.update(cx, |state, cx| {
+                state.delegate_mut().selected_rows = BTreeSet::from([1, 2, 3]);
+                state.refresh(cx);
+            });
+            pane.table
+                .read(cx)
+                .delegate()
+                .entry_at(2)
+                .expect("多选内的条目")
+        });
+        pane.update(cx, |pane, cx| pane.request(FileAction::Delete, clicked, cx));
+
         assert_eq!(*emitted.borrow(), ["one", "two", "three"]);
     }
 

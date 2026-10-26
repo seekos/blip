@@ -4308,6 +4308,7 @@ name = "macscp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "chrono",
  "dirs 6.0.0",
  "env_logger",

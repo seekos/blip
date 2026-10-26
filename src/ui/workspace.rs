@@ -636,6 +636,8 @@ impl Workspace {
                             edit.error = Some(SharedString::from(message.clone()));
                         }
                     }
+                    // 批量删除可能部分成功；即使最终事件是错误，也要反映已删除的条目。
+                    ErrorContext::Remove => self.reload_remote(cx),
                     _ => {}
                 }
                 self.toast(window, cx, Notification::error(message));
@@ -1301,11 +1303,12 @@ impl Workspace {
                 }
             }
             FileAction::Delete => {
-                if let Some(entry) = entries.into_iter().next() {
-                    match side {
-                        PaneSide::Local => self.confirm_local_trash(entry, window, cx),
-                        PaneSide::Remote => self.confirm_delete(entry, window, cx),
-                    }
+                if entries.is_empty() {
+                    return;
+                }
+                match side {
+                    PaneSide::Local => self.confirm_local_trash(entries, window, cx),
+                    PaneSide::Remote => self.confirm_delete(entries, window, cx),
                 }
             }
             FileAction::NewFolder => match side {
@@ -1900,33 +1903,58 @@ impl Workspace {
 
     fn confirm_local_trash(
         &mut self,
-        entry: FileEntry,
+        entries: Vec<FileEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let local = self.local.clone();
-        let path = PathBuf::from(entry.path);
-        let name = entry.name;
+        let total = entries.len();
+        let targets: Vec<_> = entries
+            .into_iter()
+            .map(|entry| (entry.name, PathBuf::from(entry.path)))
+            .collect();
+        let description = if total == 1 {
+            format!("将 {} 移到废纸篓，可在访达中恢复。", targets[0].0)
+        } else {
+            format!("将选中的 {total} 项移到废纸篓，可在访达中恢复。")
+        };
 
         window.open_alert_dialog(cx, move |alert, _window, _cx| {
             let local = local.clone();
-            let path = path.clone();
+            let targets = targets.clone();
+            let description = description.clone();
             alert
                 .confirm()
                 .title("移到废纸篓")
-                .description(SharedString::from(format!(
-                    "将 {name} 移到废纸篓，可在访达中恢复。"
-                )))
-                .on_ok(move |_, window, cx| match move_local_to_trash(&path) {
-                    Ok(()) => {
+                .description(SharedString::from(description))
+                .on_ok(move |_, window, cx| {
+                    let mut failures = Vec::new();
+                    for (_, path) in &targets {
+                        if let Err(message) = move_local_to_trash(path) {
+                            failures.push(format!("{}：{message}", path.display()));
+                        }
+                    }
+
+                    let moved = targets.len() - failures.len();
+                    if moved > 0 {
                         local.update(cx, |pane, cx| pane.reload(cx));
-                        window.push_notification(Notification::success("已移到废纸篓"), cx);
-                        true
                     }
-                    Err(message) => {
-                        window.push_notification(Notification::error(message), cx);
-                        false
+
+                    if failures.is_empty() {
+                        let message = if moved == 1 {
+                            "已移到废纸篓".to_string()
+                        } else {
+                            format!("已将 {moved} 项移到废纸篓")
+                        };
+                        window.push_notification(Notification::success(message), cx);
+                        return true;
                     }
+
+                    window.push_notification(
+                        Notification::error(batch_delete_error("移到废纸篓", moved, &failures)),
+                        cx,
+                    );
+                    moved > 0
                 })
         });
     }
@@ -2045,30 +2073,46 @@ impl Workspace {
         });
     }
 
-    fn confirm_delete(&mut self, entry: FileEntry, window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm_delete(
+        &mut self,
+        entries: Vec<FileEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.state != SessionState::Connected {
             self.warn("请先连接服务器", cx);
             return;
         }
 
         let sender = self.worker.sender();
-        let path = entry.path.clone();
-        let name = entry.name.clone();
-        let is_dir = entry.is_dir();
+        let total = entries.len();
+        let contains_directory = entries.iter().any(FileEntry::is_dir);
+        let description = if total == 1 {
+            format!("将永久删除 {}，此操作不可撤销。", entries[0].name)
+        } else if contains_directory {
+            format!("将永久删除选中的 {total} 项（含文件夹及其内容），此操作不可撤销。")
+        } else {
+            format!("将永久删除选中的 {total} 个文件，此操作不可撤销。")
+        };
+        let entries: Vec<_> = entries
+            .into_iter()
+            .map(|entry| {
+                let is_dir = entry.is_dir();
+                (entry.path, is_dir)
+            })
+            .collect();
 
         window.open_alert_dialog(cx, move |alert, _window, _cx| {
             let sender = sender.clone();
-            let path = path.clone();
+            let entries = entries.clone();
+            let description = description.clone();
             alert
                 .confirm()
                 .title("确认删除")
-                .description(SharedString::from(format!(
-                    "将永久删除 {name}，此操作不可撤销。"
-                )))
+                .description(SharedString::from(description))
                 .on_ok(move |_, _, _| {
                     let _ = sender.send(SftpCommand::Remove {
-                        path: path.clone(),
-                        is_dir,
+                        entries: entries.clone(),
                     });
                     true
                 })
@@ -2232,6 +2276,25 @@ fn move_local_to_trash(path: &Path) -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 fn move_local_to_trash(_path: &Path) -> Result<(), String> {
     Err("当前系统不支持移到废纸篓".to_string())
+}
+
+fn batch_delete_error(action: &str, completed: usize, failures: &[String]) -> String {
+    let preview = failures
+        .iter()
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("；");
+    let omitted = failures.len().saturating_sub(2);
+    let omitted = if omitted > 0 {
+        format!("；另有 {omitted} 项失败")
+    } else {
+        String::new()
+    };
+    format!(
+        "{action}完成 {completed} 项，失败 {} 项：{preview}{omitted}",
+        failures.len()
+    )
 }
 
 fn open_external_editor(local: &Path, editor_path: Option<&Path>) -> Result<(), String> {
@@ -2526,5 +2589,19 @@ mod tests {
             "多个目标只给所在目录"
         );
         assert_eq!(folder_names(&targets), "one、two、three 等 4 个");
+    }
+
+    #[test]
+    fn batch_delete_error_limits_long_failure_details() {
+        let failures = vec![
+            "one：权限不足".to_string(),
+            "two：文件不存在".to_string(),
+            "three：目录非空".to_string(),
+        ];
+
+        assert_eq!(
+            batch_delete_error("移到废纸篓", 2, &failures),
+            "移到废纸篓完成 2 项，失败 3 项：one：权限不足；two：文件不存在；另有 1 项失败"
+        );
     }
 }

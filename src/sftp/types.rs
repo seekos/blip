@@ -337,8 +337,8 @@ pub enum SftpCommand {
     WriteText { path: String, content: String },
     /// 新建目录。
     Mkdir { path: String },
-    /// 删除文件或空目录。
-    Remove { path: String, is_dir: bool },
+    /// 批量删除文件或目录。元组依次为远端路径、是否为目录；worker 会逐项处理并汇总结果。
+    Remove { entries: Vec<(String, bool)> },
     /// 重命名 / 移动。worker 侧已实现，UI 入口留待右键菜单接入。
     #[allow(dead_code)]
     Rename { from: String, to: String },
