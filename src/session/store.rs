@@ -273,10 +273,15 @@ pub fn store_password(config: &SessionConfig, password: &str) -> Result<(), Stri
         .map_err(|err| format!("写入钥匙串失败：{err}"))
 }
 
-/// 从 Keychain 取密码；没有记录时返回 `None`（不是错误）。
-pub fn load_password(config: &SessionConfig) -> Option<String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &config.keyring_account()).ok()?;
-    entry.get_password().ok()
+/// 从 Keychain 取密码；没有记录时返回 `Ok(None)`，权限或存储故障必须显式上报。
+pub fn load_password(config: &SessionConfig) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &config.keyring_account())
+        .map_err(|err| format!("无法访问钥匙串：{err}"))?;
+    match entry.get_password() {
+        Ok(password) => Ok(Some(password)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(format!("读取钥匙串失败：{err}")),
+    }
 }
 
 pub fn forget_password(config: &SessionConfig) {
@@ -487,9 +492,16 @@ mod tests {
         forget_password(&config);
 
         store_password(&config, "s3cret-token").expect("写入钥匙串");
-        assert_eq!(load_password(&config).as_deref(), Some("s3cret-token"));
+        assert_eq!(
+            load_password(&config).expect("读取钥匙串").as_deref(),
+            Some("s3cret-token")
+        );
 
         forget_password(&config);
-        assert_eq!(load_password(&config), None, "删除后不应再读到");
+        assert_eq!(
+            load_password(&config).expect("读取已删除凭证"),
+            None,
+            "删除后不应再读到"
+        );
     }
 }

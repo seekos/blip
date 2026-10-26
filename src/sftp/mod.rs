@@ -20,6 +20,7 @@
 //! `render` / `Context` 里调用这里的 `async` 函数 —— 只能通过 `flume` 通信。
 
 pub mod local_tree;
+mod path_lock;
 pub mod remote_tree;
 pub mod session;
 pub mod transfer;

@@ -44,8 +44,11 @@ pub struct LocalTree {
 ///
 /// `root` 必须是目录；根目录本身不出现在 `dirs` 里（调用方负责在远端建它）。
 pub fn scan(root: &Path) -> Result<LocalTree, String> {
-    let meta = std::fs::metadata(root)
+    let meta = std::fs::symlink_metadata(root)
         .map_err(|err| format!("读取本地目录 {} 失败：{err}", root.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("{} 是符号链接，拒绝递归上传", root.display()));
+    }
     if !meta.is_dir() {
         return Err(format!("{} 不是目录", root.display()));
     }
@@ -67,7 +70,16 @@ pub fn scan(root: &Path) -> Result<LocalTree, String> {
 
         // `read_dir` 的顺序依赖文件系统，排序之后同样的输入总是得到同样的清单
         // （测试可以断言顺序，日志也好读）。
-        let mut items: Vec<_> = reader.flatten().collect();
+        let mut items = Vec::new();
+        for item in reader {
+            match item {
+                Ok(item) => items.push(item),
+                Err(err) => {
+                    log::warn!("读取目录项失败：{err}");
+                    tree.skipped += 1;
+                }
+            }
+        }
         items.sort_by_key(|item| item.file_name());
 
         for item in items {
@@ -201,6 +213,21 @@ mod tests {
         assert_eq!(tree.skipped, 2, "链接和环形链接都算跳过");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_rejects_a_symlink_root() {
+        let parent = scratch("symlink-root");
+        let real = parent.join("real");
+        std::fs::create_dir(&real).expect("建真实目录");
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("建根目录链接");
+
+        let error = scan(&link).expect_err("根链接不能被递归上传");
+        assert!(error.contains("符号链接"));
+
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     /// 隐藏文件照传：整目录上传悄悄漏掉 `.env` 是最坏的安静。

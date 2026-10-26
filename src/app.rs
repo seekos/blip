@@ -23,7 +23,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::session::store::{self, AppSettings, RemoteOpenBehavior, SavedAuth, SavedProfile};
-use crate::sftp::types::AuthMethod;
+use crate::sftp::types::{AuthMethod, SessionConfig};
 use crate::ui::SessionState;
 use crate::ui::file_pane::FilePane;
 use crate::ui::toolbar::{Toolbar, ToolbarEvent};
@@ -39,6 +39,9 @@ pub struct ScpApp {
     transfers: Entity<TransferQueue>,
     profiles: Vec<SavedProfile>,
     settings: AppSettings,
+    /// 当前这次连接实际使用的配置。密码框可能为空（收藏会从钥匙串补密码），
+    /// 成功后必须保存这里的认证信息，不能再从空白表单反推。
+    pending_config: Option<SessionConfig>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -46,6 +49,33 @@ struct SettingsDraft {
     remote_open_behavior: RemoteOpenBehavior,
     editor_path: Option<PathBuf>,
     error: Option<SharedString>,
+}
+
+struct ProfilePersistence {
+    profile: SavedProfile,
+    /// 只来自本次实际认证配置；绝不从可能为空的密码框读取。
+    password: Option<String>,
+}
+
+fn prepare_profile_persistence(config: &SessionConfig) -> ProfilePersistence {
+    let (auth, password) = match &config.auth {
+        AuthMethod::PrivateKey { path, .. } => (
+            SavedAuth::Key {
+                path: path.to_string_lossy().to_string(),
+            },
+            None,
+        ),
+        AuthMethod::Password(password) => (SavedAuth::Password, Some(password.clone())),
+    };
+    ProfilePersistence {
+        profile: SavedProfile {
+            host: config.host.clone(),
+            port: config.port,
+            username: config.username.clone(),
+            auth,
+        },
+        password,
+    }
 }
 
 impl ScpApp {
@@ -78,10 +108,12 @@ impl ScpApp {
                         config.username, config.host
                     ));
                     let config = config.clone();
+                    app.pending_config = Some(config.clone());
                     app.workspace
                         .update(cx, |workspace, cx| workspace.connect(config, cx));
                 }
                 ToolbarEvent::Disconnect => {
+                    app.pending_config = None;
                     app.workspace
                         .update(cx, |workspace, cx| workspace.disconnect(cx));
                     window.set_window_title("macscp");
@@ -119,6 +151,9 @@ impl ScpApp {
                 // 连接成功才落盘凭证，避免把错误密码写进钥匙串。
                 if state == SessionState::Connected {
                     app.persist_profile(cx);
+                } else if state == SessionState::Disconnected {
+                    // 认证失败、超时或主动断开后，绝不能把这份配置用于下一次成功事件。
+                    app.pending_config = None;
                 }
             },
         ));
@@ -131,6 +166,7 @@ impl ScpApp {
             transfers,
             profiles,
             settings,
+            pending_config: None,
             _subscriptions: subscriptions,
         };
 
@@ -150,42 +186,29 @@ impl ScpApp {
     /// 配置里塞一堆 `tester@127.0.0.1:<随机端口>`，下次启动还会被
     /// `prefill` 填回表单。
     fn persist_profile(&mut self, cx: &mut Context<Self>) {
-        let snapshot = self.toolbar.read(cx).snapshot(cx);
-        let auth = match &snapshot.auth {
-            AuthMethod::PrivateKey { path, .. } => SavedAuth::Key {
-                path: path.to_string_lossy().to_string(),
-            },
-            AuthMethod::Password(_) => SavedAuth::Password,
+        let Some(config) = self.pending_config.take() else {
+            log::warn!("连接成功但缺少实际连接配置，跳过收藏持久化");
+            return;
         };
+        let snapshot = self.toolbar.read(cx).snapshot(cx);
+        let prepared = prepare_profile_persistence(&config);
 
         if !snapshot.remember {
-            if matches!(snapshot.auth, AuthMethod::Password(_)) {
-                let config = crate::sftp::types::SessionConfig {
-                    host: snapshot.host.clone(),
-                    port: snapshot.port,
-                    username: snapshot.username.clone(),
-                    auth: AuthMethod::Password(String::new()),
-                };
+            if matches!(config.auth, AuthMethod::Password(_)) {
                 store::forget_password(&config);
             }
             return;
         }
 
-        if let AuthMethod::Password(password) = &snapshot.auth {
-            let password = password.clone();
-            let config = crate::sftp::types::SessionConfig {
-                host: snapshot.host.clone(),
-                port: snapshot.port,
-                username: snapshot.username.clone(),
-                auth: AuthMethod::Password(password.clone()),
-            };
+        if let Some(password) = prepared.password {
+            let password_config = config.clone();
             // 写钥匙串可能触发系统授权弹窗，放到后台线程；失败时回到前台
             // 把原因显示在工具栏上 —— 只写日志等于没告诉用户。
             let this = cx.entity().downgrade();
             cx.spawn(async move |_app, cx| {
                 let task = cx
                     .background_executor()
-                    .spawn(async move { store::store_password(&config, &password) });
+                    .spawn(async move { store::store_password(&password_config, &password) });
 
                 if let Err(err) = task.await {
                     log::warn!("保存密码失败：{err}");
@@ -199,12 +222,7 @@ impl ScpApp {
             .detach();
         }
 
-        let profile = SavedProfile {
-            host: snapshot.host,
-            port: snapshot.port,
-            username: snapshot.username,
-            auth,
-        };
+        let profile = prepared.profile;
         store::upsert_profile(&mut self.profiles, profile);
         let profiles = self.profiles.clone();
         self.toolbar
@@ -596,4 +614,51 @@ fn expand_tilde(input: &str) -> PathBuf {
         return home.join(rest);
     }
     PathBuf::from(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use ::core::prelude::v1::test;
+
+    use super::*;
+
+    #[test]
+    fn favorite_persists_the_password_that_was_actually_used() {
+        let config = SessionConfig {
+            host: "server.example".to_string(),
+            port: 2222,
+            username: "alice".to_string(),
+            // 这可以是 build_config 从钥匙串补出来的密码；密码输入框仍可能为空。
+            auth: AuthMethod::Password("resolved-from-keychain".to_string()),
+        };
+
+        let prepared = prepare_profile_persistence(&config);
+
+        assert_eq!(prepared.password.as_deref(), Some("resolved-from-keychain"));
+        assert_eq!(prepared.profile.host, "server.example");
+        assert_eq!(prepared.profile.port, 2222);
+        assert_eq!(prepared.profile.username, "alice");
+        assert!(matches!(prepared.profile.auth, SavedAuth::Password));
+    }
+
+    #[test]
+    fn favorite_never_persists_a_private_key_passphrase() {
+        let config = SessionConfig {
+            host: "server.example".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            auth: AuthMethod::PrivateKey {
+                path: PathBuf::from("/tmp/id_ed25519"),
+                passphrase: Some("do-not-save".to_string()),
+            },
+        };
+
+        let prepared = prepare_profile_persistence(&config);
+
+        assert_eq!(prepared.password, None);
+        assert!(matches!(
+            prepared.profile.auth,
+            SavedAuth::Key { ref path } if path == "/tmp/id_ed25519"
+        ));
+    }
 }

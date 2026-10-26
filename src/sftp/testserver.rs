@@ -285,6 +285,16 @@ fn children_of<'a>(
 
 /// 重置虚拟磁盘，并按 `fixture()` 的尺寸预填内容（内容是可复现的伪随机字节）。
 pub async fn vfs_reset() {
+    RENAME_REFUSES_EXISTING.store(false, std::sync::atomic::Ordering::Relaxed);
+    FAIL_FILEPART_PUBLISH_ONCE.store(false, std::sync::atomic::Ordering::Relaxed);
+    WRITE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    READ_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    if let Some(path) = STAT_FAILURE_PATH.get() {
+        *path.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+    if let Some(path) = OPENDIR_FAILURE_PATH.get() {
+        *path.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
     let mut disk = vfs().lock().await;
     disk.clear();
     for (name, attrs) in fixture() {
@@ -355,14 +365,83 @@ pub async fn vfs_exists(path: &str) -> bool {
 /// 打开后，`rename` 在目标已存在时返回 `SSH_FX_FAILURE`。
 ///
 /// 真实的 SFTP v3 服务器两种行为都有：OpenSSH 的 `rename(2)` 会直接覆盖，
-/// 另一些实现严格照规范拒绝覆盖。上传的 fallback 路径（unlink + rename）
+/// 另一些实现严格照规范拒绝覆盖。上传的 fallback 路径（备份 + 发布 + 回滚）
 /// 只有在这个模式下才会被走到，所以得能模拟出来。
 static RENAME_REFUSES_EXISTING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static FAIL_FILEPART_PUBLISH_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static WRITE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READ_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STAT_FAILURE_PATH: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+static OPENDIR_FAILURE_PATH: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn set_rename_refuses_existing(enabled: bool) {
     RENAME_REFUSES_EXISTING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn fail_filepart_publish_once() {
+    FAIL_FILEPART_PUBLISH_ONCE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn set_write_delay(delay: Duration) {
+    WRITE_DELAY_MS.store(
+        delay.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+fn set_read_delay(delay: Duration) {
+    READ_DELAY_MS.store(
+        delay.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+fn set_stat_failure_path(path: Option<&str>) {
+    *STAT_FAILURE_PATH
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path.map(str::to_string);
+}
+
+#[cfg(test)]
+fn set_opendir_failure_path(path: Option<&str>) {
+    *OPENDIR_FAILURE_PATH
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path.map(str::to_string);
+}
+
+fn stat_should_fail(path: &str) -> bool {
+    STAT_FAILURE_PATH
+        .get()
+        .and_then(|slot| {
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        })
+        .as_deref()
+        == Some(path)
+}
+
+fn opendir_should_fail(path: &str) -> bool {
+    OPENDIR_FAILURE_PATH
+        .get()
+        .and_then(|slot| {
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        })
+        .as_deref()
+        == Some(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +619,9 @@ impl russh_sftp::server::Handler for TestSftp {
     }
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
+        if opendir_should_fail(&path) {
+            return Err(StatusCode::PermissionDenied);
+        }
         {
             let disk = vfs().lock().await;
             if !is_dir_path(&disk, &path) {
@@ -695,6 +777,10 @@ impl russh_sftp::server::Handler for TestSftp {
         offset: u64,
         len: u32,
     ) -> Result<Data, Self::Error> {
+        let delay = READ_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         let disk = vfs().lock().await;
         let Some(file) = disk.get(&handle) else {
             return Err(StatusCode::NoSuchFile);
@@ -719,6 +805,10 @@ impl russh_sftp::server::Handler for TestSftp {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
+        let delay = WRITE_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         let mut disk = vfs().lock().await;
         let entry = disk.entry(handle.clone()).or_default();
         let offset = offset as usize;
@@ -747,6 +837,25 @@ impl russh_sftp::server::Handler for TestSftp {
 
     /// 按路径 stat，用于「远端文件是否已存在」这类查询。
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        if stat_should_fail(&path) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        let disk = vfs().lock().await;
+        let Some(file) = disk.get(&path) else {
+            return Err(StatusCode::NoSuchFile);
+        };
+        Ok(Attrs {
+            id,
+            attrs: attrs_of(file),
+        })
+    }
+
+    /// 虚拟磁盘没有真实链接目标；lstat 直接返回条目自身属性，正好用来验证客户端
+    /// 不会在删除和覆盖探测时跟随符号链接。
+    async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        if stat_should_fail(&path) {
+            return Err(StatusCode::PermissionDenied);
+        }
         let disk = vfs().lock().await;
         let Some(file) = disk.get(&path) else {
             return Err(StatusCode::NoSuchFile);
@@ -804,6 +913,13 @@ impl russh_sftp::server::Handler for TestSftp {
         if RENAME_REFUSES_EXISTING.load(std::sync::atomic::Ordering::Relaxed)
             && disk.contains_key(&newpath)
         {
+            return Err(StatusCode::Failure);
+        }
+        if FAIL_FILEPART_PUBLISH_ONCE.load(std::sync::atomic::Ordering::Relaxed)
+            && oldpath.ends_with(".filepart")
+            && !disk.contains_key(&newpath)
+        {
+            FAIL_FILEPART_PUBLISH_ONCE.store(false, std::sync::atomic::Ordering::Relaxed);
             return Err(StatusCode::Failure);
         }
         let Some(file) = disk.remove(&oldpath) else {
@@ -1091,6 +1207,13 @@ mod tests {
             .expect("事件通道不应关闭")
     }
 
+    async fn next_event_from(events: &flume::Receiver<SftpEvent>) -> SftpEvent {
+        tokio::time::timeout(Duration::from_secs(10), events.recv_async())
+            .await
+            .expect("等待事件超时")
+            .expect("事件通道不应关闭")
+    }
+
     /// 真实 worker 首次连接必须先让 UI 确认指纹；测试选择“仅本次信任”。
     async fn connect_worker(worker: &SftpWorker, config: SessionConfig) {
         worker.send(SftpCommand::Connect(config));
@@ -1198,7 +1321,9 @@ mod tests {
         });
 
         match next_event(&worker).await {
-            SftpEvent::Notice(message) => assert_eq!(message, "已删除 2 项"),
+            SftpEvent::Notice(message) => {
+                assert_eq!(message, "已删除 2 项（共 3 个文件/目录）")
+            }
             other => panic!("期望批量删除成功通知，实际 {other:?}"),
         }
         assert!(!vfs_exists(FILE).await);
@@ -1238,13 +1363,55 @@ mod tests {
         vfs_mkdir(NESTED).await;
         vfs_write(FILE, b"delete me").await;
 
-        session::remove(&ctx.active.sftp, ROOT, true)
+        session::remove(&ctx.active.sftp, ROOT, true, &AtomicBool::new(false))
             .await
             .expect("非空远端目录应递归删除");
 
         assert!(!vfs_exists(FILE).await);
         assert!(!vfs_exists(NESTED).await);
         assert!(!vfs_exists(ROOT).await);
+    }
+
+    /// 预检无法读取任一子目录时，必须在删除第一个条目之前失败。
+    #[tokio::test]
+    async fn remove_preflight_failure_keeps_the_whole_tree() {
+        let ctx = connect_and_dir("remove-preflight").await;
+        const ROOT: &str = "/home/tester/remove-preflight";
+        const TOP_FILE: &str = "/home/tester/remove-preflight/top.txt";
+        const NESTED: &str = "/home/tester/remove-preflight/private";
+        const NESTED_FILE: &str = "/home/tester/remove-preflight/private/secret.txt";
+
+        vfs_mkdir(ROOT).await;
+        vfs_write(TOP_FILE, b"top").await;
+        vfs_mkdir(NESTED).await;
+        vfs_write(NESTED_FILE, b"secret").await;
+        set_opendir_failure_path(Some(NESTED));
+
+        let error = session::remove(&ctx.active.sftp, ROOT, true, &AtomicBool::new(false))
+            .await
+            .expect_err("不可枚举子目录应让预检失败");
+        assert_eq!(error.removed, 0, "预检失败前不应删除任何条目");
+        assert!(vfs_exists(ROOT).await);
+        assert!(vfs_exists(TOP_FILE).await);
+        assert!(vfs_exists(NESTED).await);
+        assert!(vfs_exists(NESTED_FILE).await);
+
+        set_opendir_failure_path(None);
+    }
+
+    /// 用户确认后目录若被替换成符号链接，删除必须拒绝而不是遍历链接目标。
+    #[tokio::test]
+    async fn remove_rejects_a_directory_changed_to_symlink() {
+        let ctx = connect_and_dir("remove-symlink-race").await;
+        const ROOT: &str = "/home/tester/remove-race";
+        vfs_mkdir(ROOT).await;
+        vfs_set_mode(ROOT, 0o120_777).await;
+
+        let error = session::remove(&ctx.active.sftp, ROOT, true, &AtomicBool::new(false))
+            .await
+            .expect_err("目录类型变化必须拒绝");
+        assert!(error.to_string().contains("类型"));
+        assert!(vfs_exists(ROOT).await, "符号链接本身也不应被误删");
     }
 
     // -----------------------------------------------------------------------
@@ -1371,6 +1538,62 @@ mod tests {
         assert_same_bytes(&actual, &expected);
     }
 
+    /// 等长、同秒的远端改写也必须被内容校验发现，不能发布撕裂文件。
+    #[tokio::test]
+    async fn download_rejects_remote_content_changed_mid_transfer() {
+        let ctx = connect_and_dir("dl-remote-change").await;
+        const REMOTE: &str = "/home/tester/changing.bin";
+        let before = vec![0x51; 4 * 1024 * 1024];
+        let after = vec![0xA2; before.len()];
+        vfs_write(REMOTE, &before).await;
+        set_read_delay(Duration::from_millis(8));
+
+        let local = ctx.dir.join("changing.bin");
+        std::fs::write(&local, b"keep-local").expect("写现有本地目标");
+        let (tx, rx) = flume::unbounded::<SftpEvent>();
+        let task = {
+            let sftp = ctx.active.sftp.clone();
+            let local = local.clone();
+            tokio::spawn(async move {
+                transfer::run_download(
+                    sftp,
+                    64,
+                    REMOTE.to_string(),
+                    local,
+                    before.len() as u64,
+                    false,
+                    Arc::new(AtomicBool::new(false)),
+                    tx,
+                )
+                .await;
+            })
+        };
+        loop {
+            if matches!(
+                next_event_from(&rx).await,
+                SftpEvent::TransferStarted { .. }
+            ) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        vfs_write(REMOTE, &after).await;
+        task.await.expect("下载任务不应 panic");
+        set_read_delay(Duration::ZERO);
+
+        let outcome = rx
+            .drain()
+            .into_iter()
+            .find_map(|event| match event {
+                SftpEvent::TransferCompleted { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .expect("应有结论");
+        assert!(matches!(outcome, TransferOutcome::Failed(_)));
+        assert_eq!(std::fs::read(&local).unwrap(), b"keep-local");
+        assert!(transfer::local_filepart_path(&local).exists());
+    }
+
     /// 断点续传下载：身份标记匹配的 `.filepart` 已有 100 KiB，只补剩余部分。
     #[tokio::test]
     async fn download_resumes_from_partial_local_file() {
@@ -1418,6 +1641,56 @@ mod tests {
         assert_same_bytes(&actual, &expected);
     }
 
+    /// 身份元数据相同但断点前缀已损坏时必须从头传，不能盲目 append。
+    #[tokio::test]
+    async fn download_discards_a_mismatched_checkpoint_prefix() {
+        let ctx = connect_and_dir("dl-bad-prefix").await;
+        let expected: Vec<u8> = (0..BIG_LEN as u32).map(|ix| (ix % 251) as u8).collect();
+        vfs_write(BIG_NAME, &expected).await;
+        let local = ctx.dir.join("big.bin");
+        transfer::seed_download_checkpoint_for_test(
+            &ctx.active.sftp,
+            BIG_NAME,
+            &local,
+            &expected[..100 * 1024],
+        )
+        .await
+        .expect("写下载断点");
+        let temp = transfer::local_filepart_path(&local);
+        let mut corrupted = expected[..100 * 1024].to_vec();
+        corrupted[123] ^= 0xFF;
+        std::fs::write(&temp, corrupted).expect("破坏断点前缀");
+
+        let (tx, rx) = flume::unbounded::<SftpEvent>();
+        transfer::run_download(
+            ctx.active.sftp.clone(),
+            65,
+            BIG_NAME.to_string(),
+            local.clone(),
+            BIG_LEN as u64,
+            true,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )
+        .await;
+        let events: Vec<_> = rx.drain().collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SftpEvent::TransferStarted {
+                resumed_from: 0,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SftpEvent::TransferCompleted {
+                outcome: TransferOutcome::Completed,
+                ..
+            }
+        )));
+        assert_same_bytes(&std::fs::read(local).unwrap(), &expected);
+    }
+
     /// 上传 + 下载往返：字节原样落到虚拟磁盘，临时文件必须被 rename 掉。
     #[tokio::test]
     async fn upload_then_download_round_trip() {
@@ -1460,6 +1733,9 @@ mod tests {
         std::fs::write(&local, &payload).expect("写本地文件");
         // 上次传到 50 KiB 就断了：目标文件还不存在，只有 .filepart。
         vfs_write(&format!("{REMOTE}.filepart"), &payload[..50 * 1024]).await;
+        transfer::seed_upload_checkpoint_for_test(&ctx.active.sftp, &local, REMOTE)
+            .await
+            .expect("写上传断点身份");
 
         let (tx, rx) = flume::unbounded::<SftpEvent>();
         transfer::run_upload(
@@ -1529,9 +1805,9 @@ mod tests {
         assert!(!vfs_exists(&format!("{REMOTE}.filepart")).await);
     }
 
-    /// 服务器严格照 SFTP v3 规范拒绝覆盖 rename 时，走 unlink + rename 的 fallback。
+    /// 服务器严格照 SFTP v3 规范拒绝覆盖 rename 时，走备份 + 发布的 fallback。
     #[tokio::test]
-    async fn upload_falls_back_to_unlink_when_rename_is_refused() {
+    async fn upload_uses_recoverable_backup_when_rename_is_refused() {
         let ctx = connect_and_dir("up-strict").await;
         const REMOTE: &str = "/home/tester/strict.bin";
 
@@ -1570,6 +1846,166 @@ mod tests {
         assert_same_bytes(&stored, &payload);
     }
 
+    /// fallback 的第二次 rename 失败时必须恢复旧目标，不能只剩 `.filepart`。
+    #[tokio::test]
+    async fn upload_rolls_back_when_fallback_publish_fails() {
+        let ctx = connect_and_dir("up-rollback").await;
+        const REMOTE: &str = "/home/tester/rollback.bin";
+        const ORIGINAL: &[u8] = b"known-good-original";
+        vfs_write(REMOTE, ORIGINAL).await;
+        set_rename_refuses_existing(true);
+        fail_filepart_publish_once();
+
+        let local = ctx.dir.join("rollback.bin");
+        std::fs::write(&local, vec![0xA5; 128 * 1024]).expect("写本地文件");
+        let (tx, rx) = flume::unbounded::<SftpEvent>();
+        transfer::run_upload(
+            ctx.active.sftp.clone(),
+            61,
+            local,
+            REMOTE.to_string(),
+            128 * 1024,
+            UploadDecision::Overwrite,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )
+        .await;
+        set_rename_refuses_existing(false);
+
+        let outcome = rx
+            .drain()
+            .into_iter()
+            .find_map(|event| match event {
+                SftpEvent::TransferCompleted { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .expect("应有结论");
+        assert!(matches!(outcome, TransferOutcome::Failed(_)));
+        assert_eq!(vfs_read(REMOTE).await.as_deref(), Some(ORIGINAL));
+    }
+
+    /// 权限/协议类 stat 错误不能伪装成“不存在”，否则会绕过覆盖确认。
+    #[tokio::test]
+    async fn upload_probe_propagates_remote_stat_errors() {
+        let ctx = connect_and_dir("probe-stat-error").await;
+        const REMOTE: &str = "/home/tester/no-stat.bin";
+        vfs_write(REMOTE, b"keep").await;
+        let local = ctx.dir.join("no-stat.bin");
+        std::fs::write(&local, b"replace").expect("写本地文件");
+
+        set_stat_failure_path(Some(REMOTE));
+        let error = transfer::probe_upload(&ctx.active.sftp, &local, REMOTE)
+            .await
+            .expect_err("PermissionDenied 必须上抛");
+        set_stat_failure_path(None);
+        let message = error.to_string();
+        assert!(
+            message.contains("读取远端路径") && message.contains(REMOTE),
+            "错误必须保留远端路径和探针上下文：{message}"
+        );
+        assert_eq!(vfs_read(REMOTE).await.as_deref(), Some(&b"keep"[..]));
+    }
+
+    /// 源文件在上传期间被编辑时，临时文件校验必须失败且旧目标保持不动。
+    #[tokio::test]
+    async fn upload_rejects_a_source_changed_during_transfer() {
+        let ctx = connect_and_dir("up-source-change").await;
+        const REMOTE: &str = "/home/tester/source-change.bin";
+        vfs_write(REMOTE, b"stable remote").await;
+
+        let local = ctx.dir.join("source-change.bin");
+        let original = vec![0x11; 2 * 1024 * 1024];
+        let changed = vec![0x22; original.len()];
+        std::fs::write(&local, &original).expect("写本地文件");
+        set_write_delay(Duration::from_millis(4));
+
+        let (tx, rx) = flume::unbounded::<SftpEvent>();
+        let task = {
+            let sftp = ctx.active.sftp.clone();
+            let local = local.clone();
+            tokio::spawn(async move {
+                transfer::run_upload(
+                    sftp,
+                    62,
+                    local,
+                    REMOTE.to_string(),
+                    original.len() as u64,
+                    UploadDecision::Overwrite,
+                    Arc::new(AtomicBool::new(false)),
+                    tx,
+                )
+                .await;
+            })
+        };
+
+        loop {
+            if matches!(
+                next_event_from(&rx).await,
+                SftpEvent::TransferStarted { .. }
+            ) {
+                break;
+            }
+        }
+        std::fs::write(&local, &changed).expect("传输期间改写源文件");
+        task.await.expect("上传任务不应 panic");
+        set_write_delay(Duration::ZERO);
+
+        let outcome = rx
+            .drain()
+            .into_iter()
+            .find_map(|event| match event {
+                SftpEvent::TransferCompleted { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .expect("应有结论");
+        assert!(matches!(outcome, TransferOutcome::Failed(_)));
+        assert_eq!(
+            vfs_read(REMOTE).await.as_deref(),
+            Some(&b"stable remote"[..])
+        );
+    }
+
+    /// 同长度的旧断点也必须用内容身份拒绝，不能只凭长度拼接。
+    #[tokio::test]
+    async fn upload_resume_rejects_a_checkpoint_from_another_version() {
+        let ctx = connect_and_dir("up-stale-checkpoint").await;
+        const REMOTE: &str = "/home/tester/stale-resume.bin";
+        let local = ctx.dir.join("stale-resume.bin");
+        let old = vec![0x31; 256 * 1024];
+        let new = vec![0x42; old.len()];
+        std::fs::write(&local, &old).expect("写旧版本");
+        vfs_write(&format!("{REMOTE}.filepart"), &old[..64 * 1024]).await;
+        transfer::seed_upload_checkpoint_for_test(&ctx.active.sftp, &local, REMOTE)
+            .await
+            .expect("写旧版本身份");
+        std::fs::write(&local, &new).expect("换成本地新版本");
+
+        let (tx, rx) = flume::unbounded::<SftpEvent>();
+        transfer::run_upload(
+            ctx.active.sftp.clone(),
+            63,
+            local,
+            REMOTE.to_string(),
+            new.len() as u64,
+            UploadDecision::Resume,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )
+        .await;
+        let outcome = rx
+            .drain()
+            .into_iter()
+            .find_map(|event| match event {
+                SftpEvent::TransferCompleted { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .expect("应有结论");
+        assert!(
+            matches!(outcome, TransferOutcome::Failed(message) if message.contains("另一版本"))
+        );
+        assert!(!vfs_exists(REMOTE).await);
+    }
+
     /// worker：远端已有同名文件时先发 `UploadConflict`；选「跳过」就一个字节都不写。
     #[tokio::test]
     async fn worker_asks_before_overwriting() {
@@ -1599,6 +2035,7 @@ mod tests {
                 assert_eq!(conflict.id, 42);
                 assert_eq!(conflict.existing_size, Some(7), "远端原文件 7 字节");
                 assert_eq!(conflict.filepart_size, None, "没有半成品");
+                assert!(!conflict.checkpoint_present, "没有断点身份凭据");
                 assert!(!conflict.can_resume(), "没有 .filepart 就谈不上续传");
                 assert!(conflict.has_existing());
             }
@@ -1676,6 +2113,51 @@ mod tests {
             vfs_mode(REMOTE).await.map(|mode| mode & 0o7777),
             Some(0o640)
         );
+        assert!(!vfs_exists(&format!("{REMOTE}.filepart")).await);
+    }
+
+    /// 两个任务写同一目标时必须按路径串行化，最终内容只能是某一份完整输入。
+    #[tokio::test]
+    async fn worker_serializes_uploads_to_the_same_target() {
+        let _guard = vfs_lock().lock_owned().await;
+        let addr = spawn().await;
+        vfs_reset().await;
+        set_write_delay(Duration::from_millis(2));
+        const REMOTE: &str = "/home/tester/same-target.bin";
+
+        let dir = temp_dir("same-target");
+        let first = dir.join("first.bin");
+        let second = dir.join("second.bin");
+        let first_bytes = vec![0x17; 1024 * 1024];
+        let second_bytes = vec![0xE3; 1024 * 1024];
+        std::fs::write(&first, &first_bytes).unwrap();
+        std::fs::write(&second, &second_bytes).unwrap();
+
+        let worker = SftpWorker::spawn();
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
+        worker.send(SftpCommand::UploadOverwrite {
+            id: 67,
+            local: first,
+            remote: REMOTE.to_string(),
+            total: first_bytes.len() as u64,
+        });
+        worker.send(SftpCommand::UploadOverwrite {
+            id: 68,
+            local: second,
+            remote: REMOTE.to_string(),
+            total: second_bytes.len() as u64,
+        });
+
+        let mut completed = Vec::new();
+        while completed.len() < 2 {
+            if let SftpEvent::TransferCompleted { id, outcome } = next_event(&worker).await {
+                assert_eq!(outcome, TransferOutcome::Completed);
+                completed.push(id);
+            }
+        }
+        set_write_delay(Duration::ZERO);
+        let stored = vfs_read(REMOTE).await.expect("目标应存在");
+        assert!(stored == first_bytes || stored == second_bytes);
         assert!(!vfs_exists(&format!("{REMOTE}.filepart")).await);
     }
 
@@ -1804,6 +2286,13 @@ mod tests {
 
         let local = temp_dir("resume-pick").join("resume.bin");
         std::fs::write(&local, &payload).expect("写本地文件");
+        let checkpoint_session = connect_test(&config_for(addr, PASSWORD))
+            .await
+            .expect("连接测试服务器写断点身份");
+        transfer::seed_upload_checkpoint_for_test(&checkpoint_session.sftp, &local, REMOTE)
+            .await
+            .expect("写上传断点身份");
+        drop(checkpoint_session);
 
         let worker = SftpWorker::spawn();
         connect_worker(&worker, config_for(addr, PASSWORD)).await;
@@ -1820,6 +2309,7 @@ mod tests {
             SftpEvent::UploadConflict(conflict) => {
                 assert_eq!(conflict.filepart_size, Some(3000));
                 assert_eq!(conflict.existing_size, Some(5));
+                assert!(conflict.checkpoint_present, "续传必须带内容身份凭据");
                 assert!(conflict.can_resume(), "3000 < 8192，应该可以续传");
                 assert!(!conflict.filepart_is_stale());
             }
@@ -2090,6 +2580,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ctx.dir);
     }
 
+    /// 扫描时跳过链接/不可读条目不能静默显示“已完成”。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_dir_reports_skipped_entries_as_partial() {
+        use std::os::unix::fs::symlink;
+
+        let ctx = connect_and_dir("up-dir-partial").await;
+        const REMOTE: &str = "/home/tester/partial";
+        let (local, _) = seed_dist(&ctx.dir);
+        symlink(local.join("a.txt"), local.join("linked.txt")).expect("创建上传链接");
+
+        let (_, _, outcome) =
+            run_folder_upload(&ctx, 66, local, REMOTE, ExistingPolicy::Overwrite).await;
+        assert!(matches!(
+            outcome,
+            TransferOutcome::Partial(message) if message.contains("跳过了 1 个")
+        ));
+        assert_eq!(
+            vfs_read(&format!("{REMOTE}/a.txt")).await.as_deref(),
+            Some(&b"alpha"[..])
+        );
+        assert!(!vfs_exists(&format!("{REMOTE}/linked.txt")).await);
+    }
+
     /// 策略「跳过同名」：远端已有内容一个字节都不动，其余照传。
     #[tokio::test]
     async fn upload_dir_skips_existing_files() {
@@ -2158,14 +2672,14 @@ mod tests {
             run_folder_upload(&ctx, 14, local.clone(), REMOTE, ExistingPolicy::Overwrite).await;
 
         match outcome {
-            TransferOutcome::Failed(message) => {
+            TransferOutcome::Partial(message) => {
                 assert!(message.contains("sub"), "错误里应点出是哪个目录：{message}");
                 assert!(
                     message.contains("2 处失败"),
                     "sub 和 sub/deep 各一处：{message}"
                 );
             }
-            other => panic!("期望 Failed，实际 {other:?}"),
+            other => panic!("期望 Partial，实际 {other:?}"),
         }
 
         // 根目录下的文件照传。
@@ -2393,13 +2907,13 @@ mod tests {
             run_folder_download(&ctx, 35, REMOTE, local.clone(), ExistingPolicy::Overwrite).await;
 
         match outcome {
-            TransferOutcome::Failed(message) => {
+            TransferOutcome::Partial(message) => {
                 assert!(
                     message.contains("符号链接"),
                     "错误应解释拒绝原因：{message}"
                 );
             }
-            other => panic!("符号链接逃逸必须失败，实际 {other:?}"),
+            other => panic!("符号链接逃逸必须报告部分完成，实际 {other:?}"),
         }
         assert!(
             !outside.join("b.txt").exists() && !outside.join("deep/c.bin").exists(),

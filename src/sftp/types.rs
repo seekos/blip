@@ -115,6 +115,8 @@ pub type TransferId = u64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransferOutcome {
     Completed,
+    /// 主体传输已完成，但有条目因为链接、权限或并发变化未被处理。
+    Partial(String),
     Failed(String),
     Cancelled,
     /// 用户在冲突弹窗里选了「跳过」，一个字节都没传。
@@ -142,6 +144,8 @@ pub struct UploadConflict {
     pub existing_size: Option<u64>,
     /// 远端 `<remote>.filepart` 的大小；`None` 表示没有半成品。
     pub filepart_size: Option<u64>,
+    /// 半成品是否带有 macscp 写入的内容身份凭据。
+    pub checkpoint_present: bool,
 }
 
 impl UploadConflict {
@@ -150,11 +154,12 @@ impl UploadConflict {
         self.existing_size.is_some()
     }
 
-    /// 能不能续传：临时文件存在、非空、且**比本地短**。
+    /// 能不能续传：临时文件存在、非空、且**比本地短**，同时必须带身份凭据。
     ///
     /// 比本地长说明本地文件换过了，前半段内容对不上，只能从头传。
     pub fn can_resume(&self) -> bool {
-        matches!(self.filepart_size, Some(size) if size > 0 && size < self.local_size)
+        self.checkpoint_present
+            && matches!(self.filepart_size, Some(size) if size > 0 && size < self.local_size)
     }
 
     /// 临时文件已经不小于本地文件：残留的是一份过期数据。

@@ -515,11 +515,18 @@ impl Workspace {
                 let pending_external_edit = self.pending_external_edits.remove(&id);
                 let pending_external_sync = self.pending_external_syncs.remove(&id);
                 let failed = matches!(outcome, TransferOutcome::Failed(_));
-                // 传输结束会改动某一侧的目录：上传多一个文件、下载多一个文件，
-                // 取消则会留下 `.filepart` / 半成品。两种都值得刷一下列表。
+                let partial_message = match &outcome {
+                    TransferOutcome::Partial(message) => Some(message.clone()),
+                    _ => None,
+                };
+                // 传输结束会改动某一侧的目录：成功会新增目标；取消或失败也可能留下
+                // `.filepart` / 半成品。只有明确“跳过”保证什么都没改。
                 let touched = matches!(
                     outcome,
-                    TransferOutcome::Completed | TransferOutcome::Cancelled
+                    TransferOutcome::Completed
+                        | TransferOutcome::Partial(_)
+                        | TransferOutcome::Cancelled
+                        | TransferOutcome::Failed(_)
                 );
                 let direction = self.transfers.read(cx).direction_of(id);
 
@@ -564,6 +571,12 @@ impl Workspace {
                 }
                 if failed {
                     self.toast(window, cx, Notification::error("传输失败"));
+                } else if let Some(message) = partial_message {
+                    self.toast(
+                        window,
+                        cx,
+                        Notification::info(format!("传输部分完成：{message}")),
+                    );
                 }
             }
 
@@ -753,10 +766,11 @@ impl Workspace {
     ) {
         let sender = self.worker.sender();
         log::info!(
-            "打开上传冲突弹窗：id={} existing={:?} filepart={:?} can_resume={}",
+            "打开上传冲突弹窗：id={} existing={:?} filepart={:?} checkpoint={} can_resume={}",
             conflict.id,
             conflict.existing_size,
             conflict.filepart_size,
+            conflict.checkpoint_present,
             conflict.can_resume()
         );
         let prompt = cx.new(|_| UploadConflictPrompt::new(conflict, sender));

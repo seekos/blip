@@ -69,6 +69,8 @@ impl Render for UploadConflictPrompt {
         let filepart_size = self.conflict.filepart_size;
         let can_resume = self.conflict.can_resume();
         let stale_filepart = self.conflict.filepart_is_stale();
+        let untrusted_filepart =
+            filepart_size.is_some() && !self.conflict.checkpoint_present && !stale_filepart;
         let headline = if self.conflict.has_existing() {
             format!("远端已存在 {file_name}，请选择处理方式。")
         } else {
@@ -155,6 +157,14 @@ impl Render for UploadConflictPrompt {
                         .text_xs()
                         .text_color(theme.warning)
                         .child("临时文件不小于本地文件，内容可能已经过期 —— 只能从头覆盖。"),
+                )
+            })
+            .when(untrusted_filepart, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child("临时文件缺少内容身份凭据，不能确认来源 —— 只能从头安全覆盖。"),
                 )
             })
             .child(

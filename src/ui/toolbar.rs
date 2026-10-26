@@ -47,12 +47,10 @@ pub enum ToolbarEvent {
 
 impl EventEmitter<ToolbarEvent> for Toolbar {}
 
-/// 表单当前值的快照，用于落盘（不含任何明文凭证）。
+/// 表单当前值的快照，用于窗口标题和“记住连接”开关，不含任何凭证。
 pub struct ConnectionSnapshot {
     pub host: String,
-    pub port: u16,
     pub username: String,
-    pub auth: AuthMethod,
     pub remember: bool,
 }
 
@@ -240,24 +238,8 @@ impl Toolbar {
     pub fn snapshot(&self, cx: &App) -> ConnectionSnapshot {
         ConnectionSnapshot {
             host: self.host.read(cx).value().trim().to_string(),
-            port: self
-                .port
-                .read(cx)
-                .value()
-                .trim()
-                .parse::<u16>()
-                .unwrap_or(DEFAULT_SSH_PORT),
             username: self.username.read(cx).value().trim().to_string(),
-            auth: self.current_auth(cx),
             remember: self.remember,
-        }
-    }
-
-    fn current_auth(&self, cx: &App) -> AuthMethod {
-        if self.use_key {
-            self.key_auth(cx)
-        } else {
-            AuthMethod::Password(self.password.read(cx).value().to_string())
         }
     }
 
@@ -306,7 +288,16 @@ impl Toolbar {
                     username: username.clone(),
                     auth: AuthMethod::Password(String::new()),
                 };
-                store::load_password(&probe).unwrap_or_default()
+                match store::load_password(&probe) {
+                    Ok(Some(password)) if password.is_empty() => {
+                        return Err(
+                            "这个收藏的旧密码记录为空，请重新输入一次；连接成功后会自动修复".into(),
+                        );
+                    }
+                    Ok(Some(password)) => password,
+                    Ok(None) => String::new(),
+                    Err(message) => return Err(message.into()),
+                }
             } else {
                 typed
             };

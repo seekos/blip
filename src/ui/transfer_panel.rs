@@ -29,6 +29,7 @@ pub enum TransferStatus {
     Awaiting,
     Running,
     Done,
+    Partial(String),
     /// 用户在冲突弹窗里选了跳过，一个字节都没传。
     Skipped,
     Failed(String),
@@ -167,6 +168,7 @@ impl TransferQueue {
                     item.transferred = item.total.max(item.transferred);
                     TransferStatus::Done
                 }
+                TransferOutcome::Partial(message) => TransferStatus::Partial(message),
                 TransferOutcome::Cancelled => TransferStatus::Cancelled,
                 TransferOutcome::Skipped => {
                     item.transferred = 0;
@@ -293,6 +295,7 @@ impl TransferQueue {
                 theme.muted_foreground,
             ),
             TransferStatus::Done => ("已完成".to_string(), theme.success),
+            TransferStatus::Partial(message) => (format!("部分完成：{message}"), theme.warning),
             TransferStatus::Skipped => ("已跳过".to_string(), theme.muted_foreground),
             TransferStatus::Cancelled => (
                 if resuming {

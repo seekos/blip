@@ -6,6 +6,7 @@ use std::fmt;
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -744,37 +745,165 @@ pub async fn create_dir(sftp: &SftpSession, path: &str) -> Result<(), String> {
         .map_err(|err| format!("创建目录 {path} 失败：{err}"))
 }
 
-pub async fn remove(sftp: &SftpSession, path: &str, is_dir: bool) -> Result<(), String> {
-    if !is_dir {
-        return sftp
-            .remove_file(path)
-            .await
-            .map_err(|err| format!("删除 {path} 失败：{err}"));
+#[derive(Debug)]
+pub struct RemoveError {
+    pub message: String,
+    /// 出错前已经永久删除的内部条目数。
+    pub removed: usize,
+}
+
+impl fmt::Display for RemoveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.removed == 0 {
+            f.write_str(&self.message)
+        } else {
+            write!(
+                f,
+                "{}（此前已删除 {} 个内部条目）",
+                self.message, self.removed
+            )
+        }
+    }
+}
+
+const MAX_REMOVE_DEPTH: usize = 64;
+
+/// 删除一个远端条目，返回实际删除的文件/目录总数。
+///
+/// 目录先完整预检再开始删除，避免读到一半才因权限失败；每个待遍历路径均用 lstat
+/// 重新确认，绝不跟随符号链接。真正删除阶段仍可能遇到并发变化，此时错误会准确带上
+/// 已永久删除的条目数。
+pub async fn remove(
+    sftp: &SftpSession,
+    path: &str,
+    expected_dir: bool,
+    cancel: &AtomicBool,
+) -> std::result::Result<usize, RemoveError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(RemoveError {
+            message: "删除已取消".to_string(),
+            removed: 0,
+        });
+    }
+    let root = sftp
+        .symlink_metadata(path)
+        .await
+        .map_err(|err| RemoveError {
+            message: format!("读取待删除路径 {path} 失败：{err}"),
+            removed: 0,
+        })?;
+    let actual_dir = root.is_dir() && !root.is_symlink();
+    if actual_dir != expected_dir {
+        return Err(RemoveError {
+            message: format!("{path} 的类型在确认删除后发生变化，已拒绝操作"),
+            removed: 0,
+        });
+    }
+    if !actual_dir {
+        sftp.remove_file(path).await.map_err(|err| RemoveError {
+            message: format!("删除 {path} 失败：{err}"),
+            removed: 0,
+        })?;
+        return Ok(1);
     }
 
-    // SFTP 的 rmdir 只接受空目录：先展开整棵树并删除文件，再自底向上删目录。
+    // 预检阶段只读不删：先确认整棵树可枚举且没有目录链接/异常深度。
     let mut directories = vec![path.to_string()];
-    let mut index = 0;
-    while index < directories.len() {
-        let directory = directories[index].clone();
-        for entry in list_dir(sftp, &directory).await? {
-            if entry.is_dir() {
-                directories.push(entry.path);
+    let mut files = Vec::new();
+    let mut pending = vec![(path.to_string(), 0usize)];
+    while let Some((directory, depth)) = pending.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(RemoveError {
+                message: "删除已取消".to_string(),
+                removed: 0,
+            });
+        }
+        if depth >= MAX_REMOVE_DEPTH {
+            return Err(RemoveError {
+                message: format!("目录层级超过 {MAX_REMOVE_DEPTH}，拒绝递归删除：{directory}"),
+                removed: 0,
+            });
+        }
+        let entries = list_dir(sftp, &directory)
+            .await
+            .map_err(|message| RemoveError {
+                message,
+                removed: 0,
+            })?;
+        for entry in entries {
+            let metadata = sftp
+                .symlink_metadata(&entry.path)
+                .await
+                .map_err(|err| RemoveError {
+                    message: format!("检查待删除条目 {} 失败：{err}", entry.path),
+                    removed: 0,
+                })?;
+            if metadata.is_dir() && !metadata.is_symlink() {
+                directories.push(entry.path.clone());
+                pending.push((entry.path, depth + 1));
             } else {
-                sftp.remove_file(&entry.path)
-                    .await
-                    .map_err(|err| format!("删除 {} 失败：{err}", entry.path))?;
+                files.push(entry.path);
             }
         }
-        index += 1;
+    }
+
+    let mut removed = 0usize;
+    for file in files {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(RemoveError {
+                message: "删除已取消".to_string(),
+                removed,
+            });
+        }
+        let metadata = sftp
+            .symlink_metadata(&file)
+            .await
+            .map_err(|err| RemoveError {
+                message: format!("删除前重新检查 {file} 失败：{err}"),
+                removed,
+            })?;
+        if metadata.is_dir() && !metadata.is_symlink() {
+            return Err(RemoveError {
+                message: format!("{file} 在删除期间变成了目录，已停止"),
+                removed,
+            });
+        }
+        sftp.remove_file(&file).await.map_err(|err| RemoveError {
+            message: format!("删除 {file} 失败：{err}"),
+            removed,
+        })?;
+        removed += 1;
     }
 
     for directory in directories.into_iter().rev() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(RemoveError {
+                message: "删除已取消".to_string(),
+                removed,
+            });
+        }
+        let metadata = sftp
+            .symlink_metadata(&directory)
+            .await
+            .map_err(|err| RemoveError {
+                message: format!("删除前重新检查 {directory} 失败：{err}"),
+                removed,
+            })?;
+        if !metadata.is_dir() || metadata.is_symlink() {
+            return Err(RemoveError {
+                message: format!("{directory} 在删除期间不再是原目录，已停止"),
+                removed,
+            });
+        }
         sftp.remove_dir(&directory)
             .await
-            .map_err(|err| format!("删除 {directory} 失败：{err}"))?;
+            .map_err(|err| RemoveError {
+                message: format!("删除 {directory} 失败：{err}"),
+                removed,
+            })?;
+        removed += 1;
     }
-    Ok(())
+    Ok(removed)
 }
 
 pub async fn rename(sftp: &SftpSession, from: &str, to: &str) -> Result<(), String> {

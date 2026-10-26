@@ -608,14 +608,12 @@ impl FilePane {
             return;
         };
 
-        if !marquee.active {
-            if marquee.start_row.is_none() {
-                self.table.update(cx, |state, cx| {
-                    state.delegate_mut().clear_selection();
-                    state.clear_selection(cx);
-                    state.refresh(cx);
-                });
-            }
+        if !marquee.active && marquee.start_row.is_none() {
+            self.table.update(cx, |state, cx| {
+                state.delegate_mut().clear_selection();
+                state.clear_selection(cx);
+                state.refresh(cx);
+            });
         }
         cx.notify();
     }

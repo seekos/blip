@@ -8,8 +8,8 @@
 mod app;
 #[cfg(feature = "demo-server")]
 mod demo;
-mod sftp;
 mod session;
+mod sftp;
 mod ui;
 
 use gpui_kit::*;
@@ -26,40 +26,40 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(|cx| {
-        gpui_kit::init(cx);
+            gpui_kit::init(cx);
 
-        // 裸二进制没有 bundle，Dock 图标得运行时自己设（.app 启动时是重复设置，无害）。
-        ui::app_icon::install();
+            // 裸二进制没有 bundle，Dock 图标得运行时自己设（.app 启动时是重复设置，无害）。
+            ui::app_icon::install();
 
-        // 演示模式：先起内置服务器，等它把端口报回来再开窗。
-        #[cfg(feature = "demo-server")]
-        let _ = demo::start();
+            // 演示模式：先起内置服务器，等它把端口报回来再开窗。
+            #[cfg(feature = "demo-server")]
+            let _ = demo::start();
 
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1200.), px(780.)),
-                cx,
-            ))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("macscp".into()),
-                appears_transparent: false,
-                traffic_light_position: None,
-            }),
-            ..Default::default()
-        };
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(1200.), px(780.)),
+                    cx,
+                ))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("macscp".into()),
+                    appears_transparent: false,
+                    traffic_light_position: None,
+                }),
+                ..Default::default()
+            };
 
-        gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| {
-                #[cfg_attr(not(feature = "demo-server"), allow(unused_mut))]
-                let mut app = app::ScpApp::new(window, cx);
-                #[cfg(feature = "demo-server")]
-                app.apply_demo_login(window, cx);
-                app
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| {
+                    #[cfg_attr(not(feature = "demo-server"), allow(unused_mut))]
+                    let mut app = app::ScpApp::new(window, cx);
+                    #[cfg(feature = "demo-server")]
+                    app.apply_demo_login(window, cx);
+                    app
+                })
             })
-        })
-        .expect("failed to open the main window");
+            .expect("failed to open the main window");
 
-        cx.activate(true);
-    });
+            cx.activate(true);
+        });
 }
