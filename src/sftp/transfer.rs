@@ -784,6 +784,9 @@ async fn write_download_marker(path: &Path, identity: &RemoteIdentity) -> Result
 }
 
 async fn open_local_no_follow(path: &Path, append: bool) -> std::io::Result<tokio::fs::File> {
+    #[cfg(windows)]
+    reject_windows_reparse_point(path).await?;
+
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create(true);
     if append {
@@ -793,15 +796,68 @@ async fn open_local_no_follow(path: &Path, append: bool) -> std::io::Result<toki
     }
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
-    options.open(path).await
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+
+    let file = options.open(path).await?;
+    #[cfg(windows)]
+    reject_open_windows_reparse_point(&file).await?;
+    Ok(file)
 }
 
 async fn open_local_read_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
+    #[cfg(windows)]
+    reject_windows_reparse_point(path).await?;
+
     let mut options = tokio::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
-    options.open(path).await
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+
+    let file = options.open(path).await?;
+    #[cfg(windows)]
+    reject_open_windows_reparse_point(&file).await?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+#[cfg(windows)]
+async fn reject_windows_reparse_point(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if windows_metadata_is_reparse_point(&metadata) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to follow a Windows reparse point",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+async fn reject_open_windows_reparse_point(file: &tokio::fs::File) -> std::io::Result<()> {
+    let metadata = file.metadata().await?;
+    if windows_metadata_is_reparse_point(&metadata) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to follow a Windows reparse point",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 async fn replace_local(temp: &Path, target: &Path) -> Result<()> {
@@ -814,9 +870,15 @@ async fn replace_local(temp: &Path, target: &Path) -> Result<()> {
             target.display()
         ));
     }
-    tokio::fs::rename(temp, target)
-        .await
-        .map_err(|err| anyhow!("替换本地文件 {} 失败：{err}", target.display()))?;
+    if let Err(rename_err) = tokio::fs::rename(temp, target).await {
+        if tokio::fs::symlink_metadata(target).await.is_err() {
+            return Err(anyhow!(
+                "替换本地文件 {} 失败：{rename_err}",
+                target.display()
+            ));
+        }
+        replace_local_with_backup(temp, target, &rename_err).await?;
+    }
 
     // 文件本身已经 fsync；再同步目录项，降低系统崩溃后 rename 丢失的概率。
     // 某些文件系统不允许打开目录做 fsync，此时目标已经完整发布，只记录警告。
@@ -839,6 +901,77 @@ async fn replace_local(temp: &Path, target: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Windows 不允许 `rename` 直接覆盖现有文件；其它文件系统拒绝覆盖时也走同一套回滚逻辑。
+async fn replace_local_with_backup(
+    temp: &Path,
+    target: &Path,
+    rename_err: &std::io::Error,
+) -> Result<()> {
+    let backup = unique_local_backup_path(target).await?;
+    tokio::fs::rename(target, &backup).await.map_err(|err| {
+        anyhow!(
+            "替换 {} 失败（{rename_err}），保护原文件也失败：{err}",
+            target.display()
+        )
+    })?;
+
+    match tokio::fs::rename(temp, target).await {
+        Ok(()) => {
+            if let Err(err) = tokio::fs::remove_file(&backup).await {
+                log::warn!(
+                    "新文件已发布，但清理本地备份 {} 失败：{err}",
+                    backup.display()
+                );
+            }
+            Ok(())
+        }
+        Err(publish_err) => match tokio::fs::symlink_metadata(target).await {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match tokio::fs::rename(&backup, target).await {
+                    Ok(()) => Err(anyhow!(
+                        "发布 {} 失败：{publish_err}；已恢复原文件",
+                        target.display()
+                    )),
+                    Err(rollback_err) => Err(anyhow!(
+                        "发布 {} 失败：{publish_err}；恢复原文件也失败：{rollback_err}；原文件保留在 {}",
+                        target.display(),
+                        backup.display()
+                    )),
+                }
+            }
+            Ok(_) => Err(anyhow!(
+                "发布 {} 失败：{publish_err}；原文件备份保留在 {}",
+                target.display(),
+                backup.display()
+            )),
+            Err(check_err) => Err(anyhow!(
+                "发布 {} 失败：{publish_err}；无法确认目标状态：{check_err}；原文件备份保留在 {}",
+                target.display(),
+                backup.display()
+            )),
+        },
+    }
+}
+
+async fn unique_local_backup_path(target: &Path) -> Result<PathBuf> {
+    for sequence in 0..1000 {
+        let mut name = target.as_os_str().to_os_string();
+        name.push(format!(".macscp-backup-{}-{sequence}", std::process::id()));
+        let candidate = PathBuf::from(name);
+        match tokio::fs::symlink_metadata(&candidate).await {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => {}
+            Err(err) => {
+                return Err(anyhow!(
+                    "检查本地备份路径 {} 失败：{err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(anyhow!("无法为 {} 分配本地备份路径", target.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,7 +1157,14 @@ fn same_local_file(before: &std::fs::Metadata, after: &std::fs::Metadata) -> boo
             && before.mtime() == after.mtime()
             && before.mtime_nsec() == after.mtime_nsec()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        before.creation_time() == after.creation_time()
+            && before.last_write_time() == after.last_write_time()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         true
     }
@@ -2053,6 +2193,41 @@ mod tests {
         assert_eq!(filepart_path("rel.txt"), "rel.txt.filepart");
         // 已经带后缀也不会重复加：调用方传的是目标路径。
         assert_eq!(filepart_path("/a/b"), "/a/b.filepart");
+    }
+
+    #[tokio::test]
+    async fn local_replace_fallback_preserves_then_cleans_the_original() {
+        let nonce = NEXT_EDIT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "macscp-local-replace-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建测试目录");
+        let target = dir.join("target.txt");
+        let temp = dir.join("target.txt.filepart");
+        std::fs::write(&target, b"old").expect("写原文件");
+        std::fs::write(&temp, b"new").expect("写临时文件");
+
+        let forced = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "forced fallback");
+        replace_local_with_backup(&temp, &target, &forced)
+            .await
+            .expect("备份替换应成功");
+
+        assert_eq!(std::fs::read(&target).expect("读新文件"), b"new");
+        assert!(!temp.exists(), "临时文件应已发布");
+        assert!(
+            std::fs::read_dir(&dir)
+                .expect("读测试目录")
+                .all(|entry| !entry
+                    .expect("读目录项")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".macscp-backup-")),
+            "发布成功后不应残留备份"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("清理测试目录");
     }
 
     #[test]

@@ -2,13 +2,13 @@
 name = "blip"
 version = "0.1.0"
 edition = "2024"
-description = "A native, GPU-accelerated macOS SFTP client built with GPUI Kit"
+description = "A native, GPU-accelerated cross-platform SFTP client built with GPUI Kit"
 
 [features]
 default = []
 # 把一个假的 SFTP 服务器编进二进制（127.0.0.1 随机端口、tester / s3cret）。
 # 用来在没有真实主机的情况下手工验证「连接 → 列目录 → 上传/下载 → 取消/续传 →
-# 从 Finder 拖文件上传」整条链路：`cargo run --features demo-server`。
+# 从文件管理器拖文件上传」整条链路：`cargo run --features demo-server`。
 demo-server = []
 
 [dependencies]
@@ -36,12 +36,25 @@ russh-sftp = "3.0"
 
 # Cross-runtime actor channels.
 flume = { version = "0.12", features = ["async"] }
+futures = "0.3"
 
-# macOS integration.
+# Cross-platform system credential storage and recycle bin support.
 keyring = "4"
 dirs = "6"
+trash = "5.2.9"
 
-# Dock 图标：裸二进制（`cargo run`）没有 bundle，Dock 里只能靠运行时
+# Utilities.
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+libc = "0.2"
+rand = "0.10"
+
+# macOS-only integration. Dock 图标：裸二进制（`cargo run`）没有 bundle，Dock 里只能靠运行时
 # `NSApplication.setApplicationIconImage` 换成自己的图标。
 # 版本必须与 gpui 依赖树里的对齐（objc2 0.6 / objc2-app-kit 0.3），
 # 否则会同时链进两套 objc2，编译时间和二进制体积都会翻倍。
@@ -58,22 +71,9 @@ objc2-app-kit = { version = "0.3", features = [
 ] }
 objc2-foundation = { version = "0.3", features = [
     "NSData",
-    "NSError",
-    "NSFileManager",
     "NSURL",
 ] }
 security-framework = { version = "3.7", features = ["OSX_10_15"] }
-
-# Utilities.
-anyhow = "1"
-log = "0.4"
-env_logger = "0.11"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-libc = "0.2"
-rand = "0.10"
 
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }

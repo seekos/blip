@@ -199,7 +199,7 @@ impl Workspace {
                 FilePaneEvent::PaneAction(action) => {
                     workspace.handle_pane_action(PaneSide::Remote, *action, window, cx);
                 }
-                // Finder 拖进来的东西：文件直接上传，文件夹整棵上传。
+                // 系统文件管理器拖进来的东西：文件直接上传，文件夹整棵上传。
                 FilePaneEvent::DropFiles(paths) => {
                     workspace.upload_paths(paths.clone(), window, cx);
                 }
@@ -1032,7 +1032,7 @@ impl Workspace {
         });
     }
 
-    /// Finder 拖进来的条目 → 上传到当前远端目录。
+    /// 系统文件管理器拖进来的条目 → 上传到当前远端目录。
     ///
     /// 文件各自入队、并发上传（worker 里每个任务一个 `tokio::spawn`）；
     /// 文件夹走整目录上传，一条队列行传一整棵树。
@@ -1344,12 +1344,12 @@ impl Workspace {
                     }),
                 );
             }
-            FileAction::RevealInFinder => {
+            FileAction::RevealInFileManager => {
                 if side == PaneSide::Local
                     && let Some(entry) = entries.into_iter().next()
                 {
                     cx.reveal_path(Path::new(&entry.path));
-                    self.toast(window, cx, Notification::info("已在访达中显示"));
+                    self.toast(window, cx, Notification::info("已在文件管理器中显示"));
                 }
             }
             FileAction::Rename => {
@@ -1432,7 +1432,7 @@ impl Workspace {
                     }
                     _ => None,
                 };
-                match open_external_editor(&path, editor_path) {
+                match open_external_editor(&path, editor_path, cx) {
                     Ok(()) => {
                         self.toast(window, cx, Notification::success("已用编辑器打开本地文件"))
                     }
@@ -1522,7 +1522,7 @@ impl Workspace {
                 return;
             }
         };
-        if let Err(message) = open_external_editor(&edit.local, edit.editor_path.as_deref()) {
+        if let Err(message) = open_external_editor(&edit.local, edit.editor_path.as_deref(), cx) {
             self.toast(window, cx, Notification::error(message));
             return;
         }
@@ -1972,9 +1972,9 @@ impl Workspace {
             .map(|entry| (entry.name, PathBuf::from(entry.path)))
             .collect();
         let description = if total == 1 {
-            format!("将 {} 移到废纸篓，可在访达中恢复。", targets[0].0)
+            format!("将 {} 移到系统回收站，可随时恢复。", targets[0].0)
         } else {
-            format!("将选中的 {total} 项移到废纸篓，可在访达中恢复。")
+            format!("将选中的 {total} 项移到系统回收站，可随时恢复。")
         };
 
         window.open_alert_dialog(cx, move |alert, _window, _cx| {
@@ -1983,7 +1983,7 @@ impl Workspace {
             let description = description.clone();
             alert
                 .confirm()
-                .title("移到废纸篓")
+                .title("移到系统回收站")
                 .description(SharedString::from(description))
                 .on_ok(move |_, window, cx| {
                     let mut failures = Vec::new();
@@ -2000,16 +2000,16 @@ impl Workspace {
 
                     if failures.is_empty() {
                         let message = if moved == 1 {
-                            "已移到废纸篓".to_string()
+                            "已移到系统回收站".to_string()
                         } else {
-                            format!("已将 {moved} 项移到废纸篓")
+                            format!("已将 {moved} 项移到系统回收站")
                         };
                         window.push_notification(Notification::success(message), cx);
                         return true;
                     }
 
                     window.push_notification(
-                        Notification::error(batch_delete_error("移到废纸篓", moved, &failures)),
+                        Notification::error(batch_delete_error("移到系统回收站", moved, &failures)),
                         cx,
                     );
                     moved > 0
@@ -2320,20 +2320,8 @@ fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     })
 }
 
-#[cfg(target_os = "macos")]
 fn move_local_to_trash(path: &Path) -> Result<(), String> {
-    use objc2_foundation::{NSFileManager, NSURL};
-
-    let url = NSURL::from_file_path(path)
-        .ok_or_else(|| format!("无法识别本地路径：{}", path.display()))?;
-    NSFileManager::defaultManager()
-        .trashItemAtURL_resultingItemURL_error(&url, None)
-        .map_err(|err| format!("移到废纸篓失败：{err}"))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn move_local_to_trash(_path: &Path) -> Result<(), String> {
-    Err("当前系统不支持移到废纸篓".to_string())
+    trash::delete(path).map_err(|err| format!("移到系统回收站失败：{err}"))
 }
 
 fn batch_delete_error(action: &str, completed: usize, failures: &[String]) -> String {
@@ -2355,20 +2343,26 @@ fn batch_delete_error(action: &str, completed: usize, failures: &[String]) -> St
     )
 }
 
-fn open_external_editor(local: &Path, editor_path: Option<&Path>) -> Result<(), String> {
-    let mut command = match editor_path {
-        Some(editor_path)
-            if editor_path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("app")) =>
-        {
-            let mut command = Command::new("/usr/bin/open");
-            command.arg("-a").arg(editor_path);
-            command
-        }
-        Some(editor_path) => Command::new(editor_path),
-        None => Command::new("/usr/bin/open"),
+fn open_external_editor(local: &Path, editor_path: Option<&Path>, cx: &App) -> Result<(), String> {
+    let Some(editor_path) = editor_path else {
+        cx.open_with_system(local);
+        return Ok(());
     };
+
+    #[cfg(target_os = "macos")]
+    let mut command = if editor_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+    {
+        let mut command = Command::new("/usr/bin/open");
+        command.arg("-a").arg(editor_path);
+        command
+    } else {
+        Command::new(editor_path)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut command = Command::new(editor_path);
+
     command.arg(local);
     let mut child = command
         .spawn()

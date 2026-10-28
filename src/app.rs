@@ -15,6 +15,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
+    input::{Input, InputState},
     notification::Notification,
     radio::{Radio, RadioGroup},
     v_flex,
@@ -22,7 +23,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use crate::session::store::{self, AppSettings, RemoteOpenBehavior, SavedAuth, SavedProfile};
+use crate::session::store::{
+    self, AppSettings, LanSftpPasswordMode, RemoteOpenBehavior, SavedAuth, SavedProfile,
+};
 use crate::sftp::lan_server::ServerInfo;
 use crate::sftp::types::{AuthMethod, SessionConfig};
 use crate::ui::SessionState;
@@ -42,7 +45,7 @@ pub struct ScpApp {
     profiles: Vec<SavedProfile>,
     settings: AppSettings,
     lan_server: Result<ServerInfo, SharedString>,
-    /// 当前这次连接实际使用的配置。密码框可能为空（收藏会从钥匙串补密码），
+    /// 当前这次连接实际使用的配置。密码框可能为空（收藏会从系统凭据库补密码），
     /// 成功后必须保存这里的认证信息，不能再从空白表单反推。
     pending_config: Option<SessionConfig>,
     version: String,
@@ -54,6 +57,8 @@ struct SettingsDraft {
     remote_open_behavior: RemoteOpenBehavior,
     editor_path: Option<PathBuf>,
     lan_sftp_root: Option<PathBuf>,
+    lan_sftp_password_mode: LanSftpPasswordMode,
+    password_visible: bool,
     error: Option<SharedString>,
 }
 
@@ -88,8 +93,19 @@ impl ScpApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let profiles = store::load_profiles();
         let settings = store::load_settings();
-        let lan_server =
-            crate::sftp::lan_server::start(settings.lan_sftp_root.clone()).map_err(|message| {
+        let server_password = match settings.lan_sftp_password_mode {
+            LanSftpPasswordMode::Random => Ok(None),
+            LanSftpPasswordMode::Manual => store::load_lan_sftp_password().and_then(|password| {
+                password
+                    .map(Some)
+                    .ok_or_else(|| "手动密码尚未设置，请在设置中填写".to_string())
+            }),
+        };
+        let lan_server = server_password
+            .and_then(|password| {
+                crate::sftp::lan_server::start(settings.lan_sftp_root.clone(), password)
+            })
+            .map_err(|message| {
                 log::error!("内置局域网 SFTP 服务启动失败：{message}");
                 SharedString::from(message)
             });
@@ -222,10 +238,9 @@ impl ScpApp {
 
     fn check_for_updates(&self, cx: &mut Context<Self>) {
         let current_version = self.version.clone();
+        let http_client = cx.http_client();
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { update::check_latest_release(&current_version) })
-                .await;
+            let result = update::check_latest_release(http_client, &current_version).await;
             match result {
                 Ok(Some(available)) => {
                     let _ = this.update_in(cx, |app, window, cx| {
@@ -257,17 +272,15 @@ impl ScpApp {
                 .child(
                     v_flex()
                         .gap_2()
-                        .child(
-                            div().text_sm().child(SharedString::from(format!(
-                                "Blip {} 已发布，当前版本为 {}。",
-                                available.version, available.current_version
-                            ))),
-                        )
+                        .child(div().text_sm().child(SharedString::from(format!(
+                            "Blip {} 已发布，当前版本为 {}。",
+                            available.version, available.current_version
+                        ))))
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(_cx.theme().muted_foreground)
-                                .child("将打开 GitHub Releases 下载新版 DMG，安装时把 Blip 拖入“应用程序”即可完成升级。"),
+                                .child("将打开 GitHub Releases，请下载适合当前系统的安装包。"),
                         ),
                 )
                 .footer(
@@ -284,15 +297,8 @@ impl ScpApp {
                                 .primary()
                                 .label("下载升级")
                                 .on_click(move |_, window, cx| {
-                                    match update::open_release_page(&release_url) {
-                                        Ok(()) => window.close_dialog(cx),
-                                        Err(error) => window.push_notification(
-                                            Notification::error(format!(
-                                                "无法打开更新页面：{error}"
-                                            )),
-                                            cx,
-                                        ),
-                                    }
+                                    cx.open_url(&release_url);
+                                    window.close_dialog(cx);
                                 }),
                         ),
                 )
@@ -301,11 +307,12 @@ impl ScpApp {
 
     fn open_lan_server_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
         let server = self.lan_server.clone();
+        let manual_password = self.settings.lan_sftp_password_mode == LanSftpPasswordMode::Manual;
         window.open_dialog(cx, move |dialog, _window, cx| match server.clone() {
             Ok(info) => {
                 let theme = cx.theme().clone();
                 let command = info.command();
-                let password = info.password.clone();
+                let password = info.password();
                 let copy_command = command.clone();
                 let copy_password = password.clone();
 
@@ -320,7 +327,7 @@ impl ScpApp {
                             .child(
                                 div()
                                     .text_sm()
-                                    .child("同一局域网内的设备可使用以下信息连接到这台 Mac。"),
+                                    .child("同一局域网内的设备可使用以下信息连接到这台电脑。"),
                             )
                             .child(
                                 v_flex()
@@ -428,7 +435,11 @@ impl ScpApp {
                                 div()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .child("密码会在每次启动应用时重新生成。请只在可信局域网中使用；退出 Blip 后服务自动停止。"),
+                                    .child(if manual_password {
+                                        "当前使用手动密码。请只在可信局域网中使用；退出 Blip 后服务自动停止。"
+                                    } else {
+                                        "密码会在每次启动应用时重新生成。请只在可信局域网中使用；退出 Blip 后服务自动停止。"
+                                    }),
                             ),
                     )
                     .footer(
@@ -465,9 +476,9 @@ impl ScpApp {
     // 凭证
     // -----------------------------------------------------------------------
 
-    /// 把当前连接写进 Keychain + profiles.json。
+    /// 把当前连接写进系统凭据库 + profiles.json。
     ///
-    /// 用户关掉「记住」时**什么都不落盘**：钥匙串里的旧密码顺手清掉，
+    /// 用户关掉「记住」时**什么都不落盘**：系统凭据库里的旧密码顺手清掉，
     /// profiles.json 也不写 —— 否则演示模式（remember = false）会往
     /// 配置里塞一堆 `tester@127.0.0.1:<随机端口>`，下次启动还会被
     /// `prefill` 填回表单。
@@ -488,7 +499,7 @@ impl ScpApp {
 
         if let Some(password) = prepared.password {
             let password_config = config.clone();
-            // 写钥匙串可能触发系统授权弹窗，放到后台线程；失败时回到前台
+            // 写系统凭据库可能触发授权弹窗，放到后台线程；失败时回到前台
             // 把原因显示在工具栏上 —— 只写日志等于没告诉用户。
             let this = cx.entity().downgrade();
             cx.spawn(async move |_app, cx| {
@@ -499,7 +510,8 @@ impl ScpApp {
                 if let Err(err) = task.await {
                     log::warn!("保存密码失败：{err}");
                     let _ = this.update(cx, |app, cx| {
-                        let message = SharedString::from(format!("保存密码到钥匙串失败：{err}"));
+                        let message =
+                            SharedString::from(format!("保存密码到系统凭据库失败：{err}"));
                         app.toolbar
                             .update(cx, |toolbar, cx| toolbar.set_error(Some(message), cx));
                     });
@@ -584,17 +596,41 @@ impl ScpApp {
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let password_mode = self.settings.lan_sftp_password_mode;
+        let (manual_password, password_error) = match store::load_lan_sftp_password() {
+            Ok(password) => (password.unwrap_or_default(), None),
+            Err(message) => (String::new(), Some(SharedString::from(message))),
+        };
+        let manual_password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(manual_password)
+                .masked(true)
+                .placeholder("输入手动密码")
+        });
         let draft = cx.new(|_| SettingsDraft {
             remote_open_behavior: self.settings.remote_open_behavior,
             editor_path: self.settings.editor_path.clone(),
             lan_sftp_root: self.settings.lan_sftp_root.clone(),
-            error: None,
+            lan_sftp_password_mode: password_mode,
+            password_visible: false,
+            error: if password_mode == LanSftpPasswordMode::Manual {
+                password_error
+            } else {
+                None
+            },
         });
         let app = cx.entity().downgrade();
 
         window.open_dialog(cx, move |dialog, _window, cx| {
             let theme = cx.theme().clone();
-            let (selected, editor_path, lan_sftp_root, error) = {
+            let (
+                selected,
+                editor_path,
+                lan_sftp_root,
+                lan_sftp_password_mode,
+                password_visible,
+                error,
+            ) = {
                 let snapshot = draft.read(cx);
                 (
                     match snapshot.remote_open_behavior {
@@ -604,6 +640,8 @@ impl ScpApp {
                     },
                     snapshot.editor_path.clone(),
                     snapshot.lan_sftp_root.clone(),
+                    snapshot.lan_sftp_password_mode,
+                    snapshot.password_visible,
                     snapshot.error.clone(),
                 )
             };
@@ -612,7 +650,11 @@ impl ScpApp {
             let browse_draft = draft.clone();
             let browse_share_draft = draft.clone();
             let default_share_draft = draft.clone();
+            let password_mode_draft = draft.clone();
+            let password_visibility_draft = draft.clone();
+            let password_visibility_input = manual_password_input.clone();
             let save_draft = draft.clone();
+            let save_password_input = manual_password_input.clone();
             let save_app = app.clone();
 
             dialog
@@ -692,7 +734,7 @@ impl ScpApp {
                                                             let receiver = cx.prompt_for_paths(
                                                                 PathPromptOptions {
                                                                     files: true,
-                                                                    directories: true,
+                                                                    directories: cfg!(target_os = "macos"),
                                                                     multiple: false,
                                                                     prompt: Some(
                                                                         "选择默认编辑器".into(),
@@ -710,7 +752,7 @@ impl ScpApp {
                                                                                 cx,
                                                                                 |draft, cx| {
                                                                                     draft.error = (!is_editor_path(&path)).then(|| {
-                                                                                        SharedString::from("请选择 .app 应用或可执行文件")
+                                                                                        SharedString::from("请选择应用或可执行文件")
                                                                                     });
                                                                                     draft.editor_path = Some(path);
                                                                                     cx.notify();
@@ -761,7 +803,121 @@ impl ScpApp {
                                     div()
                                         .text_sm()
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .child("局域网 SFTP 共享目录"),
+                                        .child("局域网 SFTP"),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child("登录密码"),
+                                        )
+                                        .child(
+                                            RadioGroup::vertical("lan-sftp-password-mode")
+                                                .selected_index(Some(
+                                                    if lan_sftp_password_mode
+                                                        == LanSftpPasswordMode::Random
+                                                    {
+                                                        0
+                                                    } else {
+                                                        1
+                                                    },
+                                                ))
+                                                .on_click(move |index, _, cx| {
+                                                    password_mode_draft.update(
+                                                        cx,
+                                                        |draft, cx| {
+                                                            draft.lan_sftp_password_mode =
+                                                                if *index == 0 {
+                                                                    LanSftpPasswordMode::Random
+                                                                } else {
+                                                                    LanSftpPasswordMode::Manual
+                                                                };
+                                                            draft.error = None;
+                                                            cx.notify();
+                                                        },
+                                                    );
+                                                })
+                                                .child(
+                                                    Radio::new("lan-sftp-password-random")
+                                                        .label("每次启动随机生成 6 位数字密码"),
+                                                )
+                                                .child(
+                                                    Radio::new("lan-sftp-password-manual")
+                                                        .label("使用手动密码"),
+                                                ),
+                                        )
+                                        .when(
+                                            lan_sftp_password_mode
+                                                == LanSftpPasswordMode::Manual,
+                                            |this| {
+                                                this.child(
+                                                    h_flex()
+                                                        .w_full()
+                                                        .gap_2()
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_w_0()
+                                                                .child(
+                                                                    Input::new(
+                                                                        &manual_password_input,
+                                                                    )
+                                                                    .id(
+                                                                        "lan-sftp-manual-password",
+                                                                    )
+                                                                    .w_full(),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            Button::new(
+                                                                "toggle-lan-sftp-password",
+                                                            )
+                                                            .label(if password_visible {
+                                                                "隐藏"
+                                                            } else {
+                                                                "显示"
+                                                            })
+                                                            .on_click(move |_, window, cx| {
+                                                                let visible =
+                                                                    !password_visibility_draft
+                                                                        .read(cx)
+                                                                        .password_visible;
+                                                                password_visibility_input.update(
+                                                                    cx,
+                                                                    |input, cx| {
+                                                                        input.set_masked(
+                                                                            !visible, window, cx,
+                                                                        )
+                                                                    },
+                                                                );
+                                                                password_visibility_draft.update(
+                                                                    cx,
+                                                                    |draft, cx| {
+                                                                        draft.password_visible =
+                                                                            visible;
+                                                                        cx.notify();
+                                                                    },
+                                                                );
+                                                            }),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(theme.muted_foreground)
+                                                        .child("手动密码保存在系统凭据库中，不写入设置文件。"),
+                                                )
+                                            },
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("共享目录"),
                                 )
                                 .child(
                                     h_flex()
@@ -885,12 +1041,18 @@ impl ScpApp {
                                 .primary()
                                 .label("保存")
                                 .on_click(move |_, window, cx| {
-                                    let (behavior, editor_path, lan_sftp_root) = {
+                                    let (
+                                        behavior,
+                                        editor_path,
+                                        lan_sftp_root,
+                                        lan_sftp_password_mode,
+                                    ) = {
                                         let snapshot = save_draft.read(cx);
                                         (
                                             snapshot.remote_open_behavior,
                                             snapshot.editor_path.clone(),
                                             snapshot.lan_sftp_root.clone(),
+                                            snapshot.lan_sftp_password_mode,
                                         )
                                     };
                                     if behavior == RemoteOpenBehavior::CustomEditor
@@ -900,7 +1062,7 @@ impl ScpApp {
                                     {
                                         save_draft.update(cx, |draft, cx| {
                                             draft.error = Some(SharedString::from(
-                                                "请选择 .app 编辑器应用或可执行文件",
+                                                "请选择编辑器应用或可执行文件",
                                             ));
                                             cx.notify();
                                         });
@@ -931,10 +1093,39 @@ impl ScpApp {
                                         });
                                         return;
                                     }
+                                    let manual_password =
+                                        if lan_sftp_password_mode == LanSftpPasswordMode::Manual {
+                                            let password = save_password_input
+                                                .read(cx)
+                                                .value()
+                                                .to_string();
+                                            if password.is_empty() {
+                                                save_draft.update(cx, |draft, cx| {
+                                                    draft.error =
+                                                        Some("手动密码不能为空".into());
+                                                    cx.notify();
+                                                });
+                                                return;
+                                            }
+                                            if let Err(message) =
+                                                store::store_lan_sftp_password(&password)
+                                            {
+                                                save_draft.update(cx, |draft, cx| {
+                                                    draft.error =
+                                                        Some(SharedString::from(message));
+                                                    cx.notify();
+                                                });
+                                                return;
+                                            }
+                                            Some(password)
+                                        } else {
+                                            None
+                                        };
                                     let settings = AppSettings {
                                         remote_open_behavior: behavior,
                                         editor_path,
                                         lan_sftp_root,
+                                        lan_sftp_password_mode,
                                     };
                                     if let Err(message) = store::save_settings(&settings) {
                                         save_draft.update(cx, |draft, cx| {
@@ -948,10 +1139,22 @@ impl ScpApp {
                                         app.lan_server = match &app.lan_server {
                                             Ok(server) => server
                                                 .set_root(effective_root.clone())
+                                                .and_then(|_| match lan_sftp_password_mode {
+                                                    LanSftpPasswordMode::Manual => server
+                                                        .set_password(manual_password.clone()),
+                                                    LanSftpPasswordMode::Random
+                                                        if app.settings.lan_sftp_password_mode
+                                                            == LanSftpPasswordMode::Manual =>
+                                                    {
+                                                        server.set_password(None)
+                                                    }
+                                                    LanSftpPasswordMode::Random => Ok(()),
+                                                })
                                                 .map(|_| server.clone())
                                                 .map_err(SharedString::from),
                                             Err(_) => crate::sftp::lan_server::start(
                                                 settings.lan_sftp_root.clone(),
+                                                manual_password.clone(),
                                             )
                                             .map_err(SharedString::from),
                                         };
@@ -984,7 +1187,7 @@ impl ScpApp {
     /// 演示模式：把内置服务器的地址填进表单并直接连上。
     ///
     /// 只在 `--features demo-server` 下编译。故意 `remember = false` ——
-    /// 别把假账号写进用户的钥匙串。
+    /// 别把假账号写进用户的系统凭据库。
     #[cfg(feature = "demo-server")]
     pub fn apply_demo_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(login) = crate::demo::login() else {
@@ -1125,7 +1328,8 @@ impl Render for ScpApp {
 
 fn is_editor_path(path: &std::path::Path) -> bool {
     path.is_file()
-        || (path.is_dir()
+        || (cfg!(target_os = "macos")
+            && path.is_dir()
             && path
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("app")))
@@ -1156,7 +1360,7 @@ mod tests {
             host: "server.example".to_string(),
             port: 2222,
             username: "alice".to_string(),
-            // 这可以是 build_config 从钥匙串补出来的密码；密码输入框仍可能为空。
+            // 这可以是 build_config 从系统凭据库补出来的密码；密码输入框仍可能为空。
             auth: AuthMethod::Password("resolved-from-keychain".to_string()),
         };
 

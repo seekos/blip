@@ -1,6 +1,8 @@
 use anyhow::{Context as _, Result};
+use futures::AsyncReadExt as _;
+use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt as _, RedirectPolicy, Request};
 use serde::Deserialize;
-use std::process::Command;
+use std::{sync::Arc, time::Duration};
 
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/seekos/macscp/releases/latest";
 
@@ -17,31 +19,37 @@ struct GithubRelease {
     html_url: String,
 }
 
-pub fn check_latest_release(current_version: &str) -> Result<Option<AvailableUpdate>> {
-    let output = Command::new("/usr/bin/curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-time",
-            "8",
-            "--header",
-            "Accept: application/vnd.github+json",
-            "--header",
-            "X-GitHub-Api-Version: 2022-11-28",
-            "--user-agent",
-            concat!("Blip/", env!("CARGO_PKG_VERSION")),
-            LATEST_RELEASE_URL,
-        ])
-        .output()
-        .context("无法启动版本检查")?;
-    if !output.status.success() {
-        anyhow::bail!("无法读取最新版本");
+pub async fn check_latest_release(
+    client: Arc<dyn HttpClient>,
+    current_version: &str,
+) -> Result<Option<AvailableUpdate>> {
+    let request = Request::builder()
+        .uri(LATEST_RELEASE_URL)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", concat!("Blip/", env!("CARGO_PKG_VERSION")))
+        .follow_redirects(RedirectPolicy::FollowLimit(5))
+        .timeout(Duration::from_secs(8))
+        .body(AsyncBody::empty())?;
+    let mut response = client.send(request).await.context("无法读取最新版本")?;
+    if !response.status().is_success() {
+        anyhow::bail!("版本检查返回 {}", response.status());
     }
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .read_to_end(&mut body)
+        .await
+        .context("无法读取版本响应")?;
 
-    let release: GithubRelease =
-        serde_json::from_slice(&output.stdout).context("无法解析最新版本信息")?;
+    available_update_from_json(&body, current_version)
+}
+
+fn available_update_from_json(
+    body: &[u8],
+    current_version: &str,
+) -> Result<Option<AvailableUpdate>> {
+    let release: GithubRelease = serde_json::from_slice(body).context("无法解析最新版本信息")?;
     let version = release.tag_name.trim_start_matches(['v', 'V']).to_string();
     if !is_newer_version(&version, current_version) {
         return Ok(None);
@@ -52,17 +60,6 @@ pub fn check_latest_release(current_version: &str) -> Result<Option<AvailableUpd
         version,
         release_url: release.html_url,
     }))
-}
-
-pub fn open_release_page(url: &str) -> Result<()> {
-    let status = Command::new("/usr/bin/open")
-        .arg(url)
-        .status()
-        .context("无法打开更新页面")?;
-    if !status.success() {
-        anyhow::bail!("系统无法打开更新页面");
-    }
-    Ok(())
 }
 
 pub fn application_version() -> String {
@@ -124,7 +121,7 @@ fn is_newer_version(candidate: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_newer_version, short_version_from_plist};
+    use super::{available_update_from_json, is_newer_version, short_version_from_plist};
 
     #[test]
     fn compares_release_versions() {
@@ -139,5 +136,19 @@ mod tests {
     fn reads_bundle_short_version() {
         let plist = r#"<key>CFBundleShortVersionString</key><string>1.2.3</string>"#;
         assert_eq!(short_version_from_plist(plist).as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn parses_github_release_response() {
+        let update = available_update_from_json(
+            br#"{"tag_name":"v1.2.0","html_url":"https://example.com/release"}"#,
+            "1.1.0",
+        )
+        .expect("解析版本")
+        .expect("应有更新");
+
+        assert_eq!(update.version, "1.2.0");
+        assert_eq!(update.current_version, "1.1.0");
+        assert_eq!(update.release_url, "https://example.com/release");
     }
 }

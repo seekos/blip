@@ -1,4 +1,4 @@
-//! 会话持久化：密码进 macOS Keychain，连接配置进 Application Support 下的 JSON。
+//! 会话持久化：密码进系统凭据库，连接配置进系统配置目录下的 JSON。
 
 use std::path::PathBuf;
 
@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::sftp::types::SessionConfig;
 
-/// Keychain 里的 service 名，所有条目共享。
+/// 系统凭据库里的 service 名，所有条目共享。
 const KEYRING_SERVICE: &str = "com.macscp.credentials";
+const LAN_SFTP_PASSWORD_ACCOUNT: &str = "lan-sftp-server-password";
 #[cfg(target_os = "macos")]
 const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;
 const PROFILES_FILE: &str = "profiles.json";
@@ -79,7 +80,7 @@ impl DirectoryHistory {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteOpenBehavior {
-    /// 下载到编辑缓存后，用 macOS 为该文件选择的默认应用打开。
+    /// 下载到编辑缓存后，用系统为该文件选择的默认应用打开。
     #[serde(alias = "download")]
     #[default]
     SystemDefault,
@@ -90,14 +91,23 @@ pub enum RemoteOpenBehavior {
     BuiltInTextEditor,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LanSftpPasswordMode {
+    #[default]
+    Random,
+    Manual,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub remote_open_behavior: RemoteOpenBehavior,
-    /// 自定义编辑器的 `.app` 或可执行文件路径；系统默认和内置模式下忽略。
+    /// 自定义编辑器应用或可执行文件路径；系统默认和内置模式下忽略。
     pub editor_path: Option<PathBuf>,
     /// 内置局域网 SFTP 的共享根目录；`None` 表示当前用户主目录。
     pub lan_sftp_root: Option<PathBuf>,
+    pub lan_sftp_password_mode: LanSftpPasswordMode,
 }
 
 impl Default for AppSettings {
@@ -112,31 +122,49 @@ fn preferred_settings(notepad: Option<PathBuf>) -> AppSettings {
             remote_open_behavior: RemoteOpenBehavior::CustomEditor,
             editor_path: Some(editor_path),
             lan_sftp_root: None,
+            lan_sftp_password_mode: LanSftpPasswordMode::Random,
         },
         None => AppSettings {
             remote_open_behavior: RemoteOpenBehavior::SystemDefault,
             editor_path: None,
             lan_sftp_root: None,
+            lan_sftp_password_mode: LanSftpPasswordMode::Random,
         },
     }
 }
 
 fn find_notepad_editor() -> Option<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from("/Applications/Notepad--.app"),
-        PathBuf::from("/System/Applications/Notepad--.app"),
-    ];
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join("Applications/Notepad--.app"));
-    }
-    if let Some(path) = candidates.into_iter().find(|path| path.is_dir()) {
+    #[cfg(target_os = "macos")]
+    let candidates = {
+        let mut candidates = vec![
+            PathBuf::from("/Applications/Notepad--.app"),
+            PathBuf::from("/System/Applications/Notepad--.app"),
+        ];
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join("Applications/Notepad--.app"));
+        }
+        candidates
+    };
+    #[cfg(target_os = "windows")]
+    let candidates: Vec<PathBuf> = dirs::data_local_dir()
+        .map(|directory| directory.join("Programs/Notepad--/Notepad--.exe"))
+        .into_iter()
+        .collect();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
         return Some(path);
     }
 
+    let executable = if cfg!(target_os = "windows") {
+        "notepad--.exe"
+    } else {
+        "notepad--"
+    };
     std::env::var_os("PATH")
         .into_iter()
         .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .map(|dir| dir.join("notepad--"))
+        .map(|dir| dir.join(executable))
         .find(|path| path.is_file())
 }
 
@@ -173,7 +201,7 @@ pub struct SavedProfile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SavedAuth {
-    /// 密码存在 Keychain 里，这里只是一个标记。
+    /// 密码存在系统凭据库里，这里只是一个标记。
     Password,
     Key {
         path: String,
@@ -341,6 +369,24 @@ fn delete_legacy_password(config: &SessionConfig) {
     }
 }
 
+fn lan_sftp_password_entry() -> keyring::Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, LAN_SFTP_PASSWORD_ACCOUNT)
+}
+
+pub fn store_lan_sftp_password(password: &str) -> Result<(), String> {
+    lan_sftp_password_entry()
+        .and_then(|entry| entry.set_password(password))
+        .map_err(|err| format!("保存局域网 SFTP 密码失败：{err}"))
+}
+
+pub fn load_lan_sftp_password() -> Result<Option<String>, String> {
+    match lan_sftp_password_entry().and_then(|entry| entry.get_password()) {
+        Ok(password) => Ok(Some(password)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(format!("读取局域网 SFTP 密码失败：{err}")),
+    }
+}
+
 /// 把密码写进 Keychain。macOS 上优先写入要求用户在场的受保护条目：系统会先
 /// 尝试 Touch ID，并允许用 Mac 登录密码回退。未签名的开发二进制没有受保护
 /// Keychain 权限，此时保留旧 Keychain 存储，避免 `cargo run` 无法记住密码。
@@ -363,7 +409,7 @@ pub fn store_password(config: &SessionConfig, password: &str) -> Result<(), Stri
         }
     }
 
-    store_legacy_password(config, password).map_err(|err| format!("写入钥匙串失败：{err}"))
+    store_legacy_password(config, password).map_err(|err| format!("写入系统凭据库失败：{err}"))
 }
 
 /// 从 Keychain 取密码；受保护条目由系统执行 Touch ID 优先、登录密码回退。
@@ -395,7 +441,7 @@ pub fn load_password(config: &SessionConfig) -> Result<Option<String>, String> {
     }
 
     #[cfg(not(target_os = "macos"))]
-    load_legacy_password(config).map_err(|err| format!("读取钥匙串失败：{err}"))
+    load_legacy_password(config).map_err(|err| format!("读取系统凭据库失败：{err}"))
 }
 
 pub fn forget_password(config: &SessionConfig) {
@@ -576,6 +622,7 @@ mod tests {
             RemoteOpenBehavior::CustomEditor
         );
         assert_eq!(defaults.editor_path, Some(notepad));
+        assert_eq!(defaults.lan_sftp_password_mode, LanSftpPasswordMode::Random);
 
         let fallback = preferred_settings(None);
         assert_eq!(
@@ -583,11 +630,13 @@ mod tests {
             RemoteOpenBehavior::SystemDefault
         );
         assert_eq!(fallback.editor_path, None);
+        assert_eq!(fallback.lan_sftp_password_mode, LanSftpPasswordMode::Random);
 
         let settings = AppSettings {
             remote_open_behavior: RemoteOpenBehavior::CustomEditor,
             editor_path: Some(PathBuf::from("/Applications/Visual Studio Code.app")),
             lan_sftp_root: Some(PathBuf::from("/Users/tester/Shared")),
+            lan_sftp_password_mode: LanSftpPasswordMode::Manual,
         };
         let json = serde_json::to_string(&settings).expect("序列化设置");
         let decoded: AppSettings = serde_json::from_str(&json).expect("读回设置");
@@ -619,12 +668,16 @@ mod tests {
             previous_text.remote_open_behavior,
             RemoteOpenBehavior::BuiltInTextEditor
         );
+        assert_eq!(
+            previous_text.lan_sftp_password_mode,
+            LanSftpPasswordMode::Random
+        );
     }
 
-    /// 写-读-删一整圈。默认 `#[ignore]`：无人值守环境会卡在系统钥匙串授权弹窗上，
+    /// 写-读-删一整圈。默认 `#[ignore]`：无人值守环境可能卡在系统凭据库授权弹窗上，
     /// 需要本机手动跑 `cargo test keychain_round_trip -- --ignored`。
     #[test]
-    #[ignore = "会真的读写 macOS 钥匙串，需要人工授权"]
+    #[ignore = "会真的读写系统凭据库，需要人工授权"]
     fn keychain_round_trip() {
         let config = probe_config();
         forget_password(&config);

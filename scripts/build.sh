@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# 一键构建：图标 → 编译 → APP → DMG，产物汇总到 dist/。
+# macOS / Linux 一键构建，产物汇总到 dist/。
 #
 # 产物：
-#   dist/Blip.app   双击启动的 macOS 应用包（Finder / Dock / ⌘Tab 都带图标）
-#   dist/Blip-<version>.dmg   带“应用程序”快捷方式的安装镜像
+#   macOS: dist/Blip.app + dist/Blip-<version>-macos-<arch>.dmg
+#   Linux: dist/Blip-<version>-linux-<arch>.tar.gz
 #
 # 用法：
 #   scripts/build.sh                # release 构建，先清空 dist/（默认）
@@ -68,6 +68,42 @@ DIST="${ROOT}/dist"
 SVG="${ROOT}/assets/icon/macscp-icon.svg"
 ICNS="${ROOT}/assets/icon/AppIcon.icns"
 START=$(date +%s)
+PLATFORM=$(uname -s)
+
+# Linux 直接打包可执行文件；Windows 使用同目录的 build.ps1。
+if [ "${PLATFORM}" = "Linux" ]; then
+  if [ "${CLEAN}" = "1" ] && [ -d "${DIST}" ]; then
+    case "${DIST}" in
+      */dist) rm -rf "${DIST}" ;;
+      *) echo "拒绝清空：${DIST} 不像构建产物目录" >&2; exit 1 ;;
+    esac
+  fi
+  mkdir -p "${DIST}"
+
+  echo "→ cargo build ${PROFILE}"
+  # shellcheck disable=SC2086
+  cargo build --locked ${CARGO_FLAGS}
+
+  ARCH=$(uname -m)
+  ARCHIVE="${DIST}/Blip-${VERSION}-linux-${ARCH}.tar.gz"
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/blip-linux.XXXXXX")
+  trap 'rm -rf "${STAGE}"' EXIT
+  cp "${ROOT}/target/${PROFILE}/blip" "${STAGE}/blip"
+  cp "${ROOT}/README.md" "${STAGE}/README.md"
+  tar -czf "${ARCHIVE}" -C "${STAGE}" blip README.md
+  printf '%s\n' "${VERSION}" > "${VERSION_FILE}"
+
+  ELAPSED=$(( $(date +%s) - START ))
+  echo
+  echo "产物（${PROFILE}，${ELAPSED}s）："
+  du -sh "${ARCHIVE}" | awk -v p="${ARCHIVE}" '{printf "  %-6s %s\n", $1, p}'
+  exit 0
+fi
+
+[ "${PLATFORM}" = "Darwin" ] || {
+  echo "不支持的构建主机：${PLATFORM}；Windows 请运行 scripts/build.ps1" >&2
+  exit 1
+}
 
 # ---- 1. 图标 --------------------------------------------------------------
 # 只在「没有 icns」或「svg 比 icns 新」时重生成：Chrome 渲染 + iconset
@@ -109,7 +145,8 @@ DMG_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/blip-dmg.XXXXXX")
 trap 'rm -rf "${DMG_STAGE}"' EXIT
 cp -R "${DIST}/Blip.app" "${DMG_STAGE}/Blip.app"
 ln -s /Applications "${DMG_STAGE}/Applications"
-DMG="${DIST}/Blip-${VERSION}.dmg"
+MAC_ARCH=$(uname -m)
+DMG="${DIST}/Blip-${VERSION}-macos-${MAC_ARCH}.dmg"
 rm -f "${DMG}"
 if /usr/sbin/diskutil image create from --help >/dev/null 2>&1; then
   /usr/sbin/diskutil image create from --format UDZO --volumeName "Blip" \

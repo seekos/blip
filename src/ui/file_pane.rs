@@ -67,8 +67,8 @@ pub enum FileAction {
     Edit,
     /// 把一个或多个绝对路径复制到系统剪贴板。
     CopyPath,
-    /// 在 Finder 中显示本地条目。
-    RevealInFinder,
+    /// 在系统文件管理器中显示本地条目。
+    RevealInFileManager,
     Rename,
     Delete,
     /// 在当前面板目录下建目录。与右键落在哪一行无关。
@@ -648,7 +648,7 @@ impl FilePane {
             | FileAction::Download
             | FileAction::Edit
             | FileAction::CopyPath
-            | FileAction::RevealInFinder
+            | FileAction::RevealInFileManager
             | FileAction::Rename
             | FileAction::Delete => {
                 let entries = if matches!(
@@ -1223,8 +1223,8 @@ pub fn pane_menu_spec(side: PaneSide, online: bool) -> Vec<MenuSpec> {
 ///
 /// 这里承接了原先工具栏上那一排按钮（上传 / 下载 / 新建目录 / 删除 / 刷新）：
 ///
-/// * 本地：上传 / 编辑 / 在 Finder 中显示 / 复制路径 / 新建目录 / 重命名 /
-///   移到废纸篓 / 刷新；
+/// * 本地：上传 / 编辑 / 在文件管理器中显示 / 复制路径 / 新建目录 / 重命名 /
+///   移到系统回收站 / 刷新；
 /// * 远端：`下载到当前本地目录`（目录则是 `下载文件夹到当前本地目录`）/
 ///   编辑 / 复制路径 / 新建目录 / 重命名 / 永久删除 / 刷新。
 ///
@@ -1275,9 +1275,9 @@ pub fn menu_spec(side: PaneSide, online: bool, entry: &FileEntry) -> Vec<MenuSpe
                     });
                 }
                 items.push(MenuSpec {
-                    label: "在访达中显示",
+                    label: "在文件管理器中显示",
                     icon: IconName::FolderOpen,
-                    action: FileAction::RevealInFinder,
+                    action: FileAction::RevealInFileManager,
                     disabled: false,
                     separator_before: true,
                 });
@@ -1305,7 +1305,7 @@ pub fn menu_spec(side: PaneSide, online: bool, entry: &FileEntry) -> Vec<MenuSpe
                     separator_before: false,
                 });
                 items.push(MenuSpec {
-                    label: "移到废纸篓",
+                    label: "移到系统回收站",
                     icon: IconName::Trash,
                     action: FileAction::Delete,
                     disabled: false,
@@ -1647,14 +1647,24 @@ fn read_local_dir(dir: &Path) -> Result<Vec<FileEntry>, String> {
             kind,
             size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
             modified: meta.as_ref().and_then(|m| m.modified().ok()),
-            mode: meta
-                .as_ref()
-                .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions())),
+            mode: meta.as_ref().and_then(local_file_mode),
         });
     }
 
     sort_entries(&mut entries);
     Ok(entries)
+}
+
+#[cfg(unix)]
+fn local_file_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    Some(metadata.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn local_file_mode(_metadata: &std::fs::Metadata) -> Option<u32> {
+    None
 }
 
 #[cfg(test)]
@@ -2098,11 +2108,11 @@ mod tests {
             [
                 "上传到当前远程目录",
                 "编辑…",
-                "在访达中显示",
+                "在文件管理器中显示",
                 "复制路径",
                 "新建目录…",
                 "重命名…",
-                "移到废纸篓",
+                "移到系统回收站",
                 "刷新列表"
             ]
         );
@@ -2112,7 +2122,7 @@ mod tests {
             [
                 FileAction::Upload,
                 FileAction::Edit,
-                FileAction::RevealInFinder,
+                FileAction::RevealInFileManager,
                 FileAction::CopyPath,
                 FileAction::NewFolder,
                 FileAction::Rename,

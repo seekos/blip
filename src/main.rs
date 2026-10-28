@@ -1,4 +1,4 @@
-//! Blip —— 原生 macOS SFTP 客户端。
+//! Blip —— 原生跨平台 SFTP 客户端。
 //!
 //! 线程模型：
 //! * 主线程 = GPUI（渲染、输入、实体状态）；
@@ -16,10 +16,8 @@ mod update;
 use gpui_kit::*;
 
 fn main() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,blip=debug"),
-    )
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,blip=debug"))
+        .init();
 
     // 注册图标资源：AllAssets 把完整 Lucide 图标集嵌进二进制，
     // 否则所有 IconName 都会渲染成空白。

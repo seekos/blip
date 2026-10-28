@@ -88,7 +88,7 @@ VERSION=${VERSION#v}
 if [ "${DO_BUILD}" = "1" ]; then
   echo "→ cargo build ${PROFILE}"
   # shellcheck disable=SC2086
-  cargo build ${CARGO_FLAGS}
+  cargo build --locked ${CARGO_FLAGS}
 fi
 
 [ -x "${BIN}" ] || { echo "找不到二进制：${BIN}" >&2; exit 1; }

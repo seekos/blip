@@ -1,0 +1,62 @@
+name: 跨平台打包
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - run: test "$(uname -m)" = arm64
+      - run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
+      - run: scripts/build.sh release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64
+          path: dist/*-macos-arm64.dmg
+          if-no-files-found: error
+
+  windows-x86_64:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      - shell: pwsh
+        run: if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") { throw "需要 Windows x64 runner" }
+      - run: rustup toolchain install 1.98.1 --profile minimal; rustup default 1.98.1
+      - shell: pwsh
+        run: .\scripts\build.ps1 -Profile release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64
+          path: dist/*-windows-x86_64.zip
+          if-no-files-found: error
+
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: test "$(uname -m)" = x86_64
+      - run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
+      - name: 安装 Linux 图形依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+      - run: scripts/build.sh release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64
+          path: dist/*-linux-x86_64.tar.gz
+          if-no-files-found: error

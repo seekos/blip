@@ -125,8 +125,7 @@ pub fn scan(root: &Path) -> Result<LocalTree, String> {
 
 /// 相对路径 → POSIX 形式的字符串（`sub/deep`）。
 ///
-/// macOS 的分隔符本来就是 `/`，但这里显式拼一遍，免得将来换平台时
-/// 把 `\` 带进远端路径里。
+/// 显式用 `/` 拼接，避免 Windows 分隔符混入远程 POSIX 路径。
 pub fn relative_to_posix(relative: &Path) -> String {
     relative
         .components()

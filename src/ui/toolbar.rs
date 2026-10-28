@@ -37,6 +37,13 @@ use crate::session::store::{self, SavedAuth, SavedProfile};
 use crate::sftp::types::{AuthMethod, DEFAULT_SSH_PORT, SessionConfig};
 use crate::ui::SessionState;
 
+#[cfg(target_os = "macos")]
+const PASSWORD_STORE_TOOLTIP: &str = "密码会存入 macOS 钥匙串";
+#[cfg(target_os = "windows")]
+const PASSWORD_STORE_TOOLTIP: &str = "密码会存入 Windows 凭据管理器";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const PASSWORD_STORE_TOOLTIP: &str = "密码会存入系统密钥环";
+
 #[derive(Clone, Debug)]
 pub enum ToolbarEvent {
     Connect(SessionConfig),
@@ -88,6 +95,7 @@ pub struct Toolbar {
     /// 用户显式选择的私钥；`None` 时由连接层自动查找默认密钥。
     key_path: Option<PathBuf>,
     /// 下次打开私钥选择器时是否显示隐藏文件；也会跟随选择器内的开关更新。
+    #[cfg(target_os = "macos")]
     show_hidden_key_files: bool,
     choosing_key: bool,
     deploying_key: bool,
@@ -114,6 +122,7 @@ impl Toolbar {
             }),
             password: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("密码")),
             key_path: None,
+            #[cfg(target_os = "macos")]
             show_hidden_key_files: false,
             choosing_key: false,
             deploying_key: false,
@@ -166,7 +175,9 @@ impl Toolbar {
         }
         self.choosing_key = true;
         self.error = None;
+        #[cfg(target_os = "macos")]
         let show_hidden_files = self.show_hidden_key_files;
+        #[cfg(target_os = "macos")]
         let initial_directory = private_key_initial_directory(match purpose {
             KeyPickerPurpose::Private => self.key_path.as_deref(),
             KeyPickerPurpose::Public => None,
@@ -369,7 +380,7 @@ impl Toolbar {
         Ok(())
     }
 
-    /// 直接把一组凭证填进表单（演示模式用），不读也不写钥匙串。
+    /// 直接把一组凭证填进表单（演示模式用），不读也不写系统凭据库。
     #[cfg(feature = "demo-server")]
     #[allow(clippy::too_many_arguments)]
     pub fn fill_credentials(
@@ -423,7 +434,7 @@ impl Toolbar {
         }
     }
 
-    /// 校验表单并组装连接配置。密码留空时回落到钥匙串里的旧密码。
+    /// 校验表单并组装连接配置。密码留空时回落到系统凭据库里的旧密码。
     pub fn build_config(&self, cx: &App) -> Result<SessionConfig, SharedString> {
         let host = self.host.read(cx).value().trim().to_string();
         if host.is_empty() {
@@ -775,7 +786,7 @@ impl Toolbar {
                             .tooltip(match (use_key, self.remember) {
                                 (true, true) => "记住这台主机（私钥路径会保存，口令不会）",
                                 (true, false) => "不保存连接信息",
-                                (false, true) => "密码会存入 macOS 钥匙串",
+                                (false, true) => PASSWORD_STORE_TOOLTIP,
                                 (false, false) => "不保存密码",
                             })
                             .disabled(form_locked)
@@ -831,7 +842,7 @@ impl Render for Toolbar {
         let theme = cx.theme().clone();
         let connection_row = self.render_connection_row(cx);
 
-        // 错误（表单校验 / 钥匙串 / 连接被拒）只在真出错时多占一行：
+        // 错误（表单校验 / 凭据库 / 连接被拒）只在真出错时多占一行：
         // 常态下工具栏就是一条连接栏，不再有第二条操作栏。
         let error_row = self.error.clone().map(|error| {
             h_flex()
@@ -872,6 +883,7 @@ fn expand_tilde(input: &str) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
+#[cfg(target_os = "macos")]
 fn private_key_initial_directory(selected: Option<&std::path::Path>) -> Option<PathBuf> {
     selected
         .and_then(std::path::Path::parent)

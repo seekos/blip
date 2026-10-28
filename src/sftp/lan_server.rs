@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -24,6 +25,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 
 const DEFAULT_PORT: u16 = 2022;
+const USERNAME: &str = "zy";
 const READ_DIR_BATCH: usize = 128;
 
 #[derive(Clone, Debug)]
@@ -31,7 +33,7 @@ pub struct ServerInfo {
     pub host: String,
     pub port: u16,
     pub username: String,
-    pub password: String,
+    password: Arc<RwLock<String>>,
     root: Arc<RwLock<PathBuf>>,
 }
 
@@ -42,6 +44,22 @@ impl ServerInfo {
 
     pub fn command(&self) -> String {
         format!("sftp -P {} {}@{}", self.port, self.username, self.host)
+    }
+
+    pub fn password(&self) -> String {
+        self.password
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn set_password(&self, manual_password: Option<String>) -> Result<(), String> {
+        let password = selected_password(manual_password)?;
+        *self
+            .password
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = password;
+        Ok(())
     }
 
     pub fn root(&self) -> PathBuf {
@@ -62,17 +80,13 @@ impl ServerInfo {
 }
 
 /// 启动内置服务。返回后监听端口已经占好，不存在 UI 先显示、随后端口被抢走的竞态。
-pub fn start(configured_root: Option<PathBuf>) -> Result<ServerInfo, String> {
+pub fn start(
+    configured_root: Option<PathBuf>,
+    manual_password: Option<String>,
+) -> Result<ServerInfo, String> {
     let root = canonical_root(configured_root)?;
-    let username = std::env::var("USER")
-        .ok()
-        .filter(|user| !user.trim().is_empty())
-        .or_else(|| {
-            root.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .ok_or_else(|| "无法确定当前用户名".to_string())?;
-    let password = random_password();
+    let username = USERNAME.to_string();
+    let password = selected_password(manual_password)?;
     let listener = bind_listener(DEFAULT_PORT)?;
     let port = listener
         .local_addr()
@@ -80,6 +94,7 @@ pub fn start(configured_root: Option<PathBuf>) -> Result<ServerInfo, String> {
         .port();
     let key = load_or_create_host_key()?;
 
+    let password = Arc::new(RwLock::new(password));
     let credentials = Arc::new(Credentials {
         username: username.clone(),
         password: password.clone(),
@@ -180,6 +195,14 @@ fn random_password() -> String {
         .collect()
 }
 
+fn selected_password(manual_password: Option<String>) -> Result<String, String> {
+    match manual_password {
+        Some(password) if password.is_empty() => Err("手动密码不能为空".to_string()),
+        Some(password) => Ok(password),
+        None => Ok(random_password()),
+    }
+}
+
 fn load_or_create_host_key() -> Result<PrivateKey, String> {
     let directory = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -196,10 +219,11 @@ fn load_or_create_host_key() -> Result<PrivateKey, String> {
     let encoded = key
         .to_openssh(LineEnding::LF)
         .map_err(|err| format!("无法编码局域网 SFTP 主机密钥：{err}"))?;
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&path)
         .or_else(|err| {
             if err.kind() == ErrorKind::AlreadyExists {
@@ -224,7 +248,7 @@ fn load_or_create_host_key() -> Result<PrivateKey, String> {
 
 struct Credentials {
     username: String,
-    password: String,
+    password: Arc<RwLock<String>>,
 }
 
 #[derive(Clone)]
@@ -255,7 +279,12 @@ impl russh::server::Handler for SshSession {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        if user == self.credentials.username && password == self.credentials.password {
+        let expected = self
+            .credentials
+            .password
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if user == self.credentials.username && password == expected.as_str() {
             Ok(Auth::Accept)
         } else {
             Ok(Auth::reject())
@@ -403,12 +432,23 @@ impl LocalSftp {
                 .map_err(io_status)?;
         }
         if let Some(mode) = attrs.permissions {
-            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
-                .await
-                .map_err(io_status)?;
+            set_path_permissions(path, mode).await?;
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+async fn set_path_permissions(path: &Path, mode: u32) -> Result<(), StatusCode> {
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
+        .await
+        .map_err(io_status)
+}
+
+#[cfg(not(unix))]
+async fn set_path_permissions(_path: &Path, _mode: u32) -> Result<(), StatusCode> {
+    // Windows 没有 POSIX 权限位；文件访问仍由共享根目录与 ACL 约束。
+    Ok(())
 }
 
 fn io_status(error: std::io::Error) -> StatusCode {
@@ -606,9 +646,7 @@ impl russh_sftp::server::Handler for LocalSftp {
         let path = self.resolve_entry(&path)?;
         tokio::fs::create_dir(&path).await.map_err(io_status)?;
         if let Some(mode) = attrs.permissions {
-            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o7777))
-                .await
-                .map_err(io_status)?;
+            set_path_permissions(&path, mode).await?;
         }
         Ok(ok(id))
     }
@@ -664,6 +702,21 @@ mod tests {
             assert_eq!(password.len(), 6);
             assert!(password.bytes().all(|byte| byte.is_ascii_digit()));
         }
+    }
+
+    #[test]
+    fn manual_password_is_used_verbatim() {
+        let info = ServerInfo {
+            host: "127.0.0.1".into(),
+            port: DEFAULT_PORT,
+            username: USERNAME.into(),
+            password: Arc::new(RwLock::new("123456".into())),
+            root: Arc::new(RwLock::new(temp_root("manual-password"))),
+        };
+        info.set_password(Some("my custom password".into()))
+            .expect("设置手动密码");
+        assert_eq!(info.password(), "my custom password");
+        assert!(selected_password(Some(String::new())).is_err());
     }
 
     #[test]
@@ -745,7 +798,7 @@ mod tests {
         let address = listener.local_addr().expect("读取测试端口");
         let credentials = Arc::new(Credentials {
             username: "lan-user".into(),
-            password: "123456".into(),
+            password: Arc::new(RwLock::new("123456".into())),
         });
         let mut server = LanServer {
             credentials,

@@ -28,7 +28,7 @@ impl SessionConfig {
         format!("{}@{}:{}", self.username, self.host, self.port)
     }
 
-    /// Keychain 中的 account 键，保证不同端口的不同主机不会互相覆盖。
+    /// 系统凭据库中的 account 键，保证不同端口的不同主机不会互相覆盖。
     pub fn keyring_account(&self) -> String {
         format!("{}@{}:{}", self.username, self.host, self.port)
     }
