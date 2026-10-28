@@ -23,6 +23,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::discovery::DiscoveryService;
 use crate::session::store::{
     self, AppSettings, LanSftpPasswordMode, RemoteOpenBehavior, SavedAuth, SavedProfile,
 };
@@ -45,12 +46,14 @@ pub struct ScpApp {
     profiles: Vec<SavedProfile>,
     settings: AppSettings,
     lan_server: Result<ServerInfo, SharedString>,
+    _discovery: Option<DiscoveryService>,
     /// 当前这次连接实际使用的配置。密码框可能为空（收藏会从系统凭据库补密码），
     /// 成功后必须保存这里的认证信息，不能再从空白表单反推。
     pending_config: Option<SessionConfig>,
     version: String,
     available_update: Option<AvailableUpdate>,
     _subscriptions: Vec<Subscription>,
+    _discovery_pump: Task<()>,
 }
 
 struct SettingsDraft {
@@ -118,6 +121,34 @@ impl ScpApp {
             );
         }
         let toolbar = cx.new(|cx| Toolbar::new(profiles.clone(), window, cx));
+        let discovery =
+            match crate::discovery::start(lan_server.as_ref().ok().map(|info| info.port)) {
+                Ok(discovery) => Some(discovery),
+                Err(message) => {
+                    log::error!("局域网设备发现启动失败：{message}");
+                    None
+                }
+            };
+        let discovery_events = discovery
+            .as_ref()
+            .map(|discovery| discovery.events().clone());
+        let discovery_pump = cx.spawn(async move |this, cx| {
+            let Some(events) = discovery_events else {
+                return;
+            };
+            while let Ok(devices) = events.recv_async().await {
+                if this
+                    .update(cx, |app, cx| {
+                        app.toolbar.update(cx, |toolbar, cx| {
+                            toolbar.set_discovered_devices(devices, cx)
+                        });
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         // 工作区在构造时就启动 SftpWorker 与事件泵。
         let workspace = cx.new(|cx| Workspace::new(settings.clone(), window, cx));
 
@@ -224,10 +255,12 @@ impl ScpApp {
             profiles,
             settings,
             lan_server,
+            _discovery: discovery,
             pending_config: None,
             version: update::application_version(),
             available_update: None,
             _subscriptions: subscriptions,
+            _discovery_pump: discovery_pump,
         };
 
         app.prefill_last_profile(window, cx);
@@ -1159,6 +1192,18 @@ impl ScpApp {
                                             .map_err(SharedString::from),
                                         };
                                         app.settings = settings.clone();
+                                        if let Some(discovery) = &app._discovery {
+                                            let port = app
+                                                .lan_server
+                                                .as_ref()
+                                                .ok()
+                                                .map(|server| server.port);
+                                            if let Err(message) = discovery.set_port(port) {
+                                                log::warn!(
+                                                    "更新设备发现服务端口失败：{message}"
+                                                );
+                                            }
+                                        }
                                         app.workspace.update(cx, |workspace, cx| {
                                             workspace.set_settings(settings.clone(), cx)
                                         });

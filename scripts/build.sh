@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 #
-# macOS / Linux 一键构建，产物汇总到 dist/。
+# macOS / Linux / Windows 一键构建，产物汇总到 dist/。
 #
 # 产物：
 #   macOS: dist/Blip.app + dist/Blip-<version>-macos-<arch>.dmg
 #   Linux: dist/Blip-<version>-linux-<arch>.tar.gz
+#   Windows: dist/Blip-<version>-windows-<arch>.zip
 #
 # 用法：
-#   scripts/build.sh                # release 构建，先清空 dist/（默认）
-#   scripts/build.sh -v 0.2.0       # 指定 APP 与 DMG 的版本号
-#   scripts/build.sh debug          # debug 构建，快很多，但产物大 3~4 倍
+#   scripts/build.sh                # 当前系统 release 构建，先清空 dist/
+#   scripts/build.sh -v 0.2.0       # 指定版本号
+#   scripts/build.sh debug          # debug 构建
 #   scripts/build.sh --no-clean     # 增量构建，不清空 dist/
-#   scripts/build.sh --no-icon      # 跳过图标检查/重新生成
+#   scripts/build.sh --no-icon      # macOS 跳过图标检查
 #
 set -euo pipefail
 
@@ -37,7 +38,7 @@ while [ $# -gt 0 ]; do
     --no-clean)    CLEAN=0 ;;
     --no-icon)     WITH_ICON=0 ;;
     -h|--help)
-      sed -n '9,14p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '10,15p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -70,16 +71,20 @@ ICNS="${ROOT}/assets/icon/AppIcon.icns"
 START=$(date +%s)
 PLATFORM=$(uname -s)
 
-# Linux 直接打包可执行文件；Windows 使用同目录的 build.ps1。
-if [ "${PLATFORM}" = "Linux" ]; then
-  if [ "${CLEAN}" = "1" ] && [ -d "${DIST}" ]; then
-    case "${DIST}" in
-      */dist) rm -rf "${DIST}" ;;
-      *) echo "拒绝清空：${DIST} 不像构建产物目录" >&2; exit 1 ;;
-    esac
+# 三个平台共用清理与版本逻辑，以下只处理编译产物格式差异。
+if [ "${CLEAN}" = "1" ]; then
+  case "${DIST}" in
+    */dist) ;;
+    *) echo "拒绝清空：${DIST} 不像构建产物目录" >&2; exit 1 ;;
+  esac
+  if [ -d "${DIST}" ]; then
+    echo "→ 清空 dist/"
+    rm -rf "${DIST}"
   fi
-  mkdir -p "${DIST}"
+fi
+mkdir -p "${DIST}"
 
+if [ "${PLATFORM}" = "Linux" ]; then
   echo "→ cargo build ${PROFILE}"
   # shellcheck disable=SC2086
   cargo build --locked ${CARGO_FLAGS}
@@ -100,8 +105,43 @@ if [ "${PLATFORM}" = "Linux" ]; then
   exit 0
 fi
 
+case "${PLATFORM}" in
+  MINGW*|MSYS*|CYGWIN*)
+    command -v cygpath >/dev/null 2>&1 \
+      || { echo "Windows 打包请在 Git Bash 中运行" >&2; exit 1; }
+    command -v powershell.exe >/dev/null 2>&1 \
+      || { echo "找不到 Windows PowerShell" >&2; exit 1; }
+
+    echo "→ cargo build ${PROFILE}"
+    # shellcheck disable=SC2086
+    cargo build --locked ${CARGO_FLAGS}
+
+    ARCH=$(uname -m)
+    [ "${ARCH}" = "x86_64" ] || { echo "当前只打包 Windows x64" >&2; exit 1; }
+    ARCHIVE="${DIST}/Blip-${VERSION}-windows-x86_64.zip"
+    STAGE=$(mktemp -d "${TMPDIR:-/tmp}/blip-windows.XXXXXX")
+    trap 'rm -rf "${STAGE}"' EXIT
+    cp "${ROOT}/target/${PROFILE}/blip.exe" "${STAGE}/Blip.exe"
+    cp "${ROOT}/README.md" "${STAGE}/README.md"
+
+    BLIP_STAGE_WIN=$(cygpath -w "${STAGE}")
+    BLIP_ARCHIVE_WIN=$(cygpath -w "${ARCHIVE}")
+    export BLIP_STAGE_WIN BLIP_ARCHIVE_WIN
+    powershell.exe -NoProfile -NonInteractive -Command \
+      '$files = @((Join-Path $env:BLIP_STAGE_WIN "Blip.exe"), (Join-Path $env:BLIP_STAGE_WIN "README.md")); Compress-Archive -LiteralPath $files -DestinationPath $env:BLIP_ARCHIVE_WIN -Force' \
+      >/dev/null
+    printf '%s\n' "${VERSION}" > "${VERSION_FILE}"
+
+    ELAPSED=$(( $(date +%s) - START ))
+    echo
+    echo "产物（${PROFILE}，${ELAPSED}s）："
+    du -sh "${ARCHIVE}" | awk -v p="${ARCHIVE}" '{printf "  %-6s %s\n", $1, p}'
+    exit 0
+    ;;
+esac
+
 [ "${PLATFORM}" = "Darwin" ] || {
-  echo "不支持的构建主机：${PLATFORM}；Windows 请运行 scripts/build.ps1" >&2
+  echo "不支持的构建主机：${PLATFORM}" >&2
   exit 1
 }
 
@@ -118,29 +158,11 @@ if [ "${WITH_ICON}" = "1" ]; then
   fi
 fi
 
-# ---- 2. 清理（默认开启） --------------------------------------------------
-# 默认清空，是为了让 dist/ 里永远只有「这一次构建」的产物 —— 否则
-# release 和 debug 交替构建时，残留的旧 .app 很容易被误当成新的。
-# 只要增量重打包（比如只改了 Info.plist 想快一点）就加 --no-clean。
-if [ "${CLEAN}" = "1" ]; then
-  # 只允许删 <repo>/dist。万一以后有人改 DIST 或从别处 source 这个脚本，
-  # 一句 rm -rf 就能把无关目录端掉 —— 这里必须挡一道。
-  case "${DIST}" in
-    */dist) ;;
-    *) echo "拒绝清空：${DIST} 不像构建产物目录（应以 /dist 结尾）" >&2; exit 1 ;;
-  esac
-  if [ -d "${DIST}" ]; then
-    echo "→ 清空 dist/"
-    rm -rf "${DIST}"
-  fi
-fi
-mkdir -p "${DIST}"
-
-# ---- 3. 编译 + 打包 -------------------------------------------------------
+# ---- 2. 编译 + 打包 -------------------------------------------------------
 # 编译交给 bundle.sh（它会跑 cargo build），这里不再单独 build 一次。
 "${ROOT}/scripts/bundle.sh" "${PROFILE}" --out "${DIST}" --version "${VERSION}"
 
-# ---- 4. DMG ---------------------------------------------------------------
+# ---- 3. DMG ---------------------------------------------------------------
 DMG_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/blip-dmg.XXXXXX")
 trap 'rm -rf "${DMG_STAGE}"' EXIT
 cp -R "${DIST}/Blip.app" "${DMG_STAGE}/Blip.app"
@@ -159,7 +181,7 @@ rm -rf "${DMG_STAGE}"
 trap - EXIT
 printf '%s\n' "${VERSION}" > "${VERSION_FILE}"
 
-# ---- 5. 汇总 --------------------------------------------------------------
+# ---- 4. 汇总 --------------------------------------------------------------
 ELAPSED=$(( $(date +%s) - START ))
 
 echo

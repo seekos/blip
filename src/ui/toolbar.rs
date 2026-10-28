@@ -33,6 +33,7 @@ use objc2_app_kit::{
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL, ns_string};
 
+use crate::discovery::DiscoveredDevice;
 use crate::session::store::{self, SavedAuth, SavedProfile};
 use crate::sftp::types::{AuthMethod, DEFAULT_SSH_PORT, SessionConfig};
 use crate::ui::SessionState;
@@ -102,6 +103,7 @@ pub struct Toolbar {
     /// 加密私钥的口令。只在私钥模式下显示，且**从不落盘**。
     key_passphrase: Entity<InputState>,
     profiles: Vec<SavedProfile>,
+    discovered_devices: Vec<DiscoveredDevice>,
     use_key: bool,
     remember: bool,
     state: SessionState,
@@ -132,6 +134,7 @@ impl Toolbar {
                     .placeholder("口令（可选）")
             }),
             profiles,
+            discovered_devices: Vec::new(),
             use_key: false,
             remember: true,
             state: SessionState::Disconnected,
@@ -298,6 +301,15 @@ impl Toolbar {
         cx.notify();
     }
 
+    pub fn set_discovered_devices(
+        &mut self,
+        devices: Vec<DiscoveredDevice>,
+        cx: &mut Context<Self>,
+    ) {
+        self.discovered_devices = devices;
+        cx.notify();
+    }
+
     /// 用上次成功的连接回填表单。
     pub fn prefill(&mut self, profile: &SavedProfile, window: &mut Window, cx: &mut Context<Self>) {
         let host = profile.host.clone();
@@ -335,6 +347,30 @@ impl Toolbar {
         }
         self.prefill(profile, window, cx);
         self.start_connect(cx);
+    }
+
+    fn select_discovered_device(
+        &mut self,
+        device: &DiscoveredDevice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state != SessionState::Disconnected {
+            return;
+        }
+        self.use_key = false;
+        self.error = None;
+        self.host.update(cx, |state, cx| {
+            state.set_value(device.address.to_string(), window, cx)
+        });
+        self.port.update(cx, |state, cx| {
+            state.set_value(device.port.to_string(), window, cx)
+        });
+        self.username
+            .update(cx, |state, cx| state.set_value("zy", window, cx));
+        self.password
+            .update(cx, |state, cx| state.set_value(String::new(), window, cx));
+        cx.notify();
     }
 
     fn start_connect(&mut self, cx: &mut Context<Self>) {
@@ -506,7 +542,10 @@ impl Toolbar {
         let form_locked = connected || connecting;
         let use_key = self.use_key;
         let profiles = self.profiles.clone();
+        let discovered_devices = self.discovered_devices.clone();
+        let discovered_count = discovered_devices.len();
         let toolbar = cx.entity().downgrade();
+        let devices_toolbar = toolbar.clone();
 
         let password_or_key = if use_key {
             let choosing_key = self.choosing_key;
@@ -686,6 +725,55 @@ impl Toolbar {
                                             });
                                         },
                                     ),
+                                )
+                            },
+                        )
+                    }),
+            )
+            .child(
+                Button::new("discovered-devices")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Radar)
+                    .when(discovered_count > 0, |this| {
+                        this.label(SharedString::from(discovered_count.to_string()))
+                    })
+                    .accessibility_label(SharedString::from(format!(
+                        "局域网在线设备，当前 {discovered_count} 台"
+                    )))
+                    .tooltip(SharedString::from(if discovered_count == 0 {
+                        "正在通过 UDP 与 mDNS 查找局域网设备".to_string()
+                    } else {
+                        format!("发现 {discovered_count} 台局域网设备")
+                    }))
+                    .dropdown_menu(move |menu, _window, _cx| {
+                        if discovered_devices.is_empty() {
+                            return menu.min_w(px(220.)).item(
+                                PopupMenuItem::new("暂无在线设备，正在持续查找").disabled(true),
+                            );
+                        }
+
+                        discovered_devices.iter().fold(
+                            menu.min_w(px(280.)).max_h(px(320.)).scrollable(true),
+                            |menu, device| {
+                                let device = device.clone();
+                                let device_toolbar = devices_toolbar.clone();
+                                let label = format!(
+                                    "{} · {}:{}",
+                                    device.hostname, device.address, device.port
+                                );
+                                menu.item(
+                                    PopupMenuItem::new(label)
+                                        .icon(IconName::Laptop)
+                                        .disabled(form_locked)
+                                        .on_click(move |_, window, cx| {
+                                            let device = device.clone();
+                                            let _ = device_toolbar.update(cx, |toolbar, cx| {
+                                                toolbar
+                                                    .select_discovered_device(&device, window, cx)
+                                            });
+                                            window.dispatch_action(Box::new(Cancel), cx);
+                                        }),
                                 )
                             },
                         )

@@ -8,6 +8,7 @@
 mod app;
 #[cfg(feature = "demo-server")]
 mod demo;
+mod discovery;
 mod session;
 mod sftp;
 mod ui;

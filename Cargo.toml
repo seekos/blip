@@ -53,6 +53,10 @@ sha2 = "0.10"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 libc = "0.2"
 rand = "0.10"
+gethostname = "1"
+mdns-sd = "0.21"
+netdev = { version = "0.47", default-features = false }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # macOS-only integration. Dock 图标：裸二进制（`cargo run`）没有 bundle，Dock 里只能靠运行时
 # `NSApplication.setApplicationIconImage` 换成自己的图标。

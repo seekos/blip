@@ -62,6 +62,29 @@ Blip 启动时会同时启动一个局域网 SFTP 服务，默认监听 `2022` �
 允许访问该共享目录以内的文件，退出 Blip 后自动停止。默认的 6 位随机密码适合可信局域网内的临时传输，
 不应把该端口直接暴露到公网。
 
+### 自动发现同一局域网里的 Blip
+
+连接栏的雷达按钮会列出在线的 Blip 设备，选择一项即可回填 IP、端口和用户名。每台设备
+首次启动时生成并持久化一个 UUID；设备名称来自系统主机名，不会在广播里携带密码。
+
+发现同时走两条链路：
+
+- **UDP 定向广播**：监听 `1985/UDP`，每 3 秒重新枚举所有 `Up`、非回环且支持广播的 IPv4 网卡，
+  由每个网卡的 IP 和掩码计算定向广播地址，再绑定该网卡源 IP 发送 JSON 心跳；连续 10 秒
+  未收到心跳即离线。这样不会因为 Windows 的默认路由或虚拟网卡而把所有广播发到同一路径。
+- **mDNS / DNS-SD**：同时注册并浏览 `_blip-sftp._tcp.local.`，由标准服务记录携带 UUID、
+  主机名和 SFTP 端口。它的代码和协议更标准，在支持 Bonjour/Avahi 的网络里很稳定；但企业
+  Wi-Fi、访客网络、VPN 或防火墙可能禁用组播，所以不单独依赖它。
+
+两条链路发现的结果按 UUID 合并。若列表一直为空，请允许 Blip 访问本地网络，并放行
+`1985/UDP` 和 mDNS 的 `5353/UDP`；启用客户端隔离的无线网络本身不允许设备互相发现。
+
+Blip 支持同时打开多个传输窗口，但整台电脑只运行一套自动发现：第一个实例负责 UDP/mDNS，
+其它实例通过仅监听 `127.0.0.1` 的本机协调通道共享同一份在线设备列表，各自的连接与传输
+队列仍完全独立。负责发现的实例退出后，存活的其它实例会自动接管。局域网中只广播当前
+发现负责实例的内置 SFTP 端口；其它实例因端口占用而启用的随机 SFTP 端口仍可手动连接，
+不会重复注册成同一台设备。
+
 ## 一个文件夹，也只是一项任务
 
 文件夹里有 5 个文件，还是 500 个文件，传输队列都只显示一项任务。进度按整批汇总，
@@ -130,7 +153,7 @@ Blip 使用 GPUI Kit 构建界面，SSH/SFTP 操作则运行在独立 Tokio 线�
 ## 构建与测试
 
 ```bash
-scripts/build.sh                # macOS: .app/.dmg；Linux: .tar.gz
+scripts/build.sh                # macOS、Linux、Windows 使用同一入口
 scripts/build.sh -v 0.2.0       # 指定本次构建版本；下次构建会沿用
 cargo test --all-features       # 运行完整测试
 ```
@@ -144,12 +167,16 @@ GitHub Actions 会在三个原生构建环境中并行生成发布包：
 可在 Actions 中手动运行“跨平台打包”，推送 `v*` 标签时也会自动执行。Windows release
 必须使用 Windows SDK 的 `fxc.exe` 编译 GPUI 着色器，因此不能从 macOS 直接交叉生成可靠的发布包。
 
-Windows 请使用 PowerShell：
+Windows 请安装 Rust、Visual Studio C++ Build Tools、Windows SDK 和 Git for Windows，
+然后在 Git Bash 中执行：
 
-```powershell
-.\scripts\build.ps1
-.\scripts\build.ps1 -Version 0.2.0
+```bash
+./scripts/build.sh
+./scripts/build.sh -v 0.2.0
 ```
+
+脚本只用一条内置 PowerShell 命令生成 ZIP，不加载 `.ps1` 文件，因此不受 PowerShell
+`AllSigned` 执行策略限制。
 
 应用会在最右下角显示版本号，并在启动后异步检查 GitHub Releases。发现新版本时会用应用内
 模态框提示，可直接打开发布页下载当前平台的新版本；检查失败不会影响连接和传输。

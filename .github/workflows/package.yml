@@ -27,11 +27,12 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v7
-      - shell: pwsh
-        run: if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") { throw "需要 Windows x64 runner" }
-      - run: rustup toolchain install 1.98.1 --profile minimal; rustup default 1.98.1
-      - shell: pwsh
-        run: .\scripts\build.ps1 -Profile release
+      - shell: bash
+        run: test "$PROCESSOR_ARCHITECTURE" = AMD64
+      - shell: bash
+        run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
+      - shell: bash
+        run: scripts/build.sh release
       - uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64
