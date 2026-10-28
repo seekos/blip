@@ -47,6 +47,10 @@ pub enum WorkspaceEvent {
     /// 会话状态变化。**只从事件泵方向发出**：工具栏自己发起的
     /// 「连接中 / 已断开」不会再回传给它（那时它正被更新，重入会 panic）。
     SessionStateChanged(SessionState),
+    PublicKeyInstalled {
+        private_key: PathBuf,
+    },
+    PublicKeyInstallFailed(SharedString),
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -341,6 +345,24 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn install_public_key(
+        &mut self,
+        public_key: PathBuf,
+        private_key: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state != SessionState::Connected {
+            cx.emit(WorkspaceEvent::PublicKeyInstallFailed(
+                "请先使用密码连接服务器".into(),
+            ));
+            return;
+        }
+        self.worker.send(SftpCommand::InstallPublicKey {
+            public_key,
+            private_key,
+        });
+    }
+
     /// 连接成功后启用两个面板，并让远端面板进入恢复目录的加载态。
     fn go_live(&mut self, path: String, cx: &mut Context<Self>) {
         self.local.update(cx, |pane, cx| {
@@ -402,6 +424,7 @@ impl Workspace {
                 self.state = SessionState::Connected;
                 self.home = Some(home.clone());
                 self.last_error = None;
+                self.transfers.update(cx, |queue, cx| queue.clear_all(cx));
 
                 let remembered = self.remote_endpoint.as_ref().and_then(|(host, username)| {
                     self.directory_history
@@ -619,6 +642,22 @@ impl Workspace {
                 }
             }
 
+            SftpEvent::PublicKeyInstalled {
+                private_key,
+                already_present,
+            } => {
+                cx.emit(WorkspaceEvent::PublicKeyInstalled { private_key });
+                self.toast(
+                    window,
+                    cx,
+                    Notification::success(if already_present {
+                        "公钥已在服务器上，已切换为密钥登录"
+                    } else {
+                        "公钥部署成功，已切换为密钥登录"
+                    }),
+                );
+            }
+
             SftpEvent::Notice(message) => {
                 self.toast(window, cx, Notification::success(message));
                 // 建目录/删除/重命名之后刷新当前远端目录。
@@ -648,6 +687,11 @@ impl Workspace {
                             edit.saving = false;
                             edit.error = Some(SharedString::from(message.clone()));
                         }
+                    }
+                    ErrorContext::InstallPublicKey => {
+                        cx.emit(WorkspaceEvent::PublicKeyInstallFailed(SharedString::from(
+                            message.clone(),
+                        )));
                     }
                     // 批量删除可能部分成功；即使最终事件是错误，也要反映已删除的条目。
                     ErrorContext::Remove => self.reload_remote(cx),

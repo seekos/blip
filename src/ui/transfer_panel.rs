@@ -186,6 +186,11 @@ impl TransferQueue {
         cx.notify();
     }
 
+    pub fn clear_all(&mut self, cx: &mut Context<Self>) {
+        self.items.clear();
+        cx.notify();
+    }
+
     /// 移除单条任务（演示行也能删）。
     ///
     /// 真实进行中的任务不在这里处理：它归 worker 管，得先取消，
@@ -457,5 +462,20 @@ mod tests {
         let queue = TransferQueue::new();
         assert_eq!(queue.summary(), (0, 0));
         assert!(queue.items.is_empty(), "不该有任何预置的假任务");
+    }
+
+    #[::gpui::test]
+    fn clear_all_removes_active_and_finished_items(cx: &mut gpui::TestAppContext) {
+        let queue = cx.update(|cx| cx.new(|_| TransferQueue::new()));
+        cx.update(|cx| {
+            queue.update(cx, |queue, cx| {
+                queue.enqueue(1, "active".into(), TransferDirection::Upload, 10, cx);
+                queue.enqueue(2, "finished".into(), TransferDirection::Download, 20, cx);
+                queue.finished(2, TransferOutcome::Completed, cx);
+                queue.clear_all(cx);
+            });
+        });
+
+        assert_eq!(cx.update(|cx| queue.read(cx).summary()), (0, 0));
     }
 }

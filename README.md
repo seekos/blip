@@ -118,9 +118,13 @@ macscp 使用 GPUI Kit 构建界面，SSH/SFTP 操作则运行在独立 Tokio �
 ## 构建与测试
 
 ```bash
-scripts/build.sh                # 生成 dist/macscp.app 和裸二进制
+scripts/build.sh                # 生成 dist/macscp.app 和 dist/macscp-<version>.dmg
+scripts/build.sh -v 0.2.0       # 指定本次构建版本；下次构建会沿用
 cargo test --all-features       # 运行完整测试
 ```
+
+应用会在最右下角显示版本号，并在启动后异步检查 GitHub Releases。发现新版本时会用应用内
+模态框提示，可直接打开发布页下载新版 DMG；检查失败不会影响连接和传输。
 
 测试覆盖真实进程内 SSH/SFTP 协议链路、文件与目录传输、断点续传、取消、冲突处理及路径
 逃逸防护。

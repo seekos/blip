@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use gpui_kit::component::{
-    ActiveTheme as _, WindowExt as _,
+    ActiveTheme as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     notification::Notification,
@@ -29,6 +29,7 @@ use crate::ui::file_pane::FilePane;
 use crate::ui::toolbar::{Toolbar, ToolbarEvent};
 use crate::ui::transfer_panel::TransferQueue;
 use crate::ui::workspace::{Workspace, WorkspaceEvent};
+use crate::update::{self, AvailableUpdate};
 
 pub struct ScpApp {
     toolbar: Entity<Toolbar>,
@@ -42,6 +43,8 @@ pub struct ScpApp {
     /// 当前这次连接实际使用的配置。密码框可能为空（收藏会从钥匙串补密码），
     /// 成功后必须保存这里的认证信息，不能再从空白表单反推。
     pending_config: Option<SessionConfig>,
+    version: String,
+    available_update: Option<AvailableUpdate>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -118,6 +121,14 @@ impl ScpApp {
                         .update(cx, |workspace, cx| workspace.disconnect(cx));
                     window.set_window_title("macscp");
                 }
+                ToolbarEvent::InstallPublicKey {
+                    public_key,
+                    private_key,
+                } => {
+                    app.workspace.update(cx, |workspace, cx| {
+                        workspace.install_public_key(public_key.clone(), private_key.clone(), cx)
+                    });
+                }
                 ToolbarEvent::ProfilesChanged(profiles) => {
                     app.profiles = profiles.clone();
                 }
@@ -130,30 +141,44 @@ impl ScpApp {
             &workspace,
             window,
             |app, _workspace, event: &WorkspaceEvent, window, cx| {
-                let WorkspaceEvent::SessionStateChanged(state) = event;
-                let state = *state;
-                // 连接失败的原因（认证被拒、私钥口令错、超时…）要出现在表单旁边，
-                // 只塞进底部状态栏等于没告诉用户。
-                let last_error = app.workspace.read(cx).last_error();
+                match event {
+                    WorkspaceEvent::SessionStateChanged(state) => {
+                        let state = *state;
+                        // 连接失败的原因（认证被拒、私钥口令错、超时…）要出现在表单旁边，
+                        // 只塞进底部状态栏等于没告诉用户。
+                        let last_error = app.workspace.read(cx).last_error();
 
-                app.toolbar.update(cx, |toolbar, cx| {
-                    toolbar.set_state(state, cx);
-                    if state == SessionState::Connected {
-                        toolbar.set_error(None, cx);
-                    } else if let Some(error) = last_error {
-                        toolbar.set_error(Some(error), cx);
+                        app.toolbar.update(cx, |toolbar, cx| {
+                            toolbar.set_state(state, cx);
+                            if state == SessionState::Connected {
+                                toolbar.set_error(None, cx);
+                            } else if let Some(error) = last_error {
+                                toolbar.set_error(Some(error), cx);
+                            }
+                        });
+
+                        // 标题栏跟着会话状态走：`macscp — user@host`。
+                        app.sync_window_title(window, cx);
+
+                        // 连接成功才落盘凭证，避免把错误密码写进钥匙串。
+                        if state == SessionState::Connected {
+                            app.persist_profile(cx);
+                        } else if state == SessionState::Disconnected {
+                            // 认证失败、超时或主动断开后，绝不能把这份配置用于下一次成功事件。
+                            app.pending_config = None;
+                        }
                     }
-                });
-
-                // 标题栏跟着会话状态走：`macscp — user@host`。
-                app.sync_window_title(window, cx);
-
-                // 连接成功才落盘凭证，避免把错误密码写进钥匙串。
-                if state == SessionState::Connected {
-                    app.persist_profile(cx);
-                } else if state == SessionState::Disconnected {
-                    // 认证失败、超时或主动断开后，绝不能把这份配置用于下一次成功事件。
-                    app.pending_config = None;
+                    WorkspaceEvent::PublicKeyInstalled { private_key } => {
+                        app.toolbar.update(cx, |toolbar, cx| {
+                            toolbar.finish_public_key_install(Ok(private_key.clone()), cx)
+                        });
+                        app.persist_installed_key(private_key, cx);
+                    }
+                    WorkspaceEvent::PublicKeyInstallFailed(message) => {
+                        app.toolbar.update(cx, |toolbar, cx| {
+                            toolbar.finish_public_key_install(Err(message.clone()), cx)
+                        });
+                    }
                 }
             },
         ));
@@ -167,12 +192,94 @@ impl ScpApp {
             profiles,
             settings,
             pending_config: None,
+            version: update::application_version(),
+            available_update: None,
             _subscriptions: subscriptions,
         };
 
         app.prefill_last_profile(window, cx);
         app.sync_window_title(window, cx);
+        app.check_for_updates(cx);
         app
+    }
+
+    fn check_for_updates(&self, cx: &mut Context<Self>) {
+        let current_version = self.version.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { update::check_latest_release(&current_version) })
+                .await;
+            match result {
+                Ok(Some(available)) => {
+                    let _ = this.update_in(cx, |app, window, cx| {
+                        app.available_update = Some(available);
+                        if !window.has_active_dialog(cx) {
+                            app.open_update_dialog(window, cx);
+                        }
+                        cx.notify();
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => log::debug!("自动检查更新失败：{error}"),
+            }
+        })
+        .detach();
+    }
+
+    fn open_update_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(available) = self.available_update.clone() else {
+            return;
+        };
+        let release_url = available.release_url.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let release_url = release_url.clone();
+            dialog
+                .title("发现新版本")
+                .w(px(440.))
+                .overlay_closable(false)
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div().text_sm().child(SharedString::from(format!(
+                                "macscp {} 已发布，当前版本为 {}。",
+                                available.version, available.current_version
+                            ))),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(_cx.theme().muted_foreground)
+                                .child("将打开 GitHub Releases 下载新版 DMG，安装时把 macscp 拖入“应用程序”即可完成升级。"),
+                        ),
+                )
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("update-later")
+                                .label("稍后")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("update-download")
+                                .primary()
+                                .label("下载升级")
+                                .on_click(move |_, window, cx| {
+                                    match update::open_release_page(&release_url) {
+                                        Ok(()) => window.close_dialog(cx),
+                                        Err(error) => window.push_notification(
+                                            Notification::error(format!(
+                                                "无法打开更新页面：{error}"
+                                            )),
+                                            cx,
+                                        ),
+                                    }
+                                }),
+                        ),
+                )
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -186,7 +293,7 @@ impl ScpApp {
     /// 配置里塞一堆 `tester@127.0.0.1:<随机端口>`，下次启动还会被
     /// `prefill` 填回表单。
     fn persist_profile(&mut self, cx: &mut Context<Self>) {
-        let Some(config) = self.pending_config.take() else {
+        let Some(config) = self.pending_config.clone() else {
             log::warn!("连接成功但缺少实际连接配置，跳过收藏持久化");
             return;
         };
@@ -229,6 +336,44 @@ impl ScpApp {
             .update(cx, |toolbar, cx| toolbar.set_profiles(profiles, cx));
         if let Err(err) = store::save_profiles(&self.profiles) {
             log::warn!("保存连接配置失败：{err}");
+        }
+    }
+
+    fn persist_installed_key(&mut self, private_key: &std::path::Path, cx: &mut Context<Self>) {
+        let Some(config) = self.pending_config.as_ref() else {
+            self.toolbar.update(cx, |toolbar, cx| {
+                toolbar.set_error(Some("公钥已部署，但无法更新本地连接配置".into()), cx)
+            });
+            return;
+        };
+        if !self.toolbar.read(cx).snapshot(cx).remember {
+            return;
+        }
+
+        store::upsert_profile(
+            &mut self.profiles,
+            SavedProfile {
+                host: config.host.clone(),
+                port: config.port,
+                username: config.username.clone(),
+                auth: SavedAuth::Key {
+                    path: private_key.to_string_lossy().to_string(),
+                },
+            },
+        );
+        let profiles = self.profiles.clone();
+        self.toolbar
+            .update(cx, |toolbar, cx| toolbar.set_profiles(profiles, cx));
+        if let Err(err) = store::save_profiles(&self.profiles) {
+            log::warn!("保存密钥连接配置失败：{err}");
+            self.toolbar.update(cx, |toolbar, cx| {
+                toolbar.set_error(
+                    Some(SharedString::from(format!(
+                        "公钥已部署，但保存连接配置失败：{err}"
+                    ))),
+                    cx,
+                )
+            });
         }
     }
 
@@ -576,6 +721,21 @@ impl ScpApp {
                         "空闲".to_string()
                     })),
             )
+            .child(if self.available_update.is_some() {
+                Button::new("app-version")
+                    .link()
+                    .xsmall()
+                    .compact()
+                    .label(SharedString::from(format!("v{} · 可升级", self.version)))
+                    .tooltip("打开版本更新")
+                    .on_click(cx.listener(|app, _, window, cx| app.open_update_dialog(window, cx)))
+                    .into_any_element()
+            } else {
+                div()
+                    .flex_shrink_0()
+                    .child(SharedString::from(format!("v{}", self.version)))
+                    .into_any_element()
+            })
             .into_any_element()
     }
 }

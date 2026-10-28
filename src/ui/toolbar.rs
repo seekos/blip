@@ -41,6 +41,10 @@ use crate::ui::SessionState;
 pub enum ToolbarEvent {
     Connect(SessionConfig),
     Disconnect,
+    InstallPublicKey {
+        public_key: PathBuf,
+        private_key: PathBuf,
+    },
     ProfilesChanged(Vec<SavedProfile>),
     OpenSettings,
 }
@@ -54,6 +58,28 @@ pub struct ConnectionSnapshot {
     pub remember: bool,
 }
 
+#[derive(Clone, Copy)]
+enum KeyPickerPurpose {
+    Private,
+    Public,
+}
+
+impl KeyPickerPurpose {
+    fn prompt(self) -> &'static str {
+        match self {
+            Self::Private => "选择 SSH 私钥文件",
+            Self::Public => "选择要部署的 SSH 公钥文件",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Private => "私钥文件",
+            Self::Public => "公钥文件",
+        }
+    }
+}
+
 pub struct Toolbar {
     host: Entity<InputState>,
     port: Entity<InputState>,
@@ -64,6 +90,7 @@ pub struct Toolbar {
     /// 下次打开私钥选择器时是否显示隐藏文件；也会跟随选择器内的开关更新。
     show_hidden_key_files: bool,
     choosing_key: bool,
+    deploying_key: bool,
     /// 加密私钥的口令。只在私钥模式下显示，且**从不落盘**。
     key_passphrase: Entity<InputState>,
     profiles: Vec<SavedProfile>,
@@ -89,6 +116,7 @@ impl Toolbar {
             key_path: None,
             show_hidden_key_files: false,
             choosing_key: false,
+            deploying_key: false,
             key_passphrase: cx.new(|cx| {
                 InputState::new(window, cx)
                     .masked(true)
@@ -104,9 +132,148 @@ impl Toolbar {
 
     pub fn set_state(&mut self, state: SessionState, cx: &mut Context<Self>) {
         self.state = state;
+        if state != SessionState::Connected {
+            self.choosing_key = false;
+            self.deploying_key = false;
+        }
         if state != SessionState::Disconnected {
             self.error = None;
         }
+        cx.notify();
+    }
+
+    pub fn finish_public_key_install(
+        &mut self,
+        result: Result<PathBuf, SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.choosing_key = false;
+        self.deploying_key = false;
+        match result {
+            Ok(private_key) => {
+                self.use_key = true;
+                self.key_path = Some(private_key);
+                self.error = None;
+            }
+            Err(message) => self.error = Some(message),
+        }
+        cx.notify();
+    }
+
+    fn pick_key(&mut self, purpose: KeyPickerPurpose, cx: &mut Context<Self>) {
+        if self.choosing_key || self.deploying_key {
+            return;
+        }
+        self.choosing_key = true;
+        self.error = None;
+        let show_hidden_files = self.show_hidden_key_files;
+        let initial_directory = private_key_initial_directory(match purpose {
+            KeyPickerPurpose::Private => self.key_path.as_deref(),
+            KeyPickerPurpose::Public => None,
+        });
+        cx.notify();
+
+        #[cfg(target_os = "macos")]
+        let receiver = prompt_for_key_file(
+            purpose.prompt(),
+            show_hidden_files,
+            initial_directory.as_deref(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(purpose.prompt().into()),
+        });
+
+        let entity = cx.entity().downgrade();
+        #[cfg(target_os = "macos")]
+        cx.spawn(async move |_this, cx| match receiver.recv_async().await {
+            Ok(Ok(selection)) => {
+                let _ = entity.update(cx, |toolbar, cx| {
+                    toolbar.show_hidden_key_files = selection.show_hidden_files;
+                    toolbar.accept_key_selection(purpose, selection.path, cx);
+                });
+            }
+            Ok(Err(message)) => {
+                let _ = entity.update(cx, |toolbar, cx| toolbar.fail_key_selection(message, cx));
+            }
+            Err(_) => {
+                let _ = entity.update(cx, |toolbar, cx| {
+                    toolbar.fail_key_selection(
+                        format!("{}选择器意外关闭，请重试", purpose.label()),
+                        cx,
+                    )
+                });
+            }
+        })
+        .detach();
+
+        #[cfg(not(target_os = "macos"))]
+        cx.spawn(async move |_this, cx| match receiver.await {
+            Ok(Ok(paths)) => {
+                let path = paths.and_then(|paths| paths.into_iter().next());
+                let _ = entity.update(cx, |toolbar, cx| {
+                    toolbar.accept_key_selection(purpose, path, cx)
+                });
+            }
+            Ok(Err(err)) => {
+                let _ = entity.update(cx, |toolbar, cx| {
+                    toolbar.fail_key_selection(format!("无法选择{}：{err}", purpose.label()), cx)
+                });
+            }
+            Err(_) => {
+                let _ = entity.update(cx, |toolbar, cx| {
+                    toolbar.fail_key_selection(
+                        format!("{}选择器意外关闭，请重试", purpose.label()),
+                        cx,
+                    )
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn accept_key_selection(
+        &mut self,
+        purpose: KeyPickerPurpose,
+        path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.choosing_key = false;
+        let Some(path) = path else {
+            cx.notify();
+            return;
+        };
+        match purpose {
+            KeyPickerPurpose::Private => {
+                self.key_path = Some(path);
+                self.error = None;
+            }
+            KeyPickerPurpose::Public => {
+                if self.state != SessionState::Connected {
+                    self.error = Some("连接已断开，请重新连接后部署公钥".into());
+                } else {
+                    match deployment_key_pair(&path) {
+                        Ok(private_key) => {
+                            self.deploying_key = true;
+                            cx.emit(ToolbarEvent::InstallPublicKey {
+                                public_key: path,
+                                private_key,
+                            });
+                        }
+                        Err(message) => self.error = Some(message.into()),
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn fail_key_selection(&mut self, message: String, cx: &mut Context<Self>) {
+        self.choosing_key = false;
+        self.error = Some(message.into());
         cx.notify();
     }
 
@@ -325,6 +492,7 @@ impl Toolbar {
         let theme = cx.theme().clone();
         let connected = self.state == SessionState::Connected;
         let connecting = self.state == SessionState::Connecting;
+        let form_locked = connected || connecting;
         let use_key = self.use_key;
         let profiles = self.profiles.clone();
         let toolbar = cx.entity().downgrade();
@@ -364,100 +532,9 @@ impl Toolbar {
                         .disabled(connected || connecting)
                         .loading(choosing_key)
                         .on_click(move |_, _, cx| {
-                            let picker_options = select_toolbar.update(cx, |toolbar, cx| {
-                                if toolbar.choosing_key {
-                                    return None;
-                                }
-                                toolbar.choosing_key = true;
-                                cx.notify();
-                                Some((
-                                    toolbar.show_hidden_key_files,
-                                    private_key_initial_directory(toolbar.key_path.as_deref()),
-                                ))
+                            let _ = select_toolbar.update(cx, |toolbar, cx| {
+                                toolbar.pick_key(KeyPickerPurpose::Private, cx)
                             });
-                            let Ok(Some((show_hidden_files, initial_directory))) = picker_options
-                            else {
-                                return;
-                            };
-
-                            #[cfg(target_os = "macos")]
-                            let receiver = prompt_for_private_key(
-                                show_hidden_files,
-                                initial_directory.as_deref(),
-                            );
-                            #[cfg(not(target_os = "macos"))]
-                            let receiver = cx.prompt_for_paths(PathPromptOptions {
-                                files: true,
-                                directories: false,
-                                multiple: false,
-                                prompt: Some("选择 SSH 私钥文件".into()),
-                            });
-
-                            let toolbar = select_toolbar.clone();
-                            #[cfg(target_os = "macos")]
-                            cx.spawn(async move |cx| match receiver.recv_async().await {
-                                Ok(Ok(selection)) => {
-                                    let _ = toolbar.update(cx, |toolbar, cx| {
-                                        toolbar.choosing_key = false;
-                                        toolbar.show_hidden_key_files = selection.show_hidden_files;
-                                        if let Some(path) = selection.path {
-                                            toolbar.key_path = Some(path);
-                                            toolbar.error = None;
-                                        }
-                                        cx.notify();
-                                    });
-                                }
-                                Ok(Err(message)) => {
-                                    let _ = toolbar.update(cx, |toolbar, cx| {
-                                        toolbar.choosing_key = false;
-                                        toolbar.error = Some(message.into());
-                                        cx.notify();
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = toolbar.update(cx, |toolbar, cx| {
-                                        toolbar.choosing_key = false;
-                                        toolbar.error =
-                                            Some("私钥文件选择器意外关闭，请重试".into());
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                            .detach();
-
-                            #[cfg(not(target_os = "macos"))]
-                            cx.spawn(async move |cx| match receiver.await {
-                                Ok(Ok(paths)) => {
-                                    let _ = toolbar.update(cx, |toolbar, cx| {
-                                        toolbar.choosing_key = false;
-                                        if let Some(path) =
-                                            paths.and_then(|paths| paths.into_iter().next())
-                                        {
-                                            toolbar.key_path = Some(path);
-                                            toolbar.error = None;
-                                        }
-                                        cx.notify();
-                                    });
-                                }
-                                Ok(Err(err)) => {
-                                    let _ = toolbar.update(cx, |toolbar, cx| {
-                                        toolbar.choosing_key = false;
-                                        toolbar.error = Some(SharedString::from(format!(
-                                            "无法选择私钥文件：{err}"
-                                        )));
-                                        cx.notify();
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = toolbar.update(cx, |toolbar, cx| {
-                                        toolbar.choosing_key = false;
-                                        toolbar.error =
-                                            Some("私钥文件选择器意外关闭，请重试".into());
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                            .detach();
                         }),
                 )
                 .when(selected_path.is_some(), |this| {
@@ -481,6 +558,7 @@ impl Toolbar {
         } else {
             Input::new(&self.password)
                 .id("toolbar-password")
+                .disabled(form_locked)
                 .w_full()
                 .into_any_element()
         };
@@ -511,7 +589,7 @@ impl Toolbar {
                     .icon(IconName::Bookmark)
                     .accessibility_label("收藏夹")
                     .tooltip("收藏夹")
-                    .disabled(connecting)
+                    .disabled(form_locked)
                     .dropdown_menu(move |menu, _window, _cx| {
                         if profiles.is_empty() {
                             return menu.min_w(px(180.)).item(
@@ -608,20 +686,28 @@ impl Toolbar {
                     .min_w_0()
                     .gap_2()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(140.))
-                            .child(Input::new(&self.host).id("toolbar-host").w_full()),
+                        div().flex_1().min_w(px(140.)).child(
+                            Input::new(&self.host)
+                                .id("toolbar-host")
+                                .disabled(form_locked)
+                                .w_full(),
+                        ),
                     )
                     .child(
-                        div()
-                            .w(px(72.))
-                            .child(Input::new(&self.port).id("toolbar-port").w_full()),
+                        div().w(px(72.)).child(
+                            Input::new(&self.port)
+                                .id("toolbar-port")
+                                .disabled(form_locked)
+                                .w_full(),
+                        ),
                     )
                     .child(
-                        div()
-                            .w(px(150.))
-                            .child(Input::new(&self.username).id("toolbar-user").w_full()),
+                        div().w(px(150.)).child(
+                            Input::new(&self.username)
+                                .id("toolbar-user")
+                                .disabled(form_locked)
+                                .w_full(),
+                        ),
                     )
                     .child(div().flex_1().min_w(px(150.)).child(password_or_key))
                     // 私钥模式才出现的口令框：加密私钥没有它根本连不上。
@@ -630,6 +716,7 @@ impl Toolbar {
                             div().w(px(120.)).flex_shrink_0().child(
                                 Input::new(&self.key_passphrase)
                                     .id("toolbar-passphrase")
+                                    .disabled(form_locked)
                                     .w_full(),
                             ),
                         )
@@ -639,20 +726,36 @@ impl Toolbar {
                             .ghost()
                             .xsmall()
                             .icon(IconName::KeyRound)
-                            .accessibility_label(if use_key {
+                            .accessibility_label(if connected && !use_key {
+                                "部署公钥并切换为密钥认证"
+                            } else if use_key {
                                 "切换为密码认证"
                             } else {
                                 "切换为私钥认证"
                             })
-                            .tooltip(if use_key {
+                            .tooltip(if connected && !use_key {
+                                "一键部署公钥，下次使用密钥登录"
+                            } else if use_key {
                                 "当前：私钥认证，点击切换为密码"
                             } else {
                                 "当前：密码认证，点击切换为私钥"
                             })
-                            .disabled(connected)
+                            .disabled(
+                                connecting
+                                    || (connected && use_key)
+                                    || self.choosing_key
+                                    || self.deploying_key,
+                            )
+                            .loading(self.choosing_key || self.deploying_key)
                             .on_click(cx.listener(|toolbar, _, _, cx| {
-                                toolbar.use_key = !toolbar.use_key;
-                                cx.notify();
+                                if toolbar.state == SessionState::Connected {
+                                    if !toolbar.use_key {
+                                        toolbar.pick_key(KeyPickerPurpose::Public, cx);
+                                    }
+                                } else {
+                                    toolbar.use_key = !toolbar.use_key;
+                                    cx.notify();
+                                }
                             })),
                     )
                     .child(
@@ -675,7 +778,7 @@ impl Toolbar {
                                 (false, true) => "密码会存入 macOS 钥匙串",
                                 (false, false) => "不保存密码",
                             })
-                            .disabled(connected)
+                            .disabled(form_locked)
                             .on_click(cx.listener(|toolbar, _, _, cx| {
                                 toolbar.remember = !toolbar.remember;
                                 cx.notify();
@@ -708,6 +811,8 @@ impl Toolbar {
                             // 先切自己的状态再发事件：上层收到事件后就不会再回头
                             // update 本实体（那会撞上 GPUI 的独占租约）。
                             toolbar.state = SessionState::Disconnected;
+                            toolbar.choosing_key = false;
+                            toolbar.deploying_key = false;
                             cx.notify();
                             cx.emit(ToolbarEvent::Disconnect);
                         }
@@ -780,23 +885,43 @@ fn private_key_initial_directory(selected: Option<&std::path::Path>) -> Option<P
         })
 }
 
+fn deployment_key_pair(public_key: &std::path::Path) -> Result<PathBuf, String> {
+    if !public_key.is_file()
+        || !public_key
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pub"))
+    {
+        return Err("请选择 OpenSSH .pub 公钥文件".to_string());
+    }
+    let private_key = public_key.with_extension("");
+    if !private_key.is_file() {
+        return Err(format!(
+            "找不到配套私钥 {}，请把公钥与私钥放在同一目录",
+            private_key.display()
+        ));
+    }
+    Ok(private_key)
+}
+
 #[cfg(target_os = "macos")]
-struct PrivateKeyPickerResult {
+struct KeyPickerResult {
     path: Option<PathBuf>,
     show_hidden_files: bool,
 }
 
-/// GPUI 的通用路径选择 API 没有“显示隐藏文件”选项，因此私钥选择在 macOS 上
+/// GPUI 的通用路径选择 API 没有“显示隐藏文件”选项，因此密钥选择在 macOS 上
 /// 使用原生 `NSOpenPanel`。面板内的复选框与 `showsHiddenFiles` 双向绑定，用户也可
 /// 随时用系统快捷键 Command-Shift-. 切换，两种方式会保持同步。
 #[cfg(target_os = "macos")]
-fn prompt_for_private_key(
+fn prompt_for_key_file(
+    prompt: &str,
     show_hidden_files: bool,
     initial_directory: Option<&std::path::Path>,
-) -> flume::Receiver<Result<PrivateKeyPickerResult, String>> {
+) -> flume::Receiver<Result<KeyPickerResult, String>> {
     let (done_tx, done_rx) = flume::bounded(1);
     let Some(mtm) = MainThreadMarker::new() else {
-        let _ = done_tx.send(Err("只能从主线程打开私钥文件选择器".to_string()));
+        let _ = done_tx.send(Err("只能从主线程打开密钥文件选择器".to_string()));
         return done_rx;
     };
 
@@ -807,7 +932,7 @@ fn prompt_for_private_key(
     panel.setCanCreateDirectories(false);
     panel.setResolvesAliases(false);
     panel.setShowsHiddenFiles(show_hidden_files);
-    panel.setPrompt(Some(&NSString::from_str("选择 SSH 私钥文件")));
+    panel.setPrompt(Some(&NSString::from_str(prompt)));
 
     if let Some(directory) = initial_directory {
         let directory_url = NSURL::from_directory_path(directory);
@@ -861,7 +986,7 @@ fn prompt_for_private_key(
                     .and_then(|url| url.to_file_path())
             });
             show_hidden.unbind(unsafe { NSValueBinding });
-            let _ = done_tx.send(Ok(PrivateKeyPickerResult {
+            let _ = done_tx.send(Ok(KeyPickerResult {
                 path: path.flatten(),
                 show_hidden_files: panel.showsHiddenFiles(),
             }));

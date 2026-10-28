@@ -265,6 +265,53 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 }
             }
 
+            SftpCommand::InstallPublicKey {
+                public_key,
+                private_key,
+            } => {
+                let Some(active) = session.as_ref() else {
+                    let _ = events.send(SftpEvent::error(
+                        ErrorContext::InstallPublicKey,
+                        "尚未连接到服务器",
+                    ));
+                    continue;
+                };
+
+                let sftp = active.sftp.clone();
+                let home = active.home.clone();
+                let events = events.clone();
+                let locks = path_locks.clone();
+                let path_key = remote_key(&session::join_remote(&home, ".ssh/authorized_keys"));
+                let operation_cancel = connection_cancel.clone();
+                tokio::spawn(async move {
+                    let _path_guard = locks.acquire([path_key]).await;
+                    if operation_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let result = guard("部署公钥", async {
+                        transfer::install_public_key(&sftp, &home, &public_key)
+                            .await
+                            .map_err(|err| format!("{err:#}"))
+                    })
+                    .await;
+                    if operation_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match result {
+                        Ok(already_present) => {
+                            let _ = events.send(SftpEvent::PublicKeyInstalled {
+                                private_key,
+                                already_present,
+                            });
+                        }
+                        Err(message) => {
+                            let _ = events
+                                .send(SftpEvent::error(ErrorContext::InstallPublicKey, message));
+                        }
+                    }
+                });
+            }
+
             // ---------------------------------------------------------------
             // 目录
             // ---------------------------------------------------------------

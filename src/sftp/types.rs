@@ -308,6 +308,12 @@ pub enum SftpCommand {
     },
     /// 回答首次连接 / 主机密钥变化确认框。
     ResolveHostKey(HostKeyDecision),
+    /// 把本机公钥追加到当前账号的 `~/.ssh/authorized_keys`。
+    InstallPublicKey {
+        public_key: PathBuf,
+        /// 部署成功后，UI 用对应私钥作为下次登录方式。
+        private_key: PathBuf,
+    },
     /// 整目录下载：在 `local` 建目录，然后把 `remote` 里的内容递归取回来。
     ///
     /// 和 [`SftpCommand::UploadDir`] 完全对称，只是方向反过来。
@@ -366,6 +372,7 @@ pub enum ErrorContext {
     Rename,
     ReadText,
     WriteText,
+    InstallPublicKey,
     Runtime,
 }
 
@@ -379,6 +386,7 @@ impl ErrorContext {
             ErrorContext::Rename => "rename",
             ErrorContext::ReadText => "read_text",
             ErrorContext::WriteText => "write_text",
+            ErrorContext::InstallPublicKey => "install_public_key",
             ErrorContext::Runtime => "runtime",
         }
     }
@@ -438,6 +446,11 @@ pub enum SftpEvent {
     /// 远端文本文件已安全替换完成。
     TextSaved {
         path: String,
+    },
+    /// 公钥已经存在也算成功；`already_present` 只用于给用户更准确的反馈。
+    PublicKeyInstalled {
+        private_key: PathBuf,
+        already_present: bool,
     },
     /// 操作成功后的轻提示（建目录、删除、重命名）。
     Notice(String),

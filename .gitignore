@@ -6,6 +6,7 @@
 
 # 构建产物
 /dist
+/.macscp-build-version
 
 # 本地工具缓存 / 会话记录，不属于应用源码
 /.vite

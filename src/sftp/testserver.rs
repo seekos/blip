@@ -1300,6 +1300,44 @@ mod tests {
         assert_eq!(vfs_mode(PATH).await, Some(0o100_640), "原权限必须保留");
     }
 
+    #[tokio::test]
+    async fn worker_installs_public_key_once_with_ssh_permissions() {
+        const SSH_DIR: &str = "/home/tester/.ssh";
+        const AUTHORIZED_KEYS: &str = "/home/tester/.ssh/authorized_keys";
+        let _guard = vfs_lock().lock_owned().await;
+        vfs_reset().await;
+        let public_key = write_key("deploy-public", CLIENT_KEY_PUBLIC);
+        let private_key = public_key.with_extension("private");
+
+        let addr = spawn().await;
+        let worker = SftpWorker::spawn();
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
+
+        for already_present in [false, true] {
+            worker.send(SftpCommand::InstallPublicKey {
+                public_key: public_key.clone(),
+                private_key: private_key.clone(),
+            });
+            match next_event(&worker).await {
+                SftpEvent::PublicKeyInstalled {
+                    private_key: returned,
+                    already_present: actual,
+                } => {
+                    assert_eq!(returned, private_key);
+                    assert_eq!(actual, already_present);
+                }
+                other => panic!("期望 PublicKeyInstalled，实际 {other:?}"),
+            }
+        }
+
+        let contents = String::from_utf8(vfs_read(AUTHORIZED_KEYS).await.expect("公钥应已部署"))
+            .expect("authorized_keys 应为 UTF-8");
+        assert_eq!(contents.lines().count(), 1, "重复部署不能重复追加");
+        assert!(contents.starts_with("ssh-ed25519 "));
+        assert_eq!(vfs_mode(SSH_DIR).await, Some(0o040_700));
+        assert_eq!(vfs_mode(AUTHORIZED_KEYS).await, Some(0o100_600));
+    }
+
     /// 多选删除必须由一条指令处理整批文件/目录，并只返回一条汇总结果。
     #[tokio::test]
     async fn worker_removes_multiple_selected_entries() {

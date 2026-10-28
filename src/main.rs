@@ -11,6 +11,7 @@ mod demo;
 mod session;
 mod sftp;
 mod ui;
+mod update;
 
 use gpui_kit::*;
 

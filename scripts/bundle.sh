@@ -15,6 +15,7 @@
 #   scripts/bundle.sh release                  # release 构建，输出到 target/release/
 #   scripts/bundle.sh release --out dist       # 输出到 dist/macscp.app
 #   scripts/bundle.sh release --out dist --no-build   # 不重新编译，只重新打包
+#   scripts/bundle.sh release --version 0.2.0   # 覆盖应用包版本号
 #
 set -euo pipefail
 
@@ -24,19 +25,26 @@ ROOT=$(pwd)
 PROFILE="debug"
 DO_BUILD=1
 OUT_DIR=""
+VERSION=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     debug|release) PROFILE="$1" ;;
     --no-build)    DO_BUILD=0 ;;
     --out)         shift; OUT_DIR="${1:-}" ;;
+    -v|--version)
+      [ $# -ge 2 ] && [ -n "$2" ] \
+        || { echo "$1 后缺少版本号" >&2; exit 1; }
+      VERSION="$2"
+      shift
+      ;;
     -h|--help)
-      sed -n '13,17p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '13,18p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
       echo "未知参数：$1" >&2
-      echo "用法：scripts/bundle.sh [debug|release] [--out DIR] [--no-build]" >&2
+      echo "用法：scripts/bundle.sh [debug|release] [--out DIR] [--no-build] [--version VERSION]" >&2
       exit 1
       ;;
   esac
@@ -62,9 +70,14 @@ else
 fi
 APP="${OUT_DIR}/macscp.app"
 
-# 版本号只从 Cargo.toml 读一处，别在两个地方各写一遍。
-VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${ROOT}/Cargo.toml" | head -1)
+# 没有显式覆盖时，版本号从 Cargo.toml 读取。
+if [ -z "${VERSION}" ]; then
+  VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${ROOT}/Cargo.toml" | head -1)
+fi
+VERSION=${VERSION#v}
 [ -n "${VERSION}" ] || { echo "读不到 Cargo.toml 里的 version" >&2; exit 1; }
+[[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] \
+  || { echo "版本号无效：${VERSION}（应类似 0.2.0）" >&2; exit 1; }
 
 [ -f "${ICNS}" ] || {
   echo "缺少图标：${ICNS}" >&2

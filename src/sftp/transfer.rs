@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use russh::keys::{PublicKey, PublicKeyBase64 as _};
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpClientError;
 use russh_sftp::client::fs::Metadata as RemoteMetadata;
@@ -53,6 +54,7 @@ const MIN_SAMPLE_INTERVAL: f64 = 0.05;
 ///
 /// 编辑器需要把全部内容放进内存和文本布局引擎，不适合无上限地打开日志或二进制文件。
 pub const MAX_EDITABLE_TEXT_SIZE: u64 = 2 * 1024 * 1024;
+const MAX_PUBLIC_KEY_SIZE: u64 = 64 * 1024;
 
 static NEXT_EDIT_TEMP: AtomicU64 = AtomicU64::new(1);
 static NEXT_REMOTE_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -91,15 +93,26 @@ pub async fn read_remote_text(sftp: &SftpSession, path: &str) -> Result<String> 
 ///
 /// 这样在断线、超时或写入失败时，原文件仍保持完整。
 pub async fn write_remote_text(sftp: &SftpSession, path: &str, content: &str) -> Result<()> {
+    write_remote_text_with_mode(sftp, path, content, None).await
+}
+
+async fn write_remote_text_with_mode(
+    sftp: &SftpSession,
+    path: &str,
+    content: &str,
+    mode: Option<u32>,
+) -> Result<()> {
     if content.len() as u64 > MAX_EDITABLE_TEXT_SIZE {
         return Err(anyhow!("编辑后的内容超过 2 MiB，无法保存"));
     }
 
-    let preserved_mode = sftp
-        .metadata(path)
-        .await
-        .map_err(|err| anyhow!("读取 {path} 的信息失败：{err}"))?
-        .permissions;
+    let preserved_mode = match sftp.metadata(path).await {
+        Ok(metadata) => metadata.permissions,
+        Err(SftpClientError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+            None
+        }
+        Err(err) => return Err(anyhow!("读取 {path} 的信息失败：{err}")),
+    };
     let temp = edit_temp_path(path);
     let mut file = sftp
         .create(&temp)
@@ -133,10 +146,93 @@ pub async fn write_remote_text(sftp: &SftpSession, path: &str, content: &str) ->
         ));
     }
 
-    if let Some(mode) = preserved_mode {
+    if let Some(mode) = mode.or(preserved_mode) {
         apply_mode(sftp, &temp, mode).await?;
     }
     replace_remote(sftp, &temp, path).await
+}
+
+/// 把本机 OpenSSH 公钥安全、幂等地追加到远端账号。
+///
+/// 返回 `true` 表示远端已经有同一把密钥，因此没有改写文件。
+pub async fn install_public_key(
+    sftp: &SftpSession,
+    home: &str,
+    public_key_path: &Path,
+) -> Result<bool> {
+    let metadata = tokio::fs::symlink_metadata(public_key_path)
+        .await
+        .map_err(|err| anyhow!("读取公钥文件 {} 失败：{err}", public_key_path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(anyhow!("请选择普通公钥文件，不支持目录或符号链接"));
+    }
+    if metadata.len() > MAX_PUBLIC_KEY_SIZE {
+        return Err(anyhow!("公钥文件超过 64 KiB，已拒绝部署"));
+    }
+
+    let raw = tokio::fs::read_to_string(public_key_path)
+        .await
+        .map_err(|err| anyhow!("读取公钥文件 {} 失败：{err}", public_key_path.display()))?;
+    let key = PublicKey::from_openssh(raw.trim())
+        .map_err(|err| anyhow!("公钥不是有效的 OpenSSH 格式：{err}"))?;
+    let canonical = format!("{} {}", key.algorithm().as_str(), key.public_key_base64());
+
+    let ssh_dir = join_remote(home, ".ssh");
+    match optional_remote_metadata(sftp, &ssh_dir).await? {
+        None => sftp
+            .create_dir(&ssh_dir)
+            .await
+            .map_err(|err| anyhow!("创建 {ssh_dir} 失败：{err}"))?,
+        Some(metadata) if metadata.is_dir() && !metadata.is_symlink() => {}
+        Some(_) => return Err(anyhow!("远端 {ssh_dir} 不是普通目录，已拒绝改写")),
+    }
+    apply_mode(sftp, &ssh_dir, 0o040_700).await?;
+
+    let authorized_keys = join_remote(&ssh_dir, "authorized_keys");
+    let existing = match optional_remote_metadata(sftp, &authorized_keys).await? {
+        None => String::new(),
+        Some(metadata) if metadata.is_dir() || metadata.is_symlink() => {
+            return Err(anyhow!("远端 {authorized_keys} 不是普通文件，已拒绝改写"));
+        }
+        Some(metadata) if metadata.size.unwrap_or(0) > MAX_EDITABLE_TEXT_SIZE => {
+            return Err(anyhow!("远端 authorized_keys 超过 2 MiB，已拒绝改写"));
+        }
+        Some(_) => String::from_utf8(
+            sftp.read(&authorized_keys)
+                .await
+                .map_err(|err| anyhow!("读取 {authorized_keys} 失败：{err}"))?,
+        )
+        .map_err(|_| anyhow!("远端 authorized_keys 不是 UTF-8 文本，已拒绝改写"))?,
+    };
+
+    let (updated, already_present) = merge_authorized_key(&existing, &canonical);
+    if already_present {
+        apply_mode(sftp, &authorized_keys, 0o100_600).await?;
+        return Ok(true);
+    }
+    write_remote_text_with_mode(sftp, &authorized_keys, &updated, Some(0o100_600)).await?;
+    Ok(false)
+}
+
+fn merge_authorized_key(existing: &str, canonical: &str) -> (String, bool) {
+    let blob = canonical
+        .split_ascii_whitespace()
+        .nth(1)
+        .expect("规范化公钥必定包含类型和编码");
+    if existing
+        .lines()
+        .any(|line| line.split_ascii_whitespace().any(|token| token == blob))
+    {
+        return (existing.to_string(), true);
+    }
+
+    let mut updated = existing.to_string();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(canonical);
+    updated.push('\n');
+    (updated, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1972,6 +2068,23 @@ mod tests {
     fn text_editor_force_opens_non_utf8_and_nul_bytes() {
         let decoded = decode_text_for_editor(&[b'A', 0xff, 0, b'B']);
         assert_eq!(decoded, "A\u{FFFD}\u{FFFD}B");
+    }
+
+    #[test]
+    fn authorized_key_merge_appends_once_and_preserves_existing_lines() {
+        let existing = "ssh-rsa OLD old@example\n";
+        let key = "ssh-ed25519 NEW";
+        let (updated, already_present) = merge_authorized_key(existing, key);
+        assert!(!already_present);
+        assert_eq!(updated, "ssh-rsa OLD old@example\nssh-ed25519 NEW\n");
+
+        let (unchanged, already_present) =
+            merge_authorized_key("from=\"10.0.0.1\" ssh-ed25519 NEW existing-comment\n", key);
+        assert!(already_present);
+        assert_eq!(
+            unchanged,
+            "from=\"10.0.0.1\" ssh-ed25519 NEW existing-comment\n"
+        );
     }
 
     #[cfg(unix)]

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# 一键构建：图标 → 编译 → 打包 → 产物汇总到 dist/。
+# 一键构建：图标 → 编译 → APP → DMG，产物汇总到 dist/。
 #
 # 产物：
 #   dist/macscp.app   双击启动的 macOS 应用包（Finder / Dock / ⌘Tab 都带图标）
-#   dist/macscp       裸二进制，给命令行用（./dist/macscp）
+#   dist/macscp-<version>.dmg   带“应用程序”快捷方式的安装镜像
 #
 # 用法：
 #   scripts/build.sh                # release 构建，先清空 dist/（默认）
+#   scripts/build.sh -v 0.2.0       # 指定 APP 与 DMG 的版本号
 #   scripts/build.sh debug          # debug 构建，快很多，但产物大 3~4 倍
 #   scripts/build.sh --no-clean     # 增量构建，不清空 dist/
-#   scripts/build.sh --no-binary    # 只出 .app，不额外复制裸二进制
 #   scripts/build.sh --no-icon      # 跳过图标检查/重新生成
 #
 set -euo pipefail
@@ -20,15 +20,21 @@ ROOT=$(pwd)
 
 PROFILE="release"
 CLEAN=1
-WITH_BINARY=1
 WITH_ICON=1
+VERSION=""
+VERSION_FILE="${ROOT}/.macscp-build-version"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     debug|release) PROFILE="$1" ;;
+    -v|--version)
+      [ $# -ge 2 ] && [ -n "$2" ] \
+        || { echo "$1 后缺少版本号" >&2; exit 1; }
+      VERSION="$2"
+      shift
+      ;;
     --clean)       CLEAN=1 ;;
     --no-clean)    CLEAN=0 ;;
-    --no-binary)   WITH_BINARY=0 ;;
     --no-icon)     WITH_ICON=0 ;;
     -h|--help)
       sed -n '9,14p' "$0" | sed 's/^# \{0,1\}//'
@@ -36,12 +42,22 @@ while [ $# -gt 0 ]; do
       ;;
     *)
       echo "未知参数：$1" >&2
-      echo "用法：scripts/build.sh [debug|release] [--no-clean] [--no-binary] [--no-icon]" >&2
+      echo "用法：scripts/build.sh [debug|release] [-v VERSION] [--no-clean] [--no-icon]" >&2
       exit 1
       ;;
   esac
   shift
 done
+
+if [ -z "${VERSION}" ] && [ -s "${VERSION_FILE}" ]; then
+  VERSION=$(<"${VERSION_FILE}")
+fi
+if [ -z "${VERSION}" ]; then
+  VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${ROOT}/Cargo.toml" | head -1)
+fi
+VERSION=${VERSION#v}
+[[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] \
+  || { echo "版本号无效：${VERSION}（应类似 0.2.0）" >&2; exit 1; }
 
 case "${PROFILE}" in
   debug)   CARGO_FLAGS="" ;;
@@ -86,14 +102,25 @@ mkdir -p "${DIST}"
 
 # ---- 3. 编译 + 打包 -------------------------------------------------------
 # 编译交给 bundle.sh（它会跑 cargo build），这里不再单独 build 一次。
-"${ROOT}/scripts/bundle.sh" "${PROFILE}" --out "${DIST}"
+"${ROOT}/scripts/bundle.sh" "${PROFILE}" --out "${DIST}" --version "${VERSION}"
 
-# ---- 4. 裸二进制 ----------------------------------------------------------
-BIN="${ROOT}/target/${PROFILE}/macscp"
-if [ "${WITH_BINARY}" = "1" ]; then
-  cp "${BIN}" "${DIST}/macscp"
-  chmod +x "${DIST}/macscp"
+# ---- 4. DMG ---------------------------------------------------------------
+DMG_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/macscp-dmg.XXXXXX")
+trap 'rm -rf "${DMG_STAGE}"' EXIT
+cp -R "${DIST}/macscp.app" "${DMG_STAGE}/macscp.app"
+ln -s /Applications "${DMG_STAGE}/Applications"
+DMG="${DIST}/macscp-${VERSION}.dmg"
+rm -f "${DMG}"
+if /usr/sbin/diskutil image create from --help >/dev/null 2>&1; then
+  /usr/sbin/diskutil image create from --format UDZO --volumeName "macscp" \
+    "${DMG_STAGE}" "${DMG}" >/dev/null
+else
+  /usr/bin/hdiutil create -volname "macscp" -srcfolder "${DMG_STAGE}" \
+    -format UDZO "${DMG}" >/dev/null
 fi
+rm -rf "${DMG_STAGE}"
+trap - EXIT
+printf '%s\n' "${VERSION}" > "${VERSION_FILE}"
 
 # ---- 5. 汇总 --------------------------------------------------------------
 ELAPSED=$(( $(date +%s) - START ))
@@ -101,13 +128,6 @@ ELAPSED=$(( $(date +%s) - START ))
 echo
 echo "产物（${PROFILE}，${ELAPSED}s）："
 du -sh "${DIST}/macscp.app" | awk -v d="${DIST}" '{printf "  %-6s %s/macscp.app\n", $1, d}'
-if [ "${WITH_BINARY}" = "1" ]; then
-  du -sh "${DIST}/macscp" | awk -v d="${DIST}" '{printf "  %-6s %s/macscp\n", $1, d}'
-fi
+du -sh "${DMG}" | awk -v p="${DMG}" '{printf "  %-6s %s\n", $1, p}'
 echo
 echo "双击启动：open \"${DIST}/macscp.app\""
-# 注意别写成 `[ ... ] && echo ...`：条件是假时整行返回 1，脚本最后一条命令
-# 的状态码就是脚本的退出码，--no-binary 会「成功构建但退出码 1」。
-if [ "${WITH_BINARY}" = "1" ]; then
-  echo "命令行：  \"${DIST}/macscp\""
-fi
