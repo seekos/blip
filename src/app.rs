@@ -23,6 +23,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::session::store::{self, AppSettings, RemoteOpenBehavior, SavedAuth, SavedProfile};
+use crate::sftp::lan_server::ServerInfo;
 use crate::sftp::types::{AuthMethod, SessionConfig};
 use crate::ui::SessionState;
 use crate::ui::file_pane::FilePane;
@@ -40,6 +41,7 @@ pub struct ScpApp {
     transfers: Entity<TransferQueue>,
     profiles: Vec<SavedProfile>,
     settings: AppSettings,
+    lan_server: Result<ServerInfo, SharedString>,
     /// 当前这次连接实际使用的配置。密码框可能为空（收藏会从钥匙串补密码），
     /// 成功后必须保存这里的认证信息，不能再从空白表单反推。
     pending_config: Option<SessionConfig>,
@@ -51,6 +53,7 @@ pub struct ScpApp {
 struct SettingsDraft {
     remote_open_behavior: RemoteOpenBehavior,
     editor_path: Option<PathBuf>,
+    lan_sftp_root: Option<PathBuf>,
     error: Option<SharedString>,
 }
 
@@ -85,6 +88,19 @@ impl ScpApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let profiles = store::load_profiles();
         let settings = store::load_settings();
+        let lan_server =
+            crate::sftp::lan_server::start(settings.lan_sftp_root.clone()).map_err(|message| {
+                log::error!("内置局域网 SFTP 服务启动失败：{message}");
+                SharedString::from(message)
+            });
+        if let Ok(info) = &lan_server {
+            log::info!(
+                "局域网 SFTP 已启动：{}@{}，共享目录 {}",
+                info.username,
+                info.endpoint(),
+                info.root().display()
+            );
+        }
         let toolbar = cx.new(|cx| Toolbar::new(profiles.clone(), window, cx));
         // 工作区在构造时就启动 SftpWorker 与事件泵。
         let workspace = cx.new(|cx| Workspace::new(settings.clone(), window, cx));
@@ -107,7 +123,7 @@ impl ScpApp {
             |app, _toolbar, event: &ToolbarEvent, window, cx| match event {
                 ToolbarEvent::Connect(config) => {
                     window.set_window_title(&format!(
-                        "macscp — 正在连接 {}@{}…",
+                        "Blip — 正在连接 {}@{}…",
                         config.username, config.host
                     ));
                     let config = config.clone();
@@ -119,7 +135,7 @@ impl ScpApp {
                     app.pending_config = None;
                     app.workspace
                         .update(cx, |workspace, cx| workspace.disconnect(cx));
-                    window.set_window_title("macscp");
+                    window.set_window_title("Blip");
                 }
                 ToolbarEvent::InstallPublicKey {
                     public_key,
@@ -157,7 +173,7 @@ impl ScpApp {
                             }
                         });
 
-                        // 标题栏跟着会话状态走：`macscp — user@host`。
+                        // 标题栏跟着会话状态走：`Blip — user@host`。
                         app.sync_window_title(window, cx);
 
                         // 连接成功才落盘凭证，避免把错误密码写进钥匙串。
@@ -191,6 +207,7 @@ impl ScpApp {
             transfers,
             profiles,
             settings,
+            lan_server,
             pending_config: None,
             version: update::application_version(),
             available_update: None,
@@ -242,7 +259,7 @@ impl ScpApp {
                         .gap_2()
                         .child(
                             div().text_sm().child(SharedString::from(format!(
-                                "macscp {} 已发布，当前版本为 {}。",
+                                "Blip {} 已发布，当前版本为 {}。",
                                 available.version, available.current_version
                             ))),
                         )
@@ -250,7 +267,7 @@ impl ScpApp {
                             div()
                                 .text_xs()
                                 .text_color(_cx.theme().muted_foreground)
-                                .child("将打开 GitHub Releases 下载新版 DMG，安装时把 macscp 拖入“应用程序”即可完成升级。"),
+                                .child("将打开 GitHub Releases 下载新版 DMG，安装时把 Blip 拖入“应用程序”即可完成升级。"),
                         ),
                 )
                 .footer(
@@ -279,6 +296,168 @@ impl ScpApp {
                                 }),
                         ),
                 )
+        });
+    }
+
+    fn open_lan_server_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let server = self.lan_server.clone();
+        window.open_dialog(cx, move |dialog, _window, cx| match server.clone() {
+            Ok(info) => {
+                let theme = cx.theme().clone();
+                let command = info.command();
+                let password = info.password.clone();
+                let copy_command = command.clone();
+                let copy_password = password.clone();
+
+                dialog
+                    .title("局域网 SFTP")
+                    .w(px(560.))
+                    .overlay_closable(false)
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child("同一局域网内的设备可使用以下信息连接到这台 Mac。"),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .w(px(72.))
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("连接命令"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .px_3()
+                                                    .py_2()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .text_sm()
+                                                    .truncate()
+                                                    .child(SharedString::from(command)),
+                                            )
+                                            .child(
+                                                Button::new("copy-lan-sftp-command")
+                                                    .label("复制")
+                                                    .on_click(move |_, window, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(
+                                                                copy_command.clone(),
+                                                            ),
+                                                        );
+                                                        window.push_notification(
+                                                            Notification::success("连接命令已复制"),
+                                                            cx,
+                                                        );
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .w(px(72.))
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("6 位密码"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .px_3()
+                                                    .py_2()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(SharedString::from(password)),
+                                            )
+                                            .child(
+                                                Button::new("copy-lan-sftp-password")
+                                                    .label("复制")
+                                                    .on_click(move |_, window, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(
+                                                                copy_password.clone(),
+                                                            ),
+                                                        );
+                                                        window.push_notification(
+                                                            Notification::success("SFTP 密码已复制"),
+                                                            cx,
+                                                        );
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .w(px(72.))
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("共享目录"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .text_sm()
+                                                    .truncate()
+                                                    .child(SharedString::from(
+                                                        info.root().to_string_lossy().into_owned(),
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("密码会在每次启动应用时重新生成。请只在可信局域网中使用；退出 Blip 后服务自动停止。"),
+                            ),
+                    )
+                    .footer(
+                        h_flex().justify_end().child(
+                            Button::new("close-lan-sftp")
+                                .primary()
+                                .label("完成")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                    )
+            }
+            Err(message) => dialog
+                .title("局域网 SFTP 启动失败")
+                .w(px(480.))
+                .overlay_closable(false)
+                .child(v_flex().gap_2().child(message).child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("请在设置中重新选择共享目录；若端口或网络权限导致失败，解决后保存设置即可重试。"),
+                ))
+                .footer(
+                    h_flex().justify_end().child(
+                        Button::new("close-lan-sftp-error")
+                            .primary()
+                            .label("关闭")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                ),
         });
     }
 
@@ -386,20 +565,20 @@ impl ScpApp {
             .update(cx, |toolbar, cx| toolbar.prefill(&profile, window, cx));
     }
 
-    /// 把连接状态写进窗口标题栏：`macscp — root@192.168.146.7`。
+    /// 把连接状态写进窗口标题栏：`Blip — root@192.168.146.7`。
     ///
     /// 这串 `user@host` 原来贴在表单行的最右边，和输入框挤在一起，
     /// 长得就像一个输入框；挪到窗口顶部后，表单那一行也宽松了。
-    /// 断开时退回纯 `macscp`。
+    /// 断开时退回纯 `Blip`。
     fn sync_window_title(&self, window: &mut Window, cx: &App) {
         let toolbar = self.toolbar.read(cx);
         let title = match toolbar.state() {
             SessionState::Connected => {
                 let snapshot = toolbar.snapshot(cx);
-                format!("macscp — {}@{}", snapshot.username, snapshot.host)
+                format!("Blip — {}@{}", snapshot.username, snapshot.host)
             }
-            SessionState::Connecting => "macscp — 正在连接…".to_string(),
-            SessionState::Disconnected => "macscp".to_string(),
+            SessionState::Connecting => "Blip — 正在连接…".to_string(),
+            SessionState::Disconnected => "Blip".to_string(),
         };
         window.set_window_title(&title);
     }
@@ -408,13 +587,14 @@ impl ScpApp {
         let draft = cx.new(|_| SettingsDraft {
             remote_open_behavior: self.settings.remote_open_behavior,
             editor_path: self.settings.editor_path.clone(),
+            lan_sftp_root: self.settings.lan_sftp_root.clone(),
             error: None,
         });
         let app = cx.entity().downgrade();
 
         window.open_dialog(cx, move |dialog, _window, cx| {
             let theme = cx.theme().clone();
-            let (selected, editor_path, error) = {
+            let (selected, editor_path, lan_sftp_root, error) = {
                 let snapshot = draft.read(cx);
                 (
                     match snapshot.remote_open_behavior {
@@ -423,18 +603,21 @@ impl ScpApp {
                         RemoteOpenBehavior::BuiltInTextEditor => 2,
                     },
                     snapshot.editor_path.clone(),
+                    snapshot.lan_sftp_root.clone(),
                     snapshot.error.clone(),
                 )
             };
 
             let mode_draft = draft.clone();
             let browse_draft = draft.clone();
+            let browse_share_draft = draft.clone();
+            let default_share_draft = draft.clone();
             let save_draft = draft.clone();
             let save_app = app.clone();
 
             dialog
                 .title("设置")
-                .w(px(520.))
+                .w(px(600.))
                 .close_button(false)
                 .overlay_closable(false)
                 .child(
@@ -568,6 +751,122 @@ impl ScpApp {
                                         ),
                                 ),
                         )
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("局域网 SFTP 共享目录"),
+                                )
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .text_sm()
+                                                .truncate()
+                                                .child(SharedString::from(
+                                                    lan_sftp_root
+                                                        .clone()
+                                                        .or_else(dirs::home_dir)
+                                                        .map(|path| {
+                                                            path.to_string_lossy().into_owned()
+                                                        })
+                                                        .unwrap_or_else(|| {
+                                                            "无法确定用户主目录".to_string()
+                                                        }),
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new("choose-lan-sftp-root")
+                                                .label("选择文件夹…")
+                                                .on_click(move |_, _, cx| {
+                                                    let receiver = cx.prompt_for_paths(
+                                                        PathPromptOptions {
+                                                            files: false,
+                                                            directories: true,
+                                                            multiple: false,
+                                                            prompt: Some(
+                                                                "选择局域网 SFTP 共享目录".into(),
+                                                            ),
+                                                        },
+                                                    );
+                                                    let draft = browse_share_draft.clone();
+                                                    cx.spawn(async move |cx| {
+                                                        match receiver.await {
+                                                            Ok(Ok(Some(paths))) => {
+                                                                if let Some(path) =
+                                                                    paths.into_iter().next()
+                                                                {
+                                                                    draft.update(
+                                                                        cx,
+                                                                        |draft, cx| {
+                                                                            draft.lan_sftp_root =
+                                                                                Some(path);
+                                                                            draft.error = None;
+                                                                            cx.notify();
+                                                                        },
+                                                                    );
+                                                                }
+                                                            }
+                                                            Ok(Err(err)) => {
+                                                                draft.update(
+                                                                    cx,
+                                                                    |draft, cx| {
+                                                                        draft.error = Some(
+                                                                            SharedString::from(
+                                                                                format!(
+                                                                                    "无法选择共享目录：{err}"
+                                                                                ),
+                                                                            ),
+                                                                        );
+                                                                        cx.notify();
+                                                                    },
+                                                                );
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    })
+                                                    .detach();
+                                                }),
+                                        )
+                                        .when(lan_sftp_root.is_some(), |this| {
+                                            this.child(
+                                                Button::new("reset-lan-sftp-root")
+                                                    .label("恢复默认")
+                                                    .on_click(move |_, _, cx| {
+                                                        default_share_draft.update(
+                                                            cx,
+                                                            |draft, cx| {
+                                                                draft.lan_sftp_root = None;
+                                                                draft.error = None;
+                                                                cx.notify();
+                                                            },
+                                                        );
+                                                    }),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("默认共享当前用户主目录；更改后立即应用到新的 SFTP 文件操作。"),
+                                ),
+                        )
                         .when_some(error, |this, error| {
                             this.child(div().text_xs().text_color(theme.danger).child(error))
                         }),
@@ -586,11 +885,12 @@ impl ScpApp {
                                 .primary()
                                 .label("保存")
                                 .on_click(move |_, window, cx| {
-                                    let (behavior, editor_path) = {
+                                    let (behavior, editor_path, lan_sftp_root) = {
                                         let snapshot = save_draft.read(cx);
                                         (
                                             snapshot.remote_open_behavior,
                                             snapshot.editor_path.clone(),
+                                            snapshot.lan_sftp_root.clone(),
                                         )
                                     };
                                     if behavior == RemoteOpenBehavior::CustomEditor
@@ -606,9 +906,35 @@ impl ScpApp {
                                         });
                                         return;
                                     }
+                                    let Some(effective_root) = lan_sftp_root
+                                        .clone()
+                                        .or_else(dirs::home_dir)
+                                    else {
+                                        save_draft.update(cx, |draft, cx| {
+                                            draft.error =
+                                                Some("无法确定用户主目录，请手动选择共享目录".into());
+                                            cx.notify();
+                                        });
+                                        return;
+                                    };
+                                    let Ok(effective_root) = effective_root.canonicalize() else {
+                                        save_draft.update(cx, |draft, cx| {
+                                            draft.error = Some("共享目录不存在或无法访问".into());
+                                            cx.notify();
+                                        });
+                                        return;
+                                    };
+                                    if !effective_root.is_dir() {
+                                        save_draft.update(cx, |draft, cx| {
+                                            draft.error = Some("请选择一个文件夹作为共享目录".into());
+                                            cx.notify();
+                                        });
+                                        return;
+                                    }
                                     let settings = AppSettings {
                                         remote_open_behavior: behavior,
                                         editor_path,
+                                        lan_sftp_root,
                                     };
                                     if let Err(message) = store::save_settings(&settings) {
                                         save_draft.update(cx, |draft, cx| {
@@ -618,17 +944,37 @@ impl ScpApp {
                                         return;
                                     }
 
-                                    let _ = save_app.update(cx, |app, cx| {
+                                    let update_result = save_app.update(cx, |app, cx| {
+                                        app.lan_server = match &app.lan_server {
+                                            Ok(server) => server
+                                                .set_root(effective_root.clone())
+                                                .map(|_| server.clone())
+                                                .map_err(SharedString::from),
+                                            Err(_) => crate::sftp::lan_server::start(
+                                                settings.lan_sftp_root.clone(),
+                                            )
+                                            .map_err(SharedString::from),
+                                        };
                                         app.settings = settings.clone();
                                         app.workspace.update(cx, |workspace, cx| {
                                             workspace.set_settings(settings.clone(), cx)
                                         });
+                                        app.lan_server.as_ref().err().cloned()
                                     });
                                     window.close_dialog(cx);
-                                    window.push_notification(
-                                        Notification::success("设置已保存"),
-                                        cx,
-                                    );
+                                    if let Ok(Some(message)) = update_result {
+                                        window.push_notification(
+                                            Notification::error(format!(
+                                                "设置已保存，但局域网 SFTP 启动失败：{message}"
+                                            )),
+                                            cx,
+                                        );
+                                    } else {
+                                        window.push_notification(
+                                            Notification::success("设置已保存"),
+                                            cx,
+                                        );
+                                    }
                                 }),
                         ),
                 )
@@ -721,6 +1067,28 @@ impl ScpApp {
                         "空闲".to_string()
                     })),
             )
+            .child(match &self.lan_server {
+                Ok(info) => Button::new("lan-sftp-status")
+                    .link()
+                    .xsmall()
+                    .compact()
+                    .label(SharedString::from(format!("SFTP · {}", info.endpoint())))
+                    .tooltip("查看局域网 SFTP 登录信息")
+                    .on_click(
+                        cx.listener(|app, _, window, cx| app.open_lan_server_dialog(window, cx)),
+                    )
+                    .into_any_element(),
+                Err(_) => Button::new("lan-sftp-status")
+                    .link()
+                    .xsmall()
+                    .compact()
+                    .label("SFTP · 启动失败")
+                    .tooltip("查看局域网 SFTP 错误")
+                    .on_click(
+                        cx.listener(|app, _, window, cx| app.open_lan_server_dialog(window, cx)),
+                    )
+                    .into_any_element(),
+            })
             .child(if self.available_update.is_some() {
                 Button::new("app-version")
                     .link()

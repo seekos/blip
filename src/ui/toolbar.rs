@@ -579,7 +579,7 @@ impl Toolbar {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("macscp"),
+                            .child("Blip"),
                     ),
             )
             .child(

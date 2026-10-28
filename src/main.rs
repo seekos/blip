@@ -1,4 +1,4 @@
-//! macscp —— 原生 macOS SFTP 客户端。
+//! Blip —— 原生 macOS SFTP 客户端。
 //!
 //! 线程模型：
 //! * 主线程 = GPUI（渲染、输入、实体状态）；
@@ -17,7 +17,7 @@ use gpui_kit::*;
 
 fn main() {
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,macscp=debug"),
+        env_logger::Env::default().default_filter_or("info,blip=debug"),
     )
     .init();
 
@@ -43,7 +43,7 @@ fn main() {
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("macscp".into()),
+                    title: Some("Blip".into()),
                     appears_transparent: false,
                     traffic_light_position: None,
                 }),

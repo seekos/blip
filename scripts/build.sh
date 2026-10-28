@@ -3,8 +3,8 @@
 # 一键构建：图标 → 编译 → APP → DMG，产物汇总到 dist/。
 #
 # 产物：
-#   dist/macscp.app   双击启动的 macOS 应用包（Finder / Dock / ⌘Tab 都带图标）
-#   dist/macscp-<version>.dmg   带“应用程序”快捷方式的安装镜像
+#   dist/Blip.app   双击启动的 macOS 应用包（Finder / Dock / ⌘Tab 都带图标）
+#   dist/Blip-<version>.dmg   带“应用程序”快捷方式的安装镜像
 #
 # 用法：
 #   scripts/build.sh                # release 构建，先清空 dist/（默认）
@@ -105,17 +105,17 @@ mkdir -p "${DIST}"
 "${ROOT}/scripts/bundle.sh" "${PROFILE}" --out "${DIST}" --version "${VERSION}"
 
 # ---- 4. DMG ---------------------------------------------------------------
-DMG_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/macscp-dmg.XXXXXX")
+DMG_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/blip-dmg.XXXXXX")
 trap 'rm -rf "${DMG_STAGE}"' EXIT
-cp -R "${DIST}/macscp.app" "${DMG_STAGE}/macscp.app"
+cp -R "${DIST}/Blip.app" "${DMG_STAGE}/Blip.app"
 ln -s /Applications "${DMG_STAGE}/Applications"
-DMG="${DIST}/macscp-${VERSION}.dmg"
+DMG="${DIST}/Blip-${VERSION}.dmg"
 rm -f "${DMG}"
 if /usr/sbin/diskutil image create from --help >/dev/null 2>&1; then
-  /usr/sbin/diskutil image create from --format UDZO --volumeName "macscp" \
+  /usr/sbin/diskutil image create from --format UDZO --volumeName "Blip" \
     "${DMG_STAGE}" "${DMG}" >/dev/null
 else
-  /usr/bin/hdiutil create -volname "macscp" -srcfolder "${DMG_STAGE}" \
+  /usr/bin/hdiutil create -volname "Blip" -srcfolder "${DMG_STAGE}" \
     -format UDZO "${DMG}" >/dev/null
 fi
 rm -rf "${DMG_STAGE}"
@@ -127,7 +127,7 @@ ELAPSED=$(( $(date +%s) - START ))
 
 echo
 echo "产物（${PROFILE}，${ELAPSED}s）："
-du -sh "${DIST}/macscp.app" | awk -v d="${DIST}" '{printf "  %-6s %s/macscp.app\n", $1, d}'
+du -sh "${DIST}/Blip.app" | awk -v d="${DIST}" '{printf "  %-6s %s/Blip.app\n", $1, d}'
 du -sh "${DMG}" | awk -v p="${DMG}" '{printf "  %-6s %s\n", $1, p}'
 echo
-echo "双击启动：open \"${DIST}/macscp.app\""
+echo "双击启动：open \"${DIST}/Blip.app\""

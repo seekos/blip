@@ -31,7 +31,7 @@ pub fn check_latest_release(current_version: &str) -> Result<Option<AvailableUpd
             "--header",
             "X-GitHub-Api-Version: 2022-11-28",
             "--user-agent",
-            concat!("macscp/", env!("CARGO_PKG_VERSION")),
+            concat!("Blip/", env!("CARGO_PKG_VERSION")),
             LATEST_RELEASE_URL,
         ])
         .output()

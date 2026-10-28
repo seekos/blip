@@ -96,6 +96,8 @@ pub struct AppSettings {
     pub remote_open_behavior: RemoteOpenBehavior,
     /// 自定义编辑器的 `.app` 或可执行文件路径；系统默认和内置模式下忽略。
     pub editor_path: Option<PathBuf>,
+    /// 内置局域网 SFTP 的共享根目录；`None` 表示当前用户主目录。
+    pub lan_sftp_root: Option<PathBuf>,
 }
 
 impl Default for AppSettings {
@@ -109,10 +111,12 @@ fn preferred_settings(notepad: Option<PathBuf>) -> AppSettings {
         Some(editor_path) => AppSettings {
             remote_open_behavior: RemoteOpenBehavior::CustomEditor,
             editor_path: Some(editor_path),
+            lan_sftp_root: None,
         },
         None => AppSettings {
             remote_open_behavior: RemoteOpenBehavior::SystemDefault,
             editor_path: None,
+            lan_sftp_root: None,
         },
     }
 }
@@ -583,6 +587,7 @@ mod tests {
         let settings = AppSettings {
             remote_open_behavior: RemoteOpenBehavior::CustomEditor,
             editor_path: Some(PathBuf::from("/Applications/Visual Studio Code.app")),
+            lan_sftp_root: Some(PathBuf::from("/Users/tester/Shared")),
         };
         let json = serde_json::to_string(&settings).expect("序列化设置");
         let decoded: AppSettings = serde_json::from_str(&json).expect("读回设置");

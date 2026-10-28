@@ -11,6 +11,7 @@
 //! | --- | --- |
 //! | [`types`] | 协议类型，全部 `Send + 'static` |
 //! | [`worker`] | 线程 + runtime + 命令循环 + 取消表 |
+//! | [`lan_server`] | 局域网 SFTP 服务端 + 主目录沙箱 |
 //! | [`session`] | SSH 建连、密码/私钥认证、SFTP 子系统、目录与文件操作 |
 //! | [`transfer`] | 流式上传下载，进度按 100ms 节流 |
 //! | [`local_tree`] | 上传文件夹前扫本地目录树（纯 `std::fs`，可单测） |
@@ -19,6 +20,7 @@
 //! 一条硬约束：这个模块里**不允许**出现任何 GPUI 类型，也**不允许**在 GPUI 的
 //! `render` / `Context` 里调用这里的 `async` 函数 —— 只能通过 `flume` 通信。
 
+pub mod lan_server;
 pub mod local_tree;
 mod path_lock;
 pub mod remote_tree;

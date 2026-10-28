@@ -13,7 +13,7 @@
 # 用法：
 #   scripts/bundle.sh                          # debug 构建，输出到 target/debug/
 #   scripts/bundle.sh release                  # release 构建，输出到 target/release/
-#   scripts/bundle.sh release --out dist       # 输出到 dist/macscp.app
+#   scripts/bundle.sh release --out dist       # 输出到 dist/Blip.app
 #   scripts/bundle.sh release --out dist --no-build   # 不重新编译，只重新打包
 #   scripts/bundle.sh release --version 0.2.0   # 覆盖应用包版本号
 #
@@ -56,7 +56,7 @@ case "${PROFILE}" in
   release) CARGO_FLAGS="--release" ;;
 esac
 
-BIN="${ROOT}/target/${PROFILE}/macscp"
+BIN="${ROOT}/target/${PROFILE}/blip"
 ICNS="${ROOT}/assets/icon/AppIcon.icns"
 
 # --out 相对路径按仓库根解析，避免在 scripts/ 里跑脚本时产物落错地方。
@@ -68,7 +68,7 @@ if [ -n "${OUT_DIR}" ]; then
 else
   OUT_DIR="${ROOT}/target/${PROFILE}"
 fi
-APP="${OUT_DIR}/macscp.app"
+APP="${OUT_DIR}/Blip.app"
 
 # 没有显式覆盖时，版本号从 Cargo.toml 读取。
 if [ -z "${VERSION}" ]; then
@@ -97,7 +97,7 @@ echo "→ 组装 ${APP}"
 rm -rf "${APP}"
 mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
 
-cp "${BIN}" "${APP}/Contents/MacOS/macscp"
+cp "${BIN}" "${APP}/Contents/MacOS/blip"
 cp "${ICNS}" "${APP}/Contents/Resources/AppIcon.icns"
 
 # APPL???? —— 老工具（部分 Finder 插件、installer）仍会读这个 8 字节文件。
@@ -111,15 +111,15 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleExecutable</key>
-    <string>macscp</string>
+    <string>blip</string>
     <key>CFBundleIdentifier</key>
     <string>com.macscp.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>macscp</string>
+    <string>Blip</string>
     <key>CFBundleDisplayName</key>
-    <string>macscp</string>
+    <string>Blip</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>
