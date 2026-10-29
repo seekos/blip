@@ -95,7 +95,8 @@ pub enum RemoteOpenBehavior {
 #[serde(rename_all = "snake_case")]
 pub enum LanSftpPasswordMode {
     #[default]
-    Random,
+    #[serde(alias = "random")]
+    Default,
     Manual,
 }
 
@@ -122,13 +123,13 @@ fn preferred_settings(notepad: Option<PathBuf>) -> AppSettings {
             remote_open_behavior: RemoteOpenBehavior::CustomEditor,
             editor_path: Some(editor_path),
             lan_sftp_root: None,
-            lan_sftp_password_mode: LanSftpPasswordMode::Random,
+            lan_sftp_password_mode: LanSftpPasswordMode::Default,
         },
         None => AppSettings {
             remote_open_behavior: RemoteOpenBehavior::SystemDefault,
             editor_path: None,
             lan_sftp_root: None,
-            lan_sftp_password_mode: LanSftpPasswordMode::Random,
+            lan_sftp_password_mode: LanSftpPasswordMode::Default,
         },
     }
 }
@@ -622,7 +623,10 @@ mod tests {
             RemoteOpenBehavior::CustomEditor
         );
         assert_eq!(defaults.editor_path, Some(notepad));
-        assert_eq!(defaults.lan_sftp_password_mode, LanSftpPasswordMode::Random);
+        assert_eq!(
+            defaults.lan_sftp_password_mode,
+            LanSftpPasswordMode::Default
+        );
 
         let fallback = preferred_settings(None);
         assert_eq!(
@@ -630,7 +634,10 @@ mod tests {
             RemoteOpenBehavior::SystemDefault
         );
         assert_eq!(fallback.editor_path, None);
-        assert_eq!(fallback.lan_sftp_password_mode, LanSftpPasswordMode::Random);
+        assert_eq!(
+            fallback.lan_sftp_password_mode,
+            LanSftpPasswordMode::Default
+        );
 
         let settings = AppSettings {
             remote_open_behavior: RemoteOpenBehavior::CustomEditor,
@@ -641,6 +648,14 @@ mod tests {
         let json = serde_json::to_string(&settings).expect("序列化设置");
         let decoded: AppSettings = serde_json::from_str(&json).expect("读回设置");
         assert_eq!(decoded, settings);
+
+        let previous_random: AppSettings =
+            serde_json::from_str(r#"{"lan_sftp_password_mode":"random"}"#)
+                .expect("迁移原随机密码模式");
+        assert_eq!(
+            previous_random.lan_sftp_password_mode,
+            LanSftpPasswordMode::Default
+        );
 
         let previous_download: AppSettings =
             serde_json::from_str(r#"{"remote_open_behavior":"download"}"#).expect("迁移原下载设置");
@@ -670,7 +685,7 @@ mod tests {
         );
         assert_eq!(
             previous_text.lan_sftp_password_mode,
-            LanSftpPasswordMode::Random
+            LanSftpPasswordMode::Default
         );
     }
 

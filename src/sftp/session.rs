@@ -5,6 +5,7 @@
 use std::fmt;
 use std::future::Future;
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -378,6 +379,76 @@ const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_DELAYS: [Duration; CONNECT_ATTEMPTS - 1] =
     [Duration::from_millis(400), Duration::from_millis(1200)];
 
+/// 为同网段重复地址准备真正不同的 TCP 出口。
+///
+/// 第一次仍交给系统路由；后续优先绑定同一子网里的其它本机 IPv4。仅仅重复
+/// `TcpStream::connect` 不会换路由，在两张网卡同时接入同一网段时会连续走错接口。
+fn connection_sources(host: &str) -> [Option<Ipv4Addr>; CONNECT_ATTEMPTS] {
+    // shortcut: 只处理设备列表使用的字面量 IPv4；主机名和 IPv6 仍使用系统路由。
+    let Ok(target) = host.parse::<Ipv4Addr>() else {
+        return [None; CONNECT_ATTEMPTS];
+    };
+    let default_source = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|socket| {
+            socket.connect((target, 9))?;
+            socket.local_addr()
+        })
+        .ok()
+        .and_then(|address| match address.ip() {
+            std::net::IpAddr::V4(address) => Some(address),
+            std::net::IpAddr::V6(_) => None,
+        });
+    let networks = netdev::get_interfaces()
+        .into_iter()
+        .filter(|interface| {
+            interface.is_up() && !interface.is_loopback() && !interface.is_point_to_point()
+        })
+        .flat_map(|interface| {
+            interface
+                .ipv4
+                .into_iter()
+                .map(|network| (network.addr(), network.prefix_len()))
+        });
+    connection_sources_from(target, default_source, networks)
+}
+
+fn connection_sources_from(
+    target: Ipv4Addr,
+    default_source: Option<Ipv4Addr>,
+    networks: impl IntoIterator<Item = (Ipv4Addr, u8)>,
+) -> [Option<Ipv4Addr>; CONNECT_ATTEMPTS] {
+    let mut sources = [None; CONNECT_ATTEMPTS];
+    let mut next = 1;
+    for (source, prefix_len) in networks {
+        if next == CONNECT_ATTEMPTS {
+            break;
+        }
+        if Some(source) == default_source
+            || source.is_unspecified()
+            || source.is_loopback()
+            || !same_ipv4_subnet(source, target, prefix_len)
+            || sources[..next].contains(&Some(source))
+        {
+            continue;
+        }
+        sources[next] = Some(source);
+        next += 1;
+    }
+    sources
+}
+
+fn same_ipv4_subnet(left: Ipv4Addr, right: Ipv4Addr, prefix_len: u8) -> bool {
+    if prefix_len > 32 {
+        return false;
+    }
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    u32::from(left) & mask == u32::from(right) & mask
+}
+
 /// 建连失败的原始错误 + 已经试过几次。
 type ConnectFailure = (russh::Error, usize);
 
@@ -499,28 +570,45 @@ async fn connect_with_ssh_config(
     let verification = Arc::new(Mutex::new(VerificationState::default()));
 
     let addr = (config.host.as_str(), config.port);
+    let target = config.host.parse::<Ipv4Addr>().ok();
+    let sources = connection_sources(&config.host);
     // TCP + 版本交换 + 密钥交换这一段带重试（见 `is_transient_connect_error`）；
     // 后面的认证与 SFTP 握手不重试 —— 那两步失败重试也没用。
-    let handle_result = connect_with_retries(|_round| {
+    let handle_result = connect_with_retries(|round| {
         let ssh_config = ssh_config.clone();
         let verification = verification.clone();
         let host_key_policy = host_key_policy.clone();
         let host = config.host.clone();
         let port = config.port;
+        let source = sources[round - 1];
         async move {
-            let transport = timeout(
-                CONNECT_TIMEOUT,
-                client::connect(
-                    ssh_config,
-                    addr,
-                    ClientHandler {
-                        host,
-                        port,
-                        policy: host_key_policy,
-                        verification,
-                    },
-                ),
-            )
+            let transport = timeout(CONNECT_TIMEOUT, async {
+                let handler = ClientHandler {
+                    host,
+                    port,
+                    policy: host_key_policy,
+                    verification,
+                };
+                let Some((source, target)) = source.zip(target) else {
+                    return client::connect(ssh_config, addr, handler).await;
+                };
+
+                warn!("建连第 {round}/{CONNECT_ATTEMPTS} 次改用本机地址 {source}");
+                let socket = tokio::net::TcpSocket::new_v4().map_err(russh::Error::IO)?;
+                socket
+                    .bind(SocketAddr::from((source, 0)))
+                    .map_err(russh::Error::IO)?;
+                let stream = socket
+                    .connect(SocketAddr::from((target, port)))
+                    .await
+                    .map_err(russh::Error::IO)?;
+                if ssh_config.nodelay
+                    && let Err(err) = stream.set_nodelay(true)
+                {
+                    warn!("设置 TCP_NODELAY 失败：{err}");
+                }
+                client::connect_stream(ssh_config, stream, handler).await
+            })
             .await;
             match transport {
                 Ok(result) => result,
@@ -719,6 +807,7 @@ async fn read_dir(sftp: &SftpSession, path: &str) -> Result<Vec<FileEntry>, Dire
 
         entries.push(FileEntry {
             path: join_remote(path, &name),
+            hidden: name.starts_with('.'),
             name,
             kind,
             size: meta.size.unwrap_or(0),
@@ -1060,6 +1149,7 @@ mod tests {
             name: name.to_string(),
             path: name.to_string(),
             kind,
+            hidden: name.starts_with('.'),
             size: 0,
             modified: None,
             mode: None,
@@ -1137,6 +1227,22 @@ mod tests {
             &russh::Error::ConnectionTimeout
         ));
         assert!(!is_transient_connect_error(&russh::Error::Version));
+    }
+
+    #[test]
+    fn retries_lan_ip_through_an_alternate_interface() {
+        let target = Ipv4Addr::new(192, 168, 146, 7);
+        let sources = connection_sources_from(
+            target,
+            Some(Ipv4Addr::new(192, 168, 146, 2)),
+            [
+                (Ipv4Addr::new(10, 0, 0, 5), 24),
+                (Ipv4Addr::new(192, 168, 146, 2), 24),
+                (Ipv4Addr::new(192, 168, 146, 4), 24),
+            ],
+        );
+
+        assert_eq!(sources, [None, Some(Ipv4Addr::new(192, 168, 146, 4)), None]);
     }
 
     /// 前两次「主机不可达」、第三次成功 → 整体成功，且确实试了三次。

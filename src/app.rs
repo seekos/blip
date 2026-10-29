@@ -97,7 +97,7 @@ impl ScpApp {
         let profiles = store::load_profiles();
         let settings = store::load_settings();
         let server_password = match settings.lan_sftp_password_mode {
-            LanSftpPasswordMode::Random => Ok(None),
+            LanSftpPasswordMode::Default => Ok(None),
             LanSftpPasswordMode::Manual => store::load_lan_sftp_password().and_then(|password| {
                 password
                     .map(Some)
@@ -207,6 +207,7 @@ impl ScpApp {
                 match event {
                     WorkspaceEvent::SessionStateChanged(state) => {
                         let state = *state;
+                        let was_connected = app.toolbar.read(cx).state() == SessionState::Connected;
                         // 连接失败的原因（认证被拒、私钥口令错、超时…）要出现在表单旁边，
                         // 只塞进底部状态栏等于没告诉用户。
                         let last_error = app.workspace.read(cx).last_error();
@@ -224,7 +225,7 @@ impl ScpApp {
                         app.sync_window_title(window, cx);
 
                         // 连接成功才落盘凭证，避免把错误密码写进钥匙串。
-                        if state == SessionState::Connected {
+                        if state == SessionState::Connected && !was_connected {
                             app.persist_profile(cx);
                         } else if state == SessionState::Disconnected {
                             // 认证失败、超时或主动断开后，绝不能把这份配置用于下一次成功事件。
@@ -412,7 +413,7 @@ impl ScpApp {
                                                     .w(px(72.))
                                                     .text_xs()
                                                     .text_color(theme.muted_foreground)
-                                                    .child("6 位密码"),
+                                                    .child("登录密码"),
                                             )
                                             .child(
                                                 div()
@@ -459,7 +460,7 @@ impl ScpApp {
                                                     .text_sm()
                                                     .truncate()
                                                     .child(SharedString::from(
-                                                        info.root().to_string_lossy().into_owned(),
+                                                        display_local_path(&info.root()),
                                                     )),
                                             ),
                                     ),
@@ -471,7 +472,7 @@ impl ScpApp {
                                     .child(if manual_password {
                                         "当前使用手动密码。请只在可信局域网中使用；退出 Blip 后服务自动停止。"
                                     } else {
-                                        "密码会在每次启动应用时重新生成。请只在可信局域网中使用；退出 Blip 后服务自动停止。"
+                                        "当前使用默认密码，可在设置中改为手动密码。请只在可信局域网中使用；退出 Blip 后服务自动停止。"
                                     }),
                             ),
                     )
@@ -851,7 +852,7 @@ impl ScpApp {
                                             RadioGroup::vertical("lan-sftp-password-mode")
                                                 .selected_index(Some(
                                                     if lan_sftp_password_mode
-                                                        == LanSftpPasswordMode::Random
+                                                        == LanSftpPasswordMode::Default
                                                     {
                                                         0
                                                     } else {
@@ -864,7 +865,7 @@ impl ScpApp {
                                                         |draft, cx| {
                                                             draft.lan_sftp_password_mode =
                                                                 if *index == 0 {
-                                                                    LanSftpPasswordMode::Random
+                                                                    LanSftpPasswordMode::Default
                                                                 } else {
                                                                     LanSftpPasswordMode::Manual
                                                                 };
@@ -874,8 +875,8 @@ impl ScpApp {
                                                     );
                                                 })
                                                 .child(
-                                                    Radio::new("lan-sftp-password-random")
-                                                        .label("每次启动随机生成 6 位数字密码"),
+                                                    Radio::new("lan-sftp-password-default")
+                                                        .label("使用默认密码 88888888"),
                                                 )
                                                 .child(
                                                     Radio::new("lan-sftp-password-manual")
@@ -971,9 +972,7 @@ impl ScpApp {
                                                     lan_sftp_root
                                                         .clone()
                                                         .or_else(dirs::home_dir)
-                                                        .map(|path| {
-                                                            path.to_string_lossy().into_owned()
-                                                        })
+                                                        .map(|path| display_local_path(&path))
                                                         .unwrap_or_else(|| {
                                                             "无法确定用户主目录".to_string()
                                                         }),
@@ -1175,13 +1174,13 @@ impl ScpApp {
                                                 .and_then(|_| match lan_sftp_password_mode {
                                                     LanSftpPasswordMode::Manual => server
                                                         .set_password(manual_password.clone()),
-                                                    LanSftpPasswordMode::Random
+                                                    LanSftpPasswordMode::Default
                                                         if app.settings.lan_sftp_password_mode
                                                             == LanSftpPasswordMode::Manual =>
                                                     {
                                                         server.set_password(None)
                                                     }
-                                                    LanSftpPasswordMode::Random => Ok(()),
+                                                    LanSftpPasswordMode::Default => Ok(()),
                                                 })
                                                 .map(|_| server.clone())
                                                 .map_err(SharedString::from),
@@ -1380,6 +1379,21 @@ fn is_editor_path(path: &std::path::Path) -> bool {
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("app")))
 }
 
+fn display_local_path(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy();
+    if cfg!(target_os = "windows") {
+        return strip_windows_verbatim_prefix(&path);
+    }
+    path.into_owned()
+}
+
+fn strip_windows_verbatim_prefix(path: &str) -> String {
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{path}");
+    }
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+}
+
 /// 把 `~/xxx` 展开成真实路径；其它输入原样返回。
 ///
 /// 留空时返回空 `PathBuf`，交给 worker 去 `~/.ssh` 里自动找私钥。
@@ -1437,5 +1451,17 @@ mod tests {
             prepared.profile.auth,
             SavedAuth::Key { ref path } if path == "/tmp/id_ed25519"
         ));
+    }
+
+    #[test]
+    fn windows_verbatim_paths_are_human_readable() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\Users\zy\Shared"),
+            r"C:\Users\zy\Shared"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\Shared"),
+            r"\\server\Shared"
+        );
     }
 }

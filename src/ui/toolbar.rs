@@ -35,6 +35,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL, ns_string};
 
 use crate::discovery::DiscoveredDevice;
 use crate::session::store::{self, SavedAuth, SavedProfile};
+use crate::sftp::lan_server::DEFAULT_PASSWORD;
 use crate::sftp::types::{AuthMethod, DEFAULT_SSH_PORT, SessionConfig};
 use crate::ui::SessionState;
 
@@ -368,8 +369,9 @@ impl Toolbar {
         });
         self.username
             .update(cx, |state, cx| state.set_value("zy", window, cx));
-        self.password
-            .update(cx, |state, cx| state.set_value(String::new(), window, cx));
+        self.password.update(cx, |state, cx| {
+            state.set_value(DEFAULT_PASSWORD, window, cx)
+        });
         cx.notify();
     }
 

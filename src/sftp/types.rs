@@ -88,6 +88,8 @@ pub struct FileEntry {
     /// 完整路径：本地为绝对文件系统路径，远端为 POSIX 路径。
     pub path: String,
     pub kind: EntryKind,
+    /// 本地使用平台隐藏属性，远端使用点文件命名规则。
+    pub hidden: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
     /// POSIX mode 位，含文件类型位（例如目录是 `0o040_755`）。
@@ -405,6 +407,8 @@ pub enum SftpEvent {
     Connected {
         home: String,
     },
+    /// 已建立的连接意外关闭；worker 会保留连接意图并持续尝试恢复。
+    Reconnecting,
     Disconnected,
     /// 目录读取完成，`entries` 已按「文件夹优先、名称字母序」排好。
     DirListed {

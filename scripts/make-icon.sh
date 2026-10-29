@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 从矢量源生成 macOS 图标：assets/icon/macscp-icon.svg → assets/icon/AppIcon.icns
+# 从矢量源生成 macOS / Windows 图标：AppIcon.icns、AppIcon.ico
 #
 # 依赖：Google Chrome（无头渲染 SVG）、sips、iconutil —— 全是 macOS 自带的，
 # 只有 Chrome 是额外要求。之所以用 Chrome 而不是 rsvg-convert / ImageMagick：
@@ -18,6 +18,7 @@ ROOT=$(pwd)
 SVG="${ROOT}/assets/icon/macscp-icon.svg"
 ICONSET="${ROOT}/assets/icon/AppIcon.iconset"
 ICNS="${ROOT}/assets/icon/AppIcon.icns"
+ICO="${ROOT}/assets/icon/AppIcon.ico"
 MASTER="${ROOT}/target/icon-master-1024.png"
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
@@ -70,8 +71,11 @@ done
 echo "→ 打包 icns"
 iconutil -c icns "${ICONSET}" -o "${ICNS}"
 
+echo "→ 打包 ico"
+sips -z 256 256 "${MASTER}" --setProperty format ico --out "${ICO}" >/dev/null
+
 # iconset 只是中间产物（10 个 PNG，约 1.4 MB），留着的唯一价值是排查某档尺寸糊掉。
 # 需要时重跑一次本脚本即可，默认清掉，别让仓库里躺着两套图标。
 rm -rf "${ICONSET}"
 
-echo "完成：${ICNS} ($(du -h "${ICNS}" | cut -f1 | tr -d ' '))"
+echo "完成：${ICNS}、${ICO}"

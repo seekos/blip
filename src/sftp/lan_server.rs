@@ -2,7 +2,8 @@
 //!
 //! 服务随应用启动，优先监听 `0.0.0.0:2022`；端口被占用时让系统分配空闲端口。
 //! 虚拟根目录默认映射到当前用户主目录，也可在设置中切换；任何越界路径与指向共享
-//! 目录外的符号链接都会被拒绝。每次启动生成一枚临时密码，主机密钥则持久化，避免
+//! 目录外的符号链接都会被拒绝。登录密码默认为 `88888888`，也可在设置中修改；
+//! 主机密钥会持久化，避免
 //! 客户端反复提示变更。
 
 use std::collections::HashMap;
@@ -14,7 +15,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rand::RngExt as _;
 use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 
 const DEFAULT_PORT: u16 = 2022;
 const USERNAME: &str = "zy";
+pub(crate) const DEFAULT_PASSWORD: &str = "88888888";
 const READ_DIR_BATCH: usize = 128;
 
 #[derive(Clone, Debug)]
@@ -188,18 +189,11 @@ fn local_ipv4() -> IpAddr {
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
-fn random_password() -> String {
-    let mut rng = rand::rng();
-    (0..6)
-        .map(|_| char::from(b'0' + rng.random_range(0_u8..10)))
-        .collect()
-}
-
 fn selected_password(manual_password: Option<String>) -> Result<String, String> {
     match manual_password {
         Some(password) if password.is_empty() => Err("手动密码不能为空".to_string()),
         Some(password) => Ok(password),
-        None => Ok(random_password()),
+        None => Ok(DEFAULT_PASSWORD.to_string()),
     }
 }
 
@@ -696,12 +690,8 @@ mod tests {
     }
 
     #[test]
-    fn password_is_six_digits() {
-        for _ in 0..100 {
-            let password = random_password();
-            assert_eq!(password.len(), 6);
-            assert!(password.bytes().all(|byte| byte.is_ascii_digit()));
-        }
+    fn default_password_is_88888888() {
+        assert_eq!(selected_password(None).as_deref(), Ok(DEFAULT_PASSWORD));
     }
 
     #[test]
@@ -716,6 +706,8 @@ mod tests {
         info.set_password(Some("my custom password".into()))
             .expect("设置手动密码");
         assert_eq!(info.password(), "my custom password");
+        info.set_password(None).expect("恢复默认密码");
+        assert_eq!(info.password(), DEFAULT_PASSWORD);
         assert!(selected_password(Some(String::new())).is_err());
     }
 

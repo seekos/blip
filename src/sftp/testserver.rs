@@ -964,6 +964,45 @@ mod tests {
         HostKeyPolicy::Exact(key.public_key().clone())
     }
 
+    struct ControlledServer {
+        addr: SocketAddr,
+        handle: russh::server::RunningServerHandle,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ControlledServer {
+        async fn shutdown(self) {
+            self.handle.shutdown("测试服务重启".to_string());
+            self.task.await.expect("等待测试服务退出");
+        }
+    }
+
+    async fn spawn_controlled(addr: Option<SocketAddr>) -> ControlledServer {
+        let key = PrivateKey::from_openssh(TEST_HOST_KEY).expect("解析测试主机密钥");
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time: Duration::from_millis(50),
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        });
+        let listener = tokio::net::TcpListener::bind(
+            addr.unwrap_or_else(|| "127.0.0.1:0".parse().expect("解析回环地址")),
+        )
+        .await
+        .expect("绑定可控测试服务");
+        let addr = listener.local_addr().expect("读取可控测试服务地址");
+        let (handle_tx, handle_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut server = TestServer;
+            let running = server.run_on_socket(config, &listener);
+            handle_tx.send(running.handle()).ok();
+            running.await.expect("运行可控测试服务");
+        });
+        let handle = handle_rx.await.expect("取得可控测试服务句柄");
+
+        ControlledServer { addr, handle, task }
+    }
+
     async fn connect_test(
         config: &SessionConfig,
     ) -> std::result::Result<session::ActiveSession, session::ConnectError> {
@@ -1258,6 +1297,33 @@ mod tests {
             }
             other => panic!("期望 DirListed，实际 {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn worker_reconnects_after_server_restart() {
+        let server = spawn_controlled(None).await;
+        let addr = server.addr;
+        let worker = SftpWorker::spawn();
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
+
+        server.shutdown().await;
+        assert!(matches!(next_event(&worker).await, SftpEvent::Reconnecting));
+
+        let _restarted = spawn_controlled(Some(addr)).await;
+        match next_event(&worker).await {
+            SftpEvent::Connected { home } => assert_eq!(home, HOME),
+            other => panic!("服务恢复后应自动重连，实际 {other:?}"),
+        }
+
+        worker.send(SftpCommand::ListDir {
+            request_id: 99,
+            path: HOME.to_string(),
+            fallback: None,
+        });
+        assert!(matches!(
+            next_event(&worker).await,
+            SftpEvent::DirListed { request_id: 99, .. }
+        ));
     }
 
     /// 右键编辑的完整链路：读取 UTF-8、保存、保留权限，且不遗留临时文件。

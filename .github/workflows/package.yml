@@ -36,7 +36,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64
-          path: dist/*-windows-x86_64.zip
+          path: dist/*-windows-x86_64.exe
           if-no-files-found: error
 
   linux-x86_64:

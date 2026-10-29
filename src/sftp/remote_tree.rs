@@ -125,6 +125,7 @@ mod tests {
             name: name.to_string(),
             path: format!("/home/tester/root/{name}"),
             kind,
+            hidden: name.starts_with('.'),
             size,
             modified: None,
             mode: None,

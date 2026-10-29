@@ -116,6 +116,7 @@ fn entry(
         name: name.to_string(),
         path: join(root, name),
         kind,
+        hidden: name.starts_with('.'),
         size,
         modified: Some(SystemTime::now() - Duration::from_secs(ago_secs)),
         mode: Some(mode),

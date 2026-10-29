@@ -5,7 +5,7 @@
 # 产物：
 #   macOS: dist/Blip.app + dist/Blip-<version>-macos-<arch>.dmg
 #   Linux: dist/Blip-<version>-linux-<arch>.tar.gz
-#   Windows: dist/Blip-<version>-windows-<arch>.zip
+#   Windows: dist/Blip-<version>-windows-<arch>.exe
 #
 # 用法：
 #   scripts/build.sh                # 当前系统 release 构建，先清空 dist/
@@ -107,35 +107,20 @@ fi
 
 case "${PLATFORM}" in
   MINGW*|MSYS*|CYGWIN*)
-    command -v cygpath >/dev/null 2>&1 \
-      || { echo "Windows 打包请在 Git Bash 中运行" >&2; exit 1; }
-    command -v powershell.exe >/dev/null 2>&1 \
-      || { echo "找不到 Windows PowerShell" >&2; exit 1; }
-
     echo "→ cargo build ${PROFILE}"
     # shellcheck disable=SC2086
     cargo build --locked ${CARGO_FLAGS}
 
     ARCH=$(uname -m)
-    [ "${ARCH}" = "x86_64" ] || { echo "当前只打包 Windows x64" >&2; exit 1; }
-    ARCHIVE="${DIST}/Blip-${VERSION}-windows-x86_64.zip"
-    STAGE=$(mktemp -d "${TMPDIR:-/tmp}/blip-windows.XXXXXX")
-    trap 'rm -rf "${STAGE}"' EXIT
-    cp "${ROOT}/target/${PROFILE}/blip.exe" "${STAGE}/Blip.exe"
-    cp "${ROOT}/README.md" "${STAGE}/README.md"
-
-    BLIP_STAGE_WIN=$(cygpath -w "${STAGE}")
-    BLIP_ARCHIVE_WIN=$(cygpath -w "${ARCHIVE}")
-    export BLIP_STAGE_WIN BLIP_ARCHIVE_WIN
-    powershell.exe -NoProfile -NonInteractive -Command \
-      '$files = @((Join-Path $env:BLIP_STAGE_WIN "Blip.exe"), (Join-Path $env:BLIP_STAGE_WIN "README.md")); Compress-Archive -LiteralPath $files -DestinationPath $env:BLIP_ARCHIVE_WIN -Force' \
-      >/dev/null
+    [ "${ARCH}" = "x86_64" ] || { echo "当前只构建 Windows x64" >&2; exit 1; }
+    OUTPUT="${DIST}/Blip-${VERSION}-windows-x86_64.exe"
+    cp "${ROOT}/target/${PROFILE}/blip.exe" "${OUTPUT}"
     printf '%s\n' "${VERSION}" > "${VERSION_FILE}"
 
     ELAPSED=$(( $(date +%s) - START ))
     echo
     echo "产物（${PROFILE}，${ELAPSED}s）："
-    du -sh "${ARCHIVE}" | awk -v p="${ARCHIVE}" '{printf "  %-6s %s\n", $1, p}'
+    du -sh "${OUTPUT}" | awk -v p="${OUTPUT}" '{printf "  %-6s %s\n", $1, p}'
     exit 0
     ;;
 esac

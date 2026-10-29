@@ -102,6 +102,8 @@ pub struct FilePane {
     side: PaneSide,
     path: String,
     loading: bool,
+    local_reading: bool,
+    local_request_seq: u64,
     error: Option<SharedString>,
     /// 是否已连接。决定右键菜单里的动作是否可点。
     online: bool,
@@ -197,6 +199,8 @@ impl FilePane {
             side,
             path,
             loading: false,
+            local_reading: false,
+            local_request_seq: 0,
             error: None,
             online: false,
             show_hidden,
@@ -225,6 +229,10 @@ impl FilePane {
     /// 当前可见的条目数（隐藏文件是否计入取决于 [`Self::show_hidden`]）。
     pub fn entries_count(&self, cx: &App) -> usize {
         self.table.read(cx).delegate().entries.len()
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading || self.local_reading
     }
 
     fn selected_count(&self, cx: &App) -> usize {
@@ -264,16 +272,21 @@ impl FilePane {
 
     /// 上层把远端目录内容塞进来。
     pub fn set_entries(&mut self, path: String, entries: Vec<FileEntry>, cx: &mut Context<Self>) {
+        let keep_selection = self.path == path;
         self.set_path(path);
         self.loading = false;
         self.error = None;
         let parent = self.parent_entry();
         self.table.update(cx, |state, cx| {
             let delegate = state.delegate_mut();
+            let selected_paths = keep_selection.then(|| delegate.selected_paths());
             delegate.set_entries(entries);
             delegate.parent = parent;
             delegate.loading = false;
-            delegate.clear_selection();
+            match selected_paths {
+                Some(paths) => delegate.restore_selection(&paths),
+                None => delegate.clear_selection(),
+            }
             state.clear_selection(cx);
             state.refresh(cx);
         });
@@ -314,50 +327,65 @@ impl FilePane {
             PaneSide::Remote => {
                 cx.emit(FilePaneEvent::Navigate(self.path.clone()));
             }
-            PaneSide::Local => {
-                let path = PathBuf::from(&self.path);
-                let requested_path = path.clone();
-                self.set_loading(true, cx);
-
-                let task = cx
-                    .background_executor()
-                    .spawn(async move { read_local_dir(&path) });
-
-                cx.spawn(async move |this, cx| {
-                    let result = task.await;
-                    let _ = this.update(cx, |pane, cx| {
-                        // 期间可能已经导航到别处，迟到结果不能覆盖新目录。
-                        if Path::new(&pane.path) != requested_path {
-                            return;
-                        }
-                        pane.loading = false;
-                        let parent = pane.parent_entry();
-                        pane.table.update(cx, |state, cx| {
-                            let delegate = state.delegate_mut();
-                            delegate.loading = false;
-                            delegate.parent = parent;
-                            if let Ok(entries) = &result {
-                                delegate.set_entries(entries.clone());
-                            }
-                            delegate.clear_selection();
-                            state.clear_selection(cx);
-                            state.refresh(cx);
-                        });
-                        pane.row_bounds.borrow_mut().clear();
-                        let loaded = result.is_ok();
-                        match result {
-                            Ok(_) => pane.error = None,
-                            Err(message) => pane.error = Some(message.into()),
-                        }
-                        if loaded {
-                            cx.emit(FilePaneEvent::DirectoryLoaded(pane.path.clone()));
-                        }
-                        cx.notify();
-                    });
-                })
-                .detach();
-            }
+            PaneSide::Local => self.reload_local(true, cx),
         }
+    }
+
+    pub fn refresh_silently(&mut self, cx: &mut Context<Self>) {
+        if self.side == PaneSide::Local && !self.is_loading() {
+            self.reload_local(false, cx);
+        }
+    }
+
+    fn reload_local(&mut self, show_loading: bool, cx: &mut Context<Self>) {
+        let path = PathBuf::from(&self.path);
+        let requested_path = path.clone();
+        self.local_request_seq = self.local_request_seq.wrapping_add(1);
+        let request_id = self.local_request_seq;
+        self.local_reading = true;
+        if show_loading {
+            self.set_loading(true, cx);
+        }
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { read_local_dir(&path) });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |pane, cx| {
+                // 期间可能已经导航到别处，迟到结果不能覆盖新目录。
+                if pane.local_request_seq != request_id || Path::new(&pane.path) != requested_path {
+                    return;
+                }
+                pane.loading = false;
+                pane.local_reading = false;
+                let parent = pane.parent_entry();
+                pane.table.update(cx, |state, cx| {
+                    let delegate = state.delegate_mut();
+                    let selected_paths = delegate.selected_paths();
+                    delegate.loading = false;
+                    delegate.parent = parent;
+                    if let Ok(entries) = &result {
+                        delegate.set_entries(entries.clone());
+                        delegate.restore_selection(&selected_paths);
+                    }
+                    state.clear_selection(cx);
+                    state.refresh(cx);
+                });
+                pane.row_bounds.borrow_mut().clear();
+                let loaded = result.is_ok();
+                match result {
+                    Ok(_) => pane.error = None,
+                    Err(message) => pane.error = Some(message.into()),
+                }
+                if loaded {
+                    cx.emit(FilePaneEvent::DirectoryLoaded(pane.path.clone()));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn navigate(&mut self, path: String, cx: &mut Context<Self>) {
@@ -696,6 +724,7 @@ impl FilePane {
             name: PARENT_ROW_NAME.to_string(),
             path: parent,
             kind: EntryKind::Directory,
+            hidden: false,
             size: 0,
             modified: None,
             mode: None,
@@ -810,6 +839,7 @@ impl FilePane {
             format!("{count} 项")
         };
         let current_path = self.path.clone();
+        let choose_directory = weak.clone();
 
         h_flex()
             .w_full()
@@ -860,6 +890,34 @@ impl FilePane {
                             .text_color(theme.muted_foreground)
                             .child(SharedString::from(count_label)),
                     )
+                    .when(self.side == PaneSide::Local, |this| {
+                        this.child(
+                            Button::new("choose-local-directory")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::FolderOpen)
+                                .tooltip("选择本地目录")
+                                .on_click(move |_, _, cx| {
+                                    let receiver = cx.prompt_for_paths(PathPromptOptions {
+                                        files: false,
+                                        directories: true,
+                                        multiple: false,
+                                        prompt: Some("选择本地目录".into()),
+                                    });
+                                    let pane = choose_directory.clone();
+                                    cx.spawn(async move |cx| {
+                                        if let Ok(Ok(Some(paths))) = receiver.await
+                                            && let Some(path) = paths.into_iter().next()
+                                        {
+                                            let path = path.to_string_lossy().into_owned();
+                                            let _ =
+                                                pane.update(cx, |pane, cx| pane.navigate(path, cx));
+                                        }
+                                    })
+                                    .detach();
+                                }),
+                        )
+                    })
                     .child(
                         Button::new(("pane-copy-path", pane_ix))
                             .ghost()
@@ -1091,7 +1149,7 @@ impl Render for FilePane {
 pub struct FileTable {
     /// 目录里的全部条目（含隐藏文件）；行号索引的是下面那个可见列表。
     all_entries: Vec<FileEntry>,
-    /// 当前可见的条目：`show_hidden` 为假时滤掉 `.` 开头的名字。
+    /// 当前可见的条目：`show_hidden` 为假时滤掉平台判定的隐藏项。
     entries: Vec<FileEntry>,
     /// 是否把隐藏文件也列出来。
     show_hidden: bool,
@@ -1149,6 +1207,18 @@ impl FileTable {
     fn clear_selection(&mut self) {
         self.selected_rows.clear();
         self.selection_anchor = None;
+    }
+
+    fn selected_paths(&self) -> BTreeSet<String> {
+        self.selected_entries()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
+    }
+
+    fn restore_selection(&mut self, paths: &BTreeSet<String>) {
+        self.selected_rows = selected_rows_for_paths(&self.entries, self.parent.is_some(), paths);
+        self.selection_anchor = self.selected_rows.iter().next().copied();
     }
 
     fn selected_entries(&self) -> Vec<FileEntry> {
@@ -1395,7 +1465,7 @@ fn filter_entries(entries: &[FileEntry], show_hidden: bool) -> Vec<FileEntry> {
     }
     entries
         .iter()
-        .filter(|entry| !is_hidden_name(&entry.name))
+        .filter(|entry| !entry.hidden)
         .cloned()
         .collect()
 }
@@ -1611,6 +1681,19 @@ fn selectable_row_range(
         .collect()
 }
 
+fn selected_rows_for_paths(
+    entries: &[FileEntry],
+    has_parent: bool,
+    paths: &BTreeSet<String>,
+) -> BTreeSet<usize> {
+    let offset = usize::from(has_parent);
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(row, entry)| paths.contains(&entry.path).then_some(row + offset))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // 本地目录读取
 // ---------------------------------------------------------------------------
@@ -1643,6 +1726,7 @@ fn read_local_dir(dir: &Path) -> Result<Vec<FileEntry>, String> {
 
         entries.push(FileEntry {
             path: item.path().to_string_lossy().to_string(),
+            hidden: is_hidden_name(&name) || local_file_hidden(meta.as_ref()),
             name,
             kind,
             size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
@@ -1667,6 +1751,24 @@ fn local_file_mode(_metadata: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
+#[cfg(target_os = "windows")]
+fn local_file_hidden(metadata: Option<&std::fs::Metadata>) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    metadata.is_some_and(|metadata| windows_file_attributes_hidden(metadata.file_attributes()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn local_file_hidden(_metadata: Option<&std::fs::Metadata>) -> bool {
+    false
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_file_attributes_hidden(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    attributes & FILE_ATTRIBUTE_HIDDEN != 0
+}
+
 #[cfg(test)]
 mod tests {
     // `use super::*` 会把 `gpui_kit::*` 里的 `gpui_macros::test` 一起带进来，
@@ -1681,6 +1783,7 @@ mod tests {
             name: name.to_string(),
             path: format!("/x/{name}"),
             kind,
+            hidden: name.starts_with('.'),
             size: 0,
             modified: None,
             mode: None,
@@ -1727,6 +1830,20 @@ mod tests {
         assert_eq!(
             selectable_row_range(0, 2, 3, false),
             BTreeSet::from([0, 1, 2])
+        );
+    }
+
+    #[test]
+    fn refresh_restores_selection_by_path() {
+        let entries = vec![
+            entry("new.txt", EntryKind::File),
+            entry("kept.txt", EntryKind::File),
+        ];
+        let selected = BTreeSet::from(["/x/kept.txt".to_string(), "/x/deleted.txt".to_string()]);
+
+        assert_eq!(
+            selected_rows_for_paths(&entries, true, &selected),
+            BTreeSet::from([2])
         );
     }
 
@@ -2246,11 +2363,23 @@ mod tests {
     }
 
     #[test]
-    fn dot_prefix_is_the_only_hidden_rule() {
+    fn dot_prefix_is_hidden_on_every_platform() {
         assert!(is_hidden_name(".zshrc"));
         assert!(is_hidden_name("."));
         assert!(!is_hidden_name("zshrc"));
         assert!(!is_hidden_name("a.b"));
+    }
+
+    #[test]
+    fn windows_hidden_attribute_is_respected() {
+        assert!(windows_file_attributes_hidden(0x2));
+        assert!(windows_file_attributes_hidden(0x2 | 0x4));
+        assert!(!windows_file_attributes_hidden(0x1));
+
+        let mut hidden = entry("desktop.ini", EntryKind::File);
+        hidden.hidden = true;
+        assert!(filter_entries(&[hidden.clone()], false).is_empty());
+        assert_eq!(filter_entries(&[hidden], true).len(), 1);
     }
 
     /// `..` 行不给条目级动作，但保留面板级动作（新建目录 / 刷新）——

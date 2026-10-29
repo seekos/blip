@@ -65,8 +65,16 @@ struct PendingHostTrust {
     challenge: HostKeyChallenge,
 }
 
+#[derive(Clone)]
+struct ReconnectTarget {
+    config: super::types::SessionConfig,
+    host_key_policy: HostKeyPolicy,
+}
+
 /// 单条指令的最长等待时间。超时后按失败处理，避免界面无限转圈。
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECTION_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
 pub struct SftpWorker {
     commands: flume::Sender<SftpCommand>,
@@ -161,6 +169,8 @@ fn worker_main(commands: flume::Receiver<SftpCommand>, events: flume::Sender<Sft
 /// 命令循环。串行处理控制类指令，把耗时操作 `tokio::spawn` 出去并发执行。
 async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<SftpEvent>) {
     let mut session: Option<ActiveSession> = None;
+    let mut reconnect_target: Option<ReconnectTarget> = None;
+    let mut next_reconnect = tokio::time::Instant::now();
     let cancels: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
     let pending: PendingRegistry = Arc::new(Mutex::new(HashMap::new()));
     let path_locks = PathLocks::new();
@@ -170,7 +180,65 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
     // 「对后续冲突执行相同操作」的选择，本次连接内有效。
     let mut upload_policy: Option<UploadDecision> = None;
 
-    while let Ok(command) = commands.recv_async().await {
+    loop {
+        let command = match tokio::time::timeout(CONNECTION_HEALTH_INTERVAL, commands.recv_async())
+            .await
+        {
+            Ok(Ok(command)) => command,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                if session
+                    .as_ref()
+                    .is_some_and(|active| active.handle.is_closed())
+                {
+                    info!("SFTP 连接已中断，开始自动重连");
+                    connection_cancel.store(true, Ordering::Relaxed);
+                    cancel_all(&cancels);
+                    cancel_pending_uploads(&pending, &cancels, &events);
+                    session = None;
+                    pending_host = None;
+                    upload_policy = None;
+                    next_reconnect = tokio::time::Instant::now();
+                    let _ = events.send(SftpEvent::Reconnecting);
+                }
+
+                if session.is_none()
+                    && pending_host.is_none()
+                    && tokio::time::Instant::now() >= next_reconnect
+                    && let Some(target) = reconnect_target.clone()
+                {
+                    match session::connect(&target.config, target.host_key_policy.clone()).await {
+                        Ok(active) => {
+                            let home = active.home.clone();
+                            info!("已自动重连 {}，登录目录 {home}", target.config.endpoint());
+                            connection_cancel = Arc::new(AtomicBool::new(false));
+                            session = Some(active);
+                            let _ = events.send(SftpEvent::Connected { home });
+                        }
+                        Err(ConnectError::HostKey(challenge)) => {
+                            let prompt = HostKeyPrompt {
+                                endpoint: challenge.endpoint.clone(),
+                                algorithm: challenge.algorithm.clone(),
+                                fingerprint: challenge.fingerprint.clone(),
+                                changed_line: challenge.changed_line,
+                            };
+                            reconnect_target = None;
+                            pending_host = Some(PendingHostTrust {
+                                config: target.config,
+                                challenge: *challenge,
+                            });
+                            let _ = events.send(SftpEvent::HostKeyPrompt(prompt));
+                        }
+                        Err(err) => {
+                            warn!("自动重连失败：{err:#}");
+                            next_reconnect = tokio::time::Instant::now() + RECONNECT_DELAY;
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+
         match command {
             // ---------------------------------------------------------------
             // 连接
@@ -183,6 +251,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 cancel_all(&cancels);
                 cancel_pending_uploads(&pending, &cancels, &events);
                 session = None;
+                reconnect_target = None;
                 pending_host = None;
                 upload_policy = None;
 
@@ -191,6 +260,10 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                         let home = active.home.clone();
                         info!("已连接 {}，登录目录 {home}", config.endpoint());
                         session = Some(active);
+                        reconnect_target = Some(ReconnectTarget {
+                            config,
+                            host_key_policy: HostKeyPolicy::KnownHosts,
+                        });
                         let _ = events.send(SftpEvent::Connected { home });
                     }
                     Err(ConnectError::HostKey(challenge)) => {
@@ -219,6 +292,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 cancel_all(&cancels);
                 cancel_pending_uploads(&pending, &cancels, &events);
                 session = None;
+                reconnect_target = None;
                 pending_host = None;
                 upload_policy = None;
                 let _ = events.send(SftpEvent::Disconnected);
@@ -249,13 +323,17 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                     continue;
                 }
 
-                match session::connect(&waiting.config, HostKeyPolicy::Exact(waiting.challenge.key))
-                    .await
-                {
+                let host_key_policy = HostKeyPolicy::Exact(waiting.challenge.key);
+                match session::connect(&waiting.config, host_key_policy.clone()).await {
                     Ok(active) => {
                         let home = active.home.clone();
                         info!("已确认主机密钥，登录目录 {home}");
+                        connection_cancel = Arc::new(AtomicBool::new(false));
                         session = Some(active);
+                        reconnect_target = Some(ReconnectTarget {
+                            config: waiting.config,
+                            host_key_policy,
+                        });
                         let _ = events.send(SftpEvent::Connected { home });
                     }
                     Err(err) => {

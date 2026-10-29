@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 //! Blip —— 原生跨平台 SFTP 客户端。
 //!
 //! 线程模型：

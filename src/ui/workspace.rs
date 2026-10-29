@@ -74,6 +74,7 @@ pub struct Workspace {
     last_error: Option<SharedString>,
     /// 目录列表请求序号，用于丢弃迟到的响应。
     request_seq: u64,
+    directory_refresh_request: Option<u64>,
     next_transfer_id: u64,
     /// 传输完成后的自动刷新：待刷新的面板 + 合并用的定时器。
     ///
@@ -90,6 +91,7 @@ pub struct Workspace {
     pending_external_syncs: HashMap<u64, PendingExternalSync>,
     _subscriptions: Vec<Subscription>,
     _pump: Task<()>,
+    _directory_refresh: Task<()>,
 }
 
 /// 攒着待刷新的面板。
@@ -157,6 +159,7 @@ impl PendingRefresh {
 
 /// 传输完成到刷新列表之间的合并窗口。
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(300);
+const DIRECTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const EXTERNAL_EDIT_POLL: Duration = Duration::from_millis(500);
 const EXTERNAL_EDIT_DEBOUNCE: Duration = Duration::from_millis(700);
 
@@ -253,6 +256,21 @@ impl Workspace {
                 }
             }
         });
+        let directory_refresh = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(DIRECTORY_REFRESH_INTERVAL)
+                    .await;
+                if this
+                    .update(cx, |workspace, cx| {
+                        workspace.refresh_visible_directories(cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         Self {
             worker,
@@ -268,6 +286,7 @@ impl Workspace {
             home: None,
             last_error: None,
             request_seq: 0,
+            directory_refresh_request: None,
             next_transfer_id: 1,
             pending_refresh: PendingRefresh::default(),
             refresh_timer: None,
@@ -278,6 +297,7 @@ impl Workspace {
             pending_external_syncs: HashMap::new(),
             _subscriptions: subscriptions,
             _pump: pump,
+            _directory_refresh: directory_refresh,
         }
     }
 
@@ -422,6 +442,7 @@ impl Workspace {
 
             SftpEvent::Connected { home } => {
                 self.state = SessionState::Connected;
+                self.directory_refresh_request = None;
                 self.home = Some(home.clone());
                 self.last_error = None;
                 self.transfers.update(cx, |queue, cx| queue.clear_all(cx));
@@ -492,10 +513,19 @@ impl Workspace {
                 }
             }
 
+            SftpEvent::Reconnecting => {
+                self.connection_generation = self.connection_generation.wrapping_add(1);
+                self.home = None;
+                self.directory_refresh_request = None;
+                self.set_online(false, cx);
+                self.toast(window, cx, Notification::info("连接已中断，正在自动重连…"));
+            }
+
             SftpEvent::Disconnected => {
                 self.connection_generation = self.connection_generation.wrapping_add(1);
                 self.state = SessionState::Disconnected;
                 self.home = None;
+                self.directory_refresh_request = None;
                 self.remote_endpoint = None;
                 self.set_online(false, cx);
                 self.emit_state(cx);
@@ -506,6 +536,9 @@ impl Workspace {
                 path,
                 entries,
             } => {
+                if self.directory_refresh_request == Some(request_id) {
+                    self.directory_refresh_request = None;
+                }
                 // 迟到的响应直接丢弃：用户可能已经又点进了别的目录。
                 if request_id == self.request_seq {
                     self.remember_remote_directory(path.clone());
@@ -672,6 +705,7 @@ impl Workspace {
                         self.emit_state(cx);
                     }
                     ErrorContext::List => {
+                        self.directory_refresh_request = None;
                         // 目录读取失败时，面板要退出加载态并把错误显示在自己的列表上方。
                         let message = SharedString::from(message.clone());
                         self.remote
@@ -728,6 +762,7 @@ impl Workspace {
         if self.state != SessionState::Connected {
             return;
         }
+        self.directory_refresh_request = None;
         self.request_seq += 1;
         let request_id = self.request_seq;
         self.worker.send(SftpCommand::ListDir {
@@ -747,6 +782,26 @@ impl Workspace {
         self.remote
             .update(cx, |pane, cx| pane.begin_loading(path.clone(), cx));
         self.request_remote_listing(path, cx);
+    }
+
+    fn refresh_visible_directories(&mut self, cx: &mut Context<Self>) {
+        if !self.local.read(cx).is_loading() {
+            self.local.update(cx, |pane, cx| pane.refresh_silently(cx));
+        }
+        if self.state == SessionState::Connected
+            && self.directory_refresh_request.is_none()
+            && !self.remote.read(cx).is_loading()
+        {
+            let path = self.remote.read(cx).path().to_string();
+            self.request_seq += 1;
+            let request_id = self.request_seq;
+            self.directory_refresh_request = Some(request_id);
+            self.worker.send(SftpCommand::ListDir {
+                request_id,
+                path,
+                fallback: None,
+            });
+        }
     }
 
     /// 传输结束后把「该刷新的面板」记下来，攒够一个合并窗口再真的去刷。
@@ -2021,11 +2076,20 @@ impl Workspace {
         let dir = PathBuf::from(self.local.read(cx).path());
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("新目录名称"));
         let local = self.local.clone();
+        let focus_on_mount = Rc::new(Cell::new(true));
 
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let input = input.clone();
             let dir = dir.clone();
             let local = local.clone();
+            let focus_on_mount = focus_on_mount.clone();
+
+            if focus_on_mount.replace(false) {
+                let input = input.clone();
+                window.defer(cx, move |window, cx| {
+                    input.focus_handle(cx).focus(window, cx);
+                });
+            }
 
             dialog
                 .title("新建本地目录")
@@ -2187,11 +2251,20 @@ impl Workspace {
         let dir = self.remote.read(cx).path().to_string();
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("新目录名称"));
         let sender = self.worker.sender();
+        let focus_on_mount = Rc::new(Cell::new(true));
 
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let input = input.clone();
             let sender = sender.clone();
             let dir = dir.clone();
+            let focus_on_mount = focus_on_mount.clone();
+
+            if focus_on_mount.replace(false) {
+                let input = input.clone();
+                window.defer(cx, move |window, cx| {
+                    input.focus_handle(cx).focus(window, cx);
+                });
+            }
 
             dialog
                 .title("新建目录")
