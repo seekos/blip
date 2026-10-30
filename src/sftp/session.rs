@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Result, anyhow};
 use log::warn;
 use russh::client::{self, Handle};
-use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, load_secret_key};
+use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, decode_secret_key};
 use russh_sftp::{
     client::{SftpSession, error::Error as SftpClientError},
     protocol::StatusCode,
@@ -277,12 +277,13 @@ fn resolve_key_path(path: &Path) -> Result<PathBuf> {
 
 /// 把用户填的路径落到一个**真实存在的私钥文件**上。
 ///
-/// 三种容错，都来自真实踩过的坑：
+/// 常见容错，都来自真实踩过的坑：
 /// * 填的是目录（`~/.ssh`）→ 在里面按 [`DEFAULT_KEY_NAMES`] 挑一把；
+/// * 误选 `.pub` 公钥 → 使用同目录同名私钥；
 /// * 文件不存在 → 说清楚是路径问题，而不是甩一句 IO 错误；
-/// * 没有读权限 → 直接提示 `chmod 600`（OpenSSH 也会拒绝 0644 的私钥）。
+/// * 没有读权限 → 给出对应平台能执行的处理方式。
 fn resolve_existing_key(path: &Path) -> Result<PathBuf> {
-    let resolved = resolve_key_path(path)?;
+    let mut resolved = resolve_key_path(path)?;
 
     if resolved.is_dir() {
         return discover_private_key_in(&resolved).ok_or_else(|| {
@@ -293,6 +294,18 @@ fn resolve_existing_key(path: &Path) -> Result<PathBuf> {
         });
     }
 
+    // Windows 默认隐藏扩展名，id_ed25519 与 id_ed25519.pub 很容易选反。
+    if resolved
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pub"))
+    {
+        let private_key = resolved.with_extension("");
+        if private_key.is_file() {
+            resolved = private_key;
+        }
+    }
+
     match std::fs::metadata(&resolved) {
         Ok(meta) if meta.is_file() => Ok(resolved),
         Ok(_) => Err(anyhow!("{} 不是普通文件，无法当作私钥", resolved.display())),
@@ -300,11 +313,20 @@ fn resolve_existing_key(path: &Path) -> Result<PathBuf> {
             "找不到私钥 {}：路径写错了？留空则自动查找 ~/.ssh/id_ed25519",
             resolved.display()
         )),
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Err(anyhow!(
-            "没有权限读取私钥 {}：试试 chmod 600 {}",
-            resolved.display(),
-            resolved.display()
-        )),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            #[cfg(target_os = "windows")]
+            let message = format!(
+                "没有权限读取私钥 {}：请在文件属性的“安全”中允许当前用户读取",
+                resolved.display()
+            );
+            #[cfg(not(target_os = "windows"))]
+            let message = format!(
+                "没有权限读取私钥 {}：试试 chmod 600 {}",
+                resolved.display(),
+                resolved.display()
+            );
+            Err(anyhow!(message))
+        }
         Err(err) => Err(anyhow!("无法访问私钥 {}：{err}", resolved.display())),
     }
 }
@@ -316,10 +338,45 @@ fn resolve_existing_key(path: &Path) -> Result<PathBuf> {
 /// 等于什么都没说。
 fn load_private_key(path: &Path, passphrase: Option<&str>) -> Result<PrivateKey> {
     let key_path = resolve_existing_key(path)?;
-    match load_secret_key(&key_path, passphrase) {
+    let encoded = read_private_key_text(&key_path)?;
+    match decode_secret_key(&encoded, passphrase) {
         Ok(key) => Ok(key),
         Err(err) => Err(explain_key_error(&key_path, passphrase, err)),
     }
+}
+
+fn read_private_key_text(path: &Path) -> Result<String> {
+    let bytes =
+        std::fs::read(path).map_err(|err| anyhow!("无法读取私钥 {}：{err}", path.display()))?;
+    let decoded: std::result::Result<String, ()> =
+        if let Some(bytes) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+            String::from_utf8(bytes.to_vec()).map_err(|_| ())
+        } else if let Some(bytes) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+            decode_utf16(bytes, u16::from_le_bytes)
+        } else if let Some(bytes) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+            decode_utf16(bytes, u16::from_be_bytes)
+        } else {
+            String::from_utf8(bytes).map_err(|_| ())
+        };
+    decoded.map_err(|_| {
+        anyhow!(
+            "私钥 {} 不是有效的 UTF-8/UTF-16 文本，请选择 OpenSSH、PEM 或 PuTTY PPK 私钥",
+            path.display()
+        )
+    })
+}
+
+fn decode_utf16(bytes: &[u8], decode: impl Fn([u8; 2]) -> u16) -> std::result::Result<String, ()> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(());
+    }
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| decode(*chunk))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).map_err(|_| ())
 }
 
 fn explain_key_error(
@@ -1354,6 +1411,53 @@ mod tests {
         std::fs::remove_file(dir.join("id_ed25519")).expect("删 id_ed25519");
         std::fs::create_dir_all(dir.join("id_ed25519")).expect("建同名目录");
         assert_eq!(discover_private_key_in(&dir), Some(dir.join("id_rsa")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selecting_a_public_key_uses_its_private_key_pair() {
+        let dir = std::env::temp_dir().join(format!(
+            "macscp-public-key-selection-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时密钥目录");
+        let private_key = dir.join("id_ed25519");
+        let public_key = dir.join("id_ed25519.pub");
+        std::fs::write(&private_key, crate::sftp::testserver::CLIENT_KEY).expect("写私钥");
+        std::fs::write(&public_key, crate::sftp::testserver::CLIENT_KEY_PUBLIC).expect("写公钥");
+
+        assert_eq!(
+            resolve_existing_key(&public_key).expect("应找到配套私钥"),
+            private_key
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loads_private_keys_saved_with_windows_byte_order_marks() {
+        let dir = std::env::temp_dir().join(format!(
+            "macscp-windows-key-encoding-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时密钥目录");
+
+        let utf8_path = dir.join("utf8-bom-key");
+        let mut utf8 = vec![0xEF, 0xBB, 0xBF];
+        utf8.extend_from_slice(crate::sftp::testserver::CLIENT_KEY.as_bytes());
+        std::fs::write(&utf8_path, utf8).expect("写 UTF-8 BOM 私钥");
+        load_private_key(&utf8_path, None).expect("应读取 UTF-8 BOM 私钥");
+
+        let utf16_path = dir.join("utf16-key");
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in crate::sftp::testserver::CLIENT_KEY.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&utf16_path, utf16).expect("写 UTF-16 私钥");
+        load_private_key(&utf16_path, None).expect("应读取 UTF-16 私钥");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

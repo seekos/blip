@@ -27,7 +27,7 @@ use crate::discovery::DiscoveryService;
 use crate::session::store::{
     self, AppSettings, LanSftpPasswordMode, RemoteOpenBehavior, SavedAuth, SavedProfile,
 };
-use crate::sftp::lan_server::ServerInfo;
+use crate::sftp::lan_server::{ServerInfo, TransferActivity};
 use crate::sftp::types::{AuthMethod, SessionConfig};
 use crate::ui::SessionState;
 use crate::ui::file_pane::FilePane;
@@ -46,6 +46,10 @@ pub struct ScpApp {
     profiles: Vec<SavedProfile>,
     settings: AppSettings,
     lan_server: Result<ServerInfo, SharedString>,
+    lan_transfer_activity: TransferActivity,
+    lan_transfer_active: bool,
+    lan_idle_sleep_guard: Option<ActivityGuard>,
+    lan_idle_sleep_request_pending: bool,
     _discovery: Option<DiscoveryService>,
     /// 当前这次连接实际使用的配置。密码框可能为空（收藏会从系统凭据库补密码），
     /// 成功后必须保存这里的认证信息，不能再从空白表单反推。
@@ -54,6 +58,7 @@ pub struct ScpApp {
     available_update: Option<AvailableUpdate>,
     _subscriptions: Vec<Subscription>,
     _discovery_pump: Task<()>,
+    _lan_transfer_pump: Task<()>,
 }
 
 struct SettingsDraft {
@@ -104,9 +109,15 @@ impl ScpApp {
                     .ok_or_else(|| "手动密码尚未设置，请在设置中填写".to_string())
             }),
         };
+        let (lan_transfer_activity, lan_transfer_events) =
+            crate::sftp::lan_server::transfer_activity();
         let lan_server = server_password
             .and_then(|password| {
-                crate::sftp::lan_server::start(settings.lan_sftp_root.clone(), password)
+                crate::sftp::lan_server::start(
+                    settings.lan_sftp_root.clone(),
+                    password,
+                    lan_transfer_activity.clone(),
+                )
             })
             .map_err(|message| {
                 log::error!("内置局域网 SFTP 服务启动失败：{message}");
@@ -143,6 +154,16 @@ impl ScpApp {
                             toolbar.set_discovered_devices(devices, cx)
                         });
                     })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let lan_transfer_pump = cx.spawn(async move |this, cx| {
+            while let Ok(active) = lan_transfer_events.recv_async().await {
+                if this
+                    .update(cx, |app, cx| app.set_lan_transfer_active(active, cx))
                     .is_err()
                 {
                     break;
@@ -256,18 +277,49 @@ impl ScpApp {
             profiles,
             settings,
             lan_server,
+            lan_transfer_activity,
+            lan_transfer_active: false,
+            lan_idle_sleep_guard: None,
+            lan_idle_sleep_request_pending: false,
             _discovery: discovery,
             pending_config: None,
             version: update::application_version(),
             available_update: None,
             _subscriptions: subscriptions,
             _discovery_pump: discovery_pump,
+            _lan_transfer_pump: lan_transfer_pump,
         };
 
         app.prefill_last_profile(window, cx);
         app.sync_window_title(window, cx);
         app.check_for_updates(cx);
         app
+    }
+
+    fn set_lan_transfer_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.lan_transfer_active = active;
+        if !active {
+            self.lan_idle_sleep_guard = None;
+            return;
+        }
+        if self.lan_idle_sleep_guard.is_some() || self.lan_idle_sleep_request_pending {
+            return;
+        }
+
+        self.lan_idle_sleep_request_pending = true;
+        let request = cx.prevent_idle_sleep("Blip 局域网 SFTP 正在传输文件");
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            let _ = this.update(cx, |app, _cx| {
+                app.lan_idle_sleep_request_pending = false;
+                match result {
+                    Ok(guard) if app.lan_transfer_active => app.lan_idle_sleep_guard = Some(guard),
+                    Ok(_) => {}
+                    Err(err) => log::warn!("无法阻止局域网传输期间系统休眠：{err:#}"),
+                }
+            });
+        })
+        .detach();
     }
 
     fn check_for_updates(&self, cx: &mut Context<Self>) {
@@ -1187,6 +1239,7 @@ impl ScpApp {
                                             Err(_) => crate::sftp::lan_server::start(
                                                 settings.lan_sftp_root.clone(),
                                                 manual_password.clone(),
+                                                app.lan_transfer_activity.clone(),
                                             )
                                             .map_err(SharedString::from),
                                         };

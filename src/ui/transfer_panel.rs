@@ -6,6 +6,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     progress::Progress,
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::prelude::*;
@@ -47,6 +48,10 @@ pub struct TransferItem {
     speed: f64,
     /// 本次传输从哪个字节开始（0 = 从头，>0 = 断点续传）。
     resumed_from: u64,
+    /// 流式目录上传在扫描完成前没有稳定总量，进度条应显示为不定进度。
+    streaming_total: bool,
+    /// 整目录并发上传时，当前真正写入远端的文件（最多为并发数）。
+    active_files: Vec<String>,
 }
 
 impl TransferItem {
@@ -80,15 +85,47 @@ impl EventEmitter<TransferQueueEvent> for TransferQueue {}
 
 pub struct TransferQueue {
     items: Vec<TransferItem>,
-    scroll: ScrollHandle,
+    active: usize,
+    scroll: UniformListScrollHandle,
+    idle_sleep_guard: Option<ActivityGuard>,
+    idle_sleep_request_pending: bool,
 }
 
 impl TransferQueue {
     pub fn new() -> Self {
         Self {
             items: Vec::new(),
-            scroll: ScrollHandle::new(),
+            active: 0,
+            scroll: UniformListScrollHandle::new(),
+            idle_sleep_guard: None,
+            idle_sleep_request_pending: false,
         }
+    }
+
+    /// 第一项传输入队时申请系统休眠抑制，最后一项结束时自动释放。
+    fn update_idle_sleep_prevention(&mut self, cx: &mut Context<Self>) {
+        if self.active == 0 {
+            self.idle_sleep_guard = None;
+            return;
+        }
+        if self.idle_sleep_guard.is_some() || self.idle_sleep_request_pending {
+            return;
+        }
+
+        self.idle_sleep_request_pending = true;
+        let request = cx.prevent_idle_sleep("Blip 正在传输文件");
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            let _ = this.update(cx, |queue, _cx| {
+                queue.idle_sleep_request_pending = false;
+                match result {
+                    Ok(guard) if queue.active > 0 => queue.idle_sleep_guard = Some(guard),
+                    Ok(_) => {}
+                    Err(err) => log::warn!("无法阻止系统在传输时休眠：{err:#}"),
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn enqueue(
@@ -108,7 +145,11 @@ impl TransferQueue {
             status: TransferStatus::Queued,
             speed: 0.,
             resumed_from: 0,
+            streaming_total: false,
+            active_files: Vec::new(),
         });
+        self.active += 1;
+        self.update_idle_sleep_prevention(cx);
         cx.notify();
     }
 
@@ -123,10 +164,18 @@ impl TransferQueue {
         if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
             item.status = TransferStatus::Running;
             item.resumed_from = resumed_from;
+            item.streaming_total = total == 0;
             item.transferred = item.transferred.max(resumed_from);
             if total > 0 {
                 item.total = total;
             }
+            cx.notify();
+        }
+    }
+
+    pub fn active_files(&mut self, id: TransferId, files: Vec<String>, cx: &mut Context<Self>) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+            item.active_files = files;
             cx.notify();
         }
     }
@@ -157,12 +206,15 @@ impl TransferQueue {
         if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
             item.status = TransferStatus::Awaiting;
             item.speed = 0.;
+            item.streaming_total = false;
+            item.active_files.clear();
             cx.notify();
         }
     }
 
     pub fn finished(&mut self, id: TransferId, outcome: TransferOutcome, cx: &mut Context<Self>) {
         if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+            let was_active = item.is_active();
             item.status = match outcome {
                 TransferOutcome::Completed => {
                     item.transferred = item.total.max(item.transferred);
@@ -177,6 +229,12 @@ impl TransferQueue {
                 TransferOutcome::Failed(message) => TransferStatus::Failed(message),
             };
             item.speed = 0.;
+            item.streaming_total = false;
+            item.active_files.clear();
+            if was_active {
+                self.active = self.active.saturating_sub(1);
+                self.update_idle_sleep_prevention(cx);
+            }
             cx.notify();
         }
     }
@@ -188,6 +246,8 @@ impl TransferQueue {
 
     pub fn clear_all(&mut self, cx: &mut Context<Self>) {
         self.items.clear();
+        self.active = 0;
+        self.update_idle_sleep_prevention(cx);
         cx.notify();
     }
 
@@ -204,7 +264,7 @@ impl TransferQueue {
     }
 
     pub fn active_count(&self) -> usize {
-        self.items.iter().filter(|item| item.is_active()).count()
+        self.active
     }
 
     /// 某个传输的方向。行已经被用户删掉时返回 `None`。
@@ -278,7 +338,15 @@ impl TransferQueue {
         // 进行中的任务点了先取消（要通知 worker）；已结束的直接从列表移除。
         let cancellable = item.is_active();
 
-        let (status_text, status_color) = match &item.status {
+        let active_summary = item.active_files.first().map(|path| {
+            let file_name = path.rsplit('/').next().unwrap_or(path);
+            if item.active_files.len() == 1 {
+                format!("正在传输 {file_name}")
+            } else {
+                format!("正在传输 {file_name} 等 {} 个文件", item.active_files.len())
+            }
+        });
+        let (mut status_text, status_color) = match &item.status {
             TransferStatus::Queued => ("等待中".to_string(), theme.muted_foreground),
             TransferStatus::Awaiting => ("等待确认".to_string(), theme.warning),
             TransferStatus::Running => (
@@ -312,9 +380,19 @@ impl TransferQueue {
             ),
             TransferStatus::Failed(message) => (format!("失败：{message}"), theme.danger),
         };
+        if let Some(active_summary) = active_summary {
+            status_text = format!("{active_summary} · {status_text}");
+        }
+        let status_tooltip = if item.active_files.is_empty() {
+            status_text.clone()
+        } else {
+            format!("{status_text}\n\n{}", item.active_files.join("\n"))
+        };
 
         h_flex()
             .w_full()
+            .h(px(52.))
+            .flex_shrink_0()
             .gap_3()
             .px_3()
             .py_1p5()
@@ -363,16 +441,26 @@ impl TransferQueue {
                             )
                             .child(
                                 div()
+                                    .id(("transfer-status", id))
                                     .flex_shrink_0()
+                                    .max_w(px(360.))
+                                    .truncate()
                                     .text_xs()
                                     .text_color(status_color)
-                                    .child(SharedString::from(status_text)),
+                                    .child(SharedString::from(status_text))
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(status_tooltip.clone()).build(window, cx)
+                                    }),
                             ),
                     )
                     .child(
                         Progress::new(("transfer-progress", item.id))
                             .with_size(px(2.))
                             .value(item.ratio())
+                            .loading(
+                                item.streaming_total
+                                    && matches!(item.status, TransferStatus::Running),
+                            )
                             .accessibility_label(format!(
                                 "{} 传输进度 {:.0}%",
                                 item.name,
@@ -413,11 +501,8 @@ impl Render for TransferQueue {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let header = self.render_header(cx);
-        let rows: Vec<AnyElement> = self
-            .items
-            .iter()
-            .map(|item| self.render_row(item, cx).into_any_element())
-            .collect();
+        let item_count = self.items.len();
+        let scroll = self.scroll.clone();
 
         v_flex()
             .size_full()
@@ -428,9 +513,7 @@ impl Render for TransferQueue {
                     .id("transfer-rows")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .when(rows.is_empty(), |this| {
+                    .when(item_count == 0, |this| {
                         this.child(
                             h_flex()
                                 .size_full()
@@ -441,7 +524,23 @@ impl Render for TransferQueue {
                                 .child("还没有传输任务"),
                         )
                     })
-                    .children(rows),
+                    .when(item_count > 0, |this| {
+                        this.child(
+                            uniform_list(
+                                "transfer-row-list",
+                                item_count,
+                                cx.processor(
+                                    |queue, range: std::ops::Range<usize>, _window, cx| {
+                                        range
+                                            .map(|index| queue.render_row(&queue.items[index], cx))
+                                            .collect()
+                                    },
+                                ),
+                            )
+                            .size_full()
+                            .track_scroll(&scroll),
+                        )
+                    }),
             )
     }
 }
@@ -477,5 +576,67 @@ mod tests {
         });
 
         assert_eq!(cx.update(|cx| queue.read(cx).summary()), (0, 0));
+    }
+
+    #[::gpui::test]
+    fn active_transfers_prevent_idle_sleep(cx: &mut gpui::TestAppContext) {
+        let queue = cx.update(|cx| cx.new(|_| TransferQueue::new()));
+        cx.update(|cx| {
+            queue.update(cx, |queue, cx| {
+                queue.enqueue(1, "first".into(), TransferDirection::Upload, 10, cx);
+                queue.enqueue(2, "second".into(), TransferDirection::Download, 20, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.active_idle_sleep_preventions(), 1);
+
+        cx.update(|cx| {
+            queue.update(cx, |queue, cx| {
+                queue.finished(1, TransferOutcome::Completed, cx);
+            });
+        });
+        assert_eq!(cx.active_idle_sleep_preventions(), 1);
+
+        cx.update(|cx| {
+            queue.update(cx, |queue, cx| {
+                queue.finished(2, TransferOutcome::Completed, cx);
+            });
+        });
+        assert_eq!(cx.active_idle_sleep_preventions(), 0);
+    }
+
+    #[::gpui::test]
+    fn streaming_folder_tracks_current_files_until_completion(cx: &mut gpui::TestAppContext) {
+        let queue = cx.update(|cx| cx.new(|_| TransferQueue::new()));
+        cx.update(|cx| {
+            queue.update(cx, |queue, cx| {
+                queue.enqueue(9, "node_modules/".into(), TransferDirection::Upload, 0, cx);
+                queue.started(9, 0, 0, cx);
+                queue.active_files(
+                    9,
+                    vec!["pkg/index.js".into(), "pkg/package.json".into()],
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            let item = &queue.read(cx).items[0];
+            assert!(item.streaming_total, "动态总量必须使用不定进度条");
+            assert_eq!(item.active_files.len(), 2);
+            assert_eq!(item.active_files[0], "pkg/index.js");
+        });
+
+        cx.update(|cx| {
+            queue.update(cx, |queue, cx| {
+                queue.finished(9, TransferOutcome::Completed, cx);
+            });
+        });
+        cx.update(|cx| {
+            let item = &queue.read(cx).items[0];
+            assert!(!item.streaming_total);
+            assert!(item.active_files.is_empty());
+            assert_eq!(item.ratio(), 100.);
+        });
     }
 }

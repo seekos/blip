@@ -433,6 +433,13 @@ pub enum SftpEvent {
         /// worker 侧测出来的实时速率，字节/秒；`f64::NAN` 表示「暂时算不出来」。
         speed: f64,
     },
+    /// 整目录并发上传时，当前实际占用传输槽的文件。
+    ///
+    /// 最多只有目录上传并发数那么多项；空列表表示正在扫描目录或已处理完当前一批。
+    TransferActiveFiles {
+        id: TransferId,
+        files: Vec<String>,
+    },
     TransferCompleted {
         id: TransferId,
         outcome: TransferOutcome,

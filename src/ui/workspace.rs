@@ -567,6 +567,11 @@ impl Workspace {
                 });
             }
 
+            SftpEvent::TransferActiveFiles { id, files } => {
+                self.transfers
+                    .update(cx, |queue, cx| queue.active_files(id, files, cx));
+            }
+
             SftpEvent::TransferCompleted { id, outcome } => {
                 let pending_external_edit = self.pending_external_edits.remove(&id);
                 let pending_external_sync = self.pending_external_syncs.remove(&id);

@@ -241,6 +241,7 @@ fn vfs() -> &'static Mutex<HashMap<String, VfsFile>> {
 
 /// 目录在虚拟磁盘上也是一条记录，靠 mode 的类型位区分（和真 POSIX 一样）。
 const DIR_MODE: u32 = 0o040_755;
+const LINK_MODE: u32 = 0o120_777;
 
 fn is_dir_mode(mode: u32) -> bool {
     mode & 0o170_000 == 0o040_000
@@ -350,6 +351,14 @@ pub async fn vfs_read(path: &str) -> Option<Vec<u8>> {
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn vfs_mode(path: &str) -> Option<u32> {
     vfs().lock().await.get(path).map(|file| file.mode)
+}
+
+#[cfg(all(test, unix))]
+async fn vfs_link_target(path: &str) -> Option<String> {
+    vfs().lock().await.get(path).and_then(|file| {
+        (file.mode & 0o170_000 == 0o120_000)
+            .then(|| String::from_utf8_lossy(&file.data).into_owned())
+    })
 }
 
 /// 文件是否还在虚拟磁盘里。
@@ -928,6 +937,32 @@ impl russh_sftp::server::Handler for TestSftp {
         disk.insert(newpath.clone(), file);
         drop(disk);
         rename_extra_entry(&oldpath, &newpath);
+        Ok(ok_status(id))
+    }
+
+    async fn symlink(
+        &mut self,
+        id: u32,
+        linkpath: String,
+        targetpath: String,
+    ) -> Result<Status, Self::Error> {
+        let mut disk = vfs().lock().await;
+        if disk.contains_key(&linkpath) {
+            return Err(StatusCode::Failure);
+        }
+        if !is_dir_path(&disk, &crate::sftp::session::remote_parent(&linkpath)) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        disk.insert(
+            linkpath.clone(),
+            VfsFile {
+                data: targetpath.into_bytes(),
+                mode: LINK_MODE,
+                mtime: unix_now(),
+            },
+        );
+        drop(disk);
+        track_file(&linkpath, 0, LINK_MODE);
         Ok(ok_status(id))
     }
 
@@ -2614,10 +2649,12 @@ mod tests {
                 SftpEvent::TransferProgress {
                     id: got,
                     transferred,
+                    total: t,
                     ..
                 } => {
                     assert_eq!(got, id);
                     progress = transferred;
+                    total = total.max(t);
                 }
                 SftpEvent::TransferCompleted {
                     id: got,
@@ -2626,6 +2663,7 @@ mod tests {
                     assert_eq!(got, id);
                     outcome = o;
                 }
+                SftpEvent::TransferActiveFiles { id: got, .. } => assert_eq!(got, id),
                 other => panic!("整目录上传不该发这个事件：{other:?}"),
             }
         }
@@ -2708,6 +2746,83 @@ mod tests {
         assert!(!vfs_exists(&format!("{REMOTE}/linked.txt")).await);
     }
 
+    /// node_modules 常见的相对链接必须原样复制，不能跟随成第二份文件。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_dir_preserves_safe_relative_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let ctx = connect_and_dir("up-dir-relative-link").await;
+        const REMOTE: &str = "/home/tester/relative-link";
+        let (local, _) = seed_dist(&ctx.dir);
+        std::fs::create_dir_all(local.join("bin")).expect("创建链接目录");
+        symlink("../a.txt", local.join("bin/tool")).expect("创建相对链接");
+
+        let (_, _, outcome) =
+            run_folder_upload(&ctx, 67, local, REMOTE, ExistingPolicy::Overwrite).await;
+
+        assert_eq!(outcome, TransferOutcome::Completed);
+        assert_eq!(
+            vfs_link_target(&format!("{REMOTE}/bin/tool"))
+                .await
+                .as_deref(),
+            Some("../a.txt")
+        );
+        assert_eq!(
+            vfs_mode(&format!("{REMOTE}/bin/tool")).await.unwrap() & 0o170_000,
+            0o120_000
+        );
+    }
+
+    /// 点击目录上传后必须先进入 Running，再逐层发现总量，不能等整棵树预处理完成。
+    #[tokio::test]
+    async fn upload_dir_starts_before_discovering_the_whole_tree() {
+        let ctx = connect_and_dir("up-dir-streaming-start").await;
+        const REMOTE: &str = "/home/tester/streaming-start";
+        let (local, _) = seed_dist(&ctx.dir);
+        let (tx, rx) = flume::unbounded();
+        let task = tokio::spawn(transfer::run_upload_dir(
+            ctx.active.sftp.clone(),
+            68,
+            local,
+            REMOTE.to_string(),
+            ExistingPolicy::Overwrite,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        ));
+
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv_async())
+            .await
+            .expect("上传应立即产生事件")
+            .expect("事件通道不应关闭");
+        assert!(matches!(
+            first,
+            SftpEvent::TransferStarted {
+                id: 68,
+                total: 0,
+                ..
+            }
+        ));
+
+        task.await.expect("目录上传任务不应 panic");
+        let events = rx.drain().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SftpEvent::TransferProgress { total, .. } if *total > 0
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SftpEvent::TransferActiveFiles { files, .. } if !files.is_empty()
+        )));
+        assert!(matches!(
+            events
+                .iter()
+                .rev()
+                .find(|event| matches!(event, SftpEvent::TransferActiveFiles { .. })),
+            Some(SftpEvent::TransferActiveFiles { files, .. }) if files.is_empty()
+        ));
+    }
+
     /// 策略「跳过同名」：远端已有内容一个字节都不动，其余照传。
     #[tokio::test]
     async fn upload_dir_skips_existing_files() {
@@ -2716,7 +2831,8 @@ mod tests {
 
         let (local, files) = seed_dist(&ctx.dir);
         let expected_total: u64 = files.iter().map(|(_, data)| data.len() as u64).sum();
-        // 远端已经有 a.txt 的旧版本（`/home/tester/keep` 目录由 ensure_dir 顺手建出来）。
+        // 远端已经有 a.txt 的旧版本。
+        vfs_mkdir(REMOTE).await;
         vfs_write(&format!("{REMOTE}/a.txt"), b"OLD").await;
 
         let (_, progress, outcome) =
@@ -2748,6 +2864,9 @@ mod tests {
         let target = format!("{REMOTE}/sub/deep/c.bin");
 
         // 故意造一份长度合理但内容错误的旧断点；按长度续传会生成混合损坏文件。
+        vfs_mkdir(REMOTE).await;
+        vfs_mkdir(&format!("{REMOTE}/sub")).await;
+        vfs_mkdir(&format!("{REMOTE}/sub/deep")).await;
         vfs_write(&format!("{target}.filepart"), &[0xFFu8; 100 * 1024]).await;
 
         let (_, _, outcome) =
@@ -2770,17 +2889,18 @@ mod tests {
 
         let (local, _) = seed_dist(&ctx.dir);
         // 远端 `broken/sub` 是个**文件**：mkdir 必然失败，`sub/` 底下的文件都传不上去。
+        vfs_mkdir(REMOTE).await;
         vfs_write(&format!("{REMOTE}/sub"), b"i am a file").await;
 
-        let (total, progress, outcome) =
+        let (_total, _progress, outcome) =
             run_folder_upload(&ctx, 14, local.clone(), REMOTE, ExistingPolicy::Overwrite).await;
 
         match outcome {
             TransferOutcome::Partial(message) => {
                 assert!(message.contains("sub"), "错误里应点出是哪个目录：{message}");
                 assert!(
-                    message.contains("2 处失败"),
-                    "sub 和 sub/deep 各一处：{message}"
+                    !message.contains("2 处失败"),
+                    "坏父目录只应报告一次：{message}"
                 );
             }
             other => panic!("期望 Partial，实际 {other:?}"),
@@ -2791,9 +2911,9 @@ mod tests {
             vfs_read(&format!("{REMOTE}/a.txt")).await.unwrap(),
             b"alpha".to_vec()
         );
-        // 坏目录底下的文件一个都没上去，进度也没走到头。
+        // 坏目录底下的文件一个都没上去；流式总量只统计已经扫描到的可处理目录，
+        // 未进入的子树由 Partial 明确表达，而不是让进度永远卡在 100% 以下。
         assert!(!vfs_exists(&format!("{REMOTE}/sub/b.txt")).await);
-        assert!(progress < total, "没传完就不该报 100%");
 
         let _ = std::fs::remove_dir_all(&ctx.dir);
     }
@@ -2820,14 +2940,19 @@ mod tests {
             on_existing: ExistingPolicy::Overwrite,
         });
 
-        let mut started_total = 0;
+        let mut started_total = None;
+        let mut discovered_total = 0;
         loop {
             match next_event(&worker).await {
                 SftpEvent::TransferStarted { id, total, .. } => {
                     assert_eq!(id, 21);
-                    started_total = total;
+                    started_total = Some(total);
                 }
-                SftpEvent::TransferProgress { id, .. } => assert_eq!(id, 21),
+                SftpEvent::TransferProgress { id, total, .. } => {
+                    assert_eq!(id, 21);
+                    discovered_total = discovered_total.max(total);
+                }
+                SftpEvent::TransferActiveFiles { id, .. } => assert_eq!(id, 21),
                 SftpEvent::TransferCompleted { id, outcome } => {
                     assert_eq!(id, 21);
                     assert_eq!(outcome, TransferOutcome::Completed);
@@ -2837,7 +2962,8 @@ mod tests {
             }
         }
 
-        assert_eq!(started_total, expected_total);
+        assert_eq!(started_total, Some(0), "目录上传应立即进入运行状态");
+        assert_eq!(discovered_total, expected_total, "扫描时动态补齐总量");
         assert!(
             vfs_exists("/home/tester/worker-dist/sub/deep/c.bin").await,
             "整棵树都该传上去"

@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use log::{debug, error, info, warn};
 use russh_sftp::client::SftpSession;
+use tokio::sync::Semaphore;
 
 use super::path_lock::{PathLocks, local_key, remote_key};
 use super::session::{self, ActiveSession, ConnectError, HostKeyChallenge, HostKeyPolicy};
@@ -42,6 +43,13 @@ type CancelFlag = Arc<AtomicBool>;
 /// 用 `Arc<Mutex<..>>` 是因为传输任务跑在 `tokio::spawn` 出来的独立 future 里，
 /// 结束时需要自己把条目摘掉 —— 否则长时间运行的客户端会把这张表越撑越大。
 type CancelRegistry = Arc<Mutex<HashMap<TransferId, CancelFlag>>>;
+
+/// 同一条 SFTP 会话上同时搬运的数据流上限。
+///
+/// 大批单文件传输如果全部直接 `spawn`，会让服务器、SSH channel 和本地文件 I/O
+/// 同时争抢资源，看起来像整批卡死。控制并发后，剩余任务仍留在队列中等待。
+const MAX_CONCURRENT_TRANSFERS: usize = 4;
+type TransferSlots = Arc<Semaphore>;
 
 /// 等 UI 决定「续传 / 覆盖 / 跳过」的上传任务。
 ///
@@ -174,6 +182,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
     let cancels: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
     let pending: PendingRegistry = Arc::new(Mutex::new(HashMap::new()));
     let path_locks = PathLocks::new();
+    let transfer_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS));
     // 短文件操作没有 TransferId；连接切换时用这一枚共享标志终止尚未开始/递归中的任务。
     let mut connection_cancel = Arc::new(AtomicBool::new(false));
     let mut pending_host: Option<PendingHostTrust> = None;
@@ -459,9 +468,14 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let registry = cancels.clone();
                 let events = events.clone();
                 let locks = path_locks.clone();
+                let slots = transfer_slots.clone();
                 let path_key = local_key(&local);
                 tokio::spawn(async move {
                     let _path_guard = locks.acquire([path_key]).await;
+                    let _slot = slots
+                        .acquire_owned()
+                        .await
+                        .expect("传输并发控制器不应被关闭");
                     transfer::run_download(sftp, id, remote, local, total, resume, cancel, events)
                         .await;
                     unregister_cancel(&registry, id);
@@ -595,6 +609,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                     &cancels,
                     &events,
                     &path_locks,
+                    &transfer_slots,
                 );
             }
 
@@ -628,6 +643,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                     &cancels,
                     &events,
                     &path_locks,
+                    &transfer_slots,
                 );
             }
 
@@ -657,9 +673,14 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let registry = cancels.clone();
                 let events = events.clone();
                 let locks = path_locks.clone();
+                let slots = transfer_slots.clone();
                 let path_key = local_key(&local);
                 tokio::spawn(async move {
                     let _path_guard = locks.acquire([path_key]).await;
+                    let _slot = slots
+                        .acquire_owned()
+                        .await
+                        .expect("传输并发控制器不应被关闭");
                     transfer::run_download_dir(
                         sftp,
                         id,
@@ -701,9 +722,14 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let registry = cancels.clone();
                 let events = events.clone();
                 let locks = path_locks.clone();
+                let slots = transfer_slots.clone();
                 let path_key = remote_key(&remote);
                 tokio::spawn(async move {
                     let _path_guard = locks.acquire([path_key]).await;
+                    let _slot = slots
+                        .acquire_owned()
+                        .await
+                        .expect("传输并发控制器不应被关闭");
                     transfer::run_upload_dir(sftp, id, local, remote, on_existing, cancel, events)
                         .await;
                     unregister_cancel(&registry, id);
@@ -778,6 +804,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                             &cancels,
                             &events,
                             &path_locks,
+                            &transfer_slots,
                         );
                     } else {
                         debug!("上传 {task_id} 被用户跳过");
@@ -1066,6 +1093,7 @@ fn register_cancel(registry: &CancelRegistry, id: TransferId, flag: CancelFlag) 
 /// 取消标志在收到 `Upload` 指令时就已经登记（探测和等确认期间也要能取消），
 /// 这里沿用它，**不新建** —— 否则用户在弹窗阶段点的取消会落在旧标志上，
 /// 新标志永远是 false，任务照跑。
+#[allow(clippy::too_many_arguments)]
 fn spawn_upload(
     id: TransferId,
     job: PendingUpload,
@@ -1074,6 +1102,7 @@ fn spawn_upload(
     cancels: &CancelRegistry,
     events: &flume::Sender<SftpEvent>,
     path_locks: &Arc<PathLocks>,
+    transfer_slots: &TransferSlots,
 ) {
     // 关掉续传时，「断点续传」等价于「从头覆盖」。
     let decision = if job.resume || decision != UploadDecision::Resume {
@@ -1086,9 +1115,14 @@ fn spawn_upload(
     let registry = cancels.clone();
     let events = events.clone();
     let locks = path_locks.clone();
+    let slots = transfer_slots.clone();
     let path_key = remote_key(&job.remote);
     tokio::spawn(async move {
         let _path_guard = locks.acquire([path_key]).await;
+        let _slot = slots
+            .acquire_owned()
+            .await
+            .expect("传输并发控制器不应被关闭");
         transfer::run_upload(
             sftp, id, job.local, job.remote, job.total, decision, cancel, events,
         )

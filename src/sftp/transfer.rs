@@ -16,13 +16,15 @@
 //! * **整目录上传**（[`run_upload_dir`]）：一条指令传一整棵树，队列里只占一行。
 //!   进度按整批字节汇总，取消一次就停掉整批。
 
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use futures::{StreamExt as _, stream};
 use russh::keys::{PublicKey, PublicKeyBase64 as _};
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpClientError;
@@ -31,14 +33,23 @@ use russh_sftp::protocol::{FileAttributes, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
 
-use super::local_tree::{self, LocalTree};
+use super::local_tree::{self, TreeSymlink};
 use super::remote_tree;
-use super::session::join_remote;
-use super::types::{ExistingPolicy, SftpEvent, TransferId, TransferOutcome, UploadDecision};
+use super::session::{self, join_remote};
+use super::types::{
+    EntryKind, ExistingPolicy, SftpEvent, TransferId, TransferOutcome, UploadDecision,
+};
 
 /// 一次搬运的块大小。64 KiB 是「进度条平滑」和「系统调用次数」之间的折中。
 const CHUNK_SIZE: usize = 64 * 1024;
+
+/// 小文件不值得为断点身份和远端回读校验支付多轮 SFTP 往返。
+const SMALL_FILE_THRESHOLD: u64 = CHUNK_SIZE as u64;
+
+/// 一棵目录内部同时处理的文件数。四路足以隐藏局域网延迟，又不会把同一 SSH 会话打满。
+const DIR_UPLOAD_CONCURRENCY: usize = 4;
 
 /// 进度上报的最小间隔。
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -1015,6 +1026,49 @@ impl UploadProbe {
     }
 }
 
+/// 整目录上传开始前按目录读取一次的远端条目快照。
+#[derive(Clone, Copy, Debug)]
+struct CachedRemoteEntry {
+    kind: EntryKind,
+    size: u64,
+    mode: Option<u32>,
+}
+
+type RemoteEntryCache = HashMap<String, CachedRemoteEntry>;
+
+fn cached_upload_probe(
+    cache: &RemoteEntryCache,
+    local_size: u64,
+    remote: &str,
+) -> Result<UploadProbe> {
+    let existing = cache.get(remote).copied();
+    let temp = filepart_path(remote);
+    let filepart = cache.get(&temp).copied();
+    if filepart.is_some_and(|entry| entry.kind != EntryKind::File) {
+        return Err(anyhow!("远端临时路径不是普通文件，拒绝写入：{temp}"));
+    }
+
+    let checkpoint_path = upload_checkpoint_path(remote);
+    let checkpoint = cache.get(&checkpoint_path).copied();
+    if checkpoint.is_some_and(|entry| entry.kind != EntryKind::File) {
+        return Err(anyhow!("远端断点身份路径不是普通文件：{checkpoint_path}"));
+    }
+    if checkpoint.is_some_and(|entry| entry.size > 16 * 1024) {
+        return Err(anyhow!("远端断点身份文件过大：{checkpoint_path}"));
+    }
+
+    Ok(UploadProbe {
+        local_size,
+        existing_size: existing.map(|entry| entry.size),
+        filepart_size: filepart.map(|entry| entry.size),
+        checkpoint_present: checkpoint.is_some(),
+        preserved_mode: existing
+            .filter(|entry| entry.kind == EntryKind::File)
+            .and_then(|entry| entry.mode.map(|mode| mode & 0o7777)),
+        target_is_dir: existing.is_some_and(|entry| entry.kind == EntryKind::Directory),
+    })
+}
+
 /// 读本地大小 + 两次远端 `stat`。
 pub async fn probe_upload(sftp: &SftpSession, local: &Path, remote: &str) -> Result<UploadProbe> {
     let local_meta = tokio::fs::symlink_metadata(local)
@@ -1340,6 +1394,128 @@ impl UploadSink for BatchSink<'_> {
     }
 }
 
+#[derive(Default)]
+struct ConcurrentBatchProgress {
+    transferred: u64,
+    total: u64,
+    active_files: Vec<String>,
+}
+
+/// 并发目录上传的进度汇总器。每个文件持有自己的 `file_transferred`，只把增量加到整批。
+struct ConcurrentBatchSink {
+    id: TransferId,
+    events: flume::Sender<SftpEvent>,
+    shared: Arc<Mutex<ConcurrentBatchProgress>>,
+    file_transferred: u64,
+}
+
+impl ConcurrentBatchSink {
+    fn new(
+        id: TransferId,
+        events: &flume::Sender<SftpEvent>,
+        shared: Arc<Mutex<ConcurrentBatchProgress>>,
+    ) -> Self {
+        Self {
+            id,
+            events: events.clone(),
+            shared,
+            file_transferred: 0,
+        }
+    }
+
+    fn add_discovered(&self, bytes: u64) {
+        let (transferred, total) = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            shared.total = shared.total.saturating_add(bytes);
+            (shared.transferred, shared.total)
+        };
+        let _ = self.events.send(SftpEvent::TransferProgress {
+            id: self.id,
+            transferred,
+            total,
+            speed: 0.,
+        });
+    }
+
+    fn add_completed(&self, bytes: u64) {
+        let (transferred, total) = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            shared.transferred = shared.transferred.saturating_add(bytes);
+            (shared.transferred, shared.total.max(shared.transferred))
+        };
+        let _ = self.events.send(SftpEvent::TransferProgress {
+            id: self.id,
+            transferred,
+            total,
+            speed: 0.,
+        });
+    }
+
+    fn file_started(&self, name: String) {
+        let files = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            shared.active_files.push(name);
+            shared.active_files.clone()
+        };
+        let _ = self
+            .events
+            .send(SftpEvent::TransferActiveFiles { id: self.id, files });
+    }
+
+    fn file_finished(&self, name: &str) {
+        let files = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(index) = shared.active_files.iter().position(|file| file == name) {
+                shared.active_files.remove(index);
+            }
+            shared.active_files.clone()
+        };
+        let _ = self
+            .events
+            .send(SftpEvent::TransferActiveFiles { id: self.id, files });
+    }
+}
+
+impl UploadSink for ConcurrentBatchSink {
+    fn started(&mut self, _total: u64, resumed_from: u64) {
+        self.file_transferred = resumed_from;
+        if resumed_from > 0 {
+            self.add_completed(resumed_from);
+        }
+    }
+
+    fn progress(&mut self, transferred: u64, _total: u64, speed: f64) {
+        let delta = transferred.saturating_sub(self.file_transferred);
+        self.file_transferred = self.file_transferred.max(transferred);
+        let (aggregate, total) = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            shared.transferred = shared.transferred.saturating_add(delta);
+            (shared.transferred, shared.total.max(shared.transferred))
+        };
+        let _ = self.events.send(SftpEvent::TransferProgress {
+            id: self.id,
+            transferred: aggregate,
+            total,
+            speed,
+        });
+    }
+}
+
 /// 上传一个文件。
 ///
 /// `decision` 由 worker（或冲突弹窗）定好，这里只负责执行：
@@ -1509,6 +1685,143 @@ async fn upload_file(
     Ok(())
 }
 
+fn small_filepart_path(remote: &str) -> String {
+    let sequence = NEXT_REMOTE_TEMP.fetch_add(1, Ordering::Relaxed);
+    format!("{remote}.filepart.tmp-{}-{sequence}", std::process::id())
+}
+
+/// 小文件快速路径：不创建断点身份、不回读远端内容做 SHA-256。
+///
+/// 数据仍先写唯一临时文件，确认尺寸并关闭句柄后才原子发布；SSH/TCP 负责链路完整性。
+async fn upload_small_file(
+    sftp: &SftpSession,
+    local: &Path,
+    remote: &str,
+    probe: &UploadProbe,
+    cancel: &AtomicBool,
+    sink: &mut dyn UploadSink,
+) -> Result<()> {
+    let temp = small_filepart_path(remote);
+    let result = upload_small_file_inner(sftp, local, remote, &temp, probe, cancel, sink).await;
+    if result.is_err() {
+        let _ = sftp.remove_file(&temp).await;
+    }
+    result
+}
+
+async fn upload_small_file_inner(
+    sftp: &SftpSession,
+    local: &Path,
+    remote: &str,
+    temp: &str,
+    probe: &UploadProbe,
+    cancel: &AtomicBool,
+    sink: &mut dyn UploadSink,
+) -> Result<()> {
+    if probe.target_is_dir {
+        return Err(anyhow!("远端同名条目是目录，无法覆盖：{remote}"));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("已取消"));
+    }
+
+    let mut source = open_local_read_no_follow(local)
+        .await
+        .map_err(|err| anyhow!("打开本地文件 {} 失败：{err}", local.display()))?;
+    let before = source
+        .metadata()
+        .await
+        .map_err(|err| anyhow!("读取本地文件 {} 失败：{err}", local.display()))?;
+    if !before.is_file() || before.len() != probe.local_size {
+        return Err(anyhow!(
+            "本地文件在目录扫描后发生变化，请重试：{}",
+            local.display()
+        ));
+    }
+    let total = before.len();
+    sink.started(total, 0);
+
+    let mut target = sftp
+        .create(temp)
+        .await
+        .map_err(|err| anyhow!("创建远端临时文件失败：{err}"))?;
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut transferred = 0u64;
+    let mut speedometer = Speedometer::new(0);
+    let mut throttle = Throttle::new(PROGRESS_INTERVAL);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = target.shutdown().await;
+            return Err(anyhow!("已取消"));
+        }
+        let read = source
+            .read(&mut buffer)
+            .await
+            .map_err(|err| anyhow!("读取本地文件失败：{err}"))?;
+        if read == 0 {
+            break;
+        }
+        target
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|err| anyhow!("写入远端临时文件失败：{err}"))?;
+        transferred += read as u64;
+        if throttle.ready() {
+            sink.progress(transferred, total, speedometer.sample(transferred));
+        }
+    }
+    target
+        .flush()
+        .await
+        .map_err(|err| anyhow!("刷新远端临时文件失败：{err}"))?;
+    // 小文件批量模式不逐文件 fsync：那会把几字节写入变成一次磁盘屏障。
+    // CLOSE 成功后再检查远端尺寸并原子发布；严格耐久路径仍由大文件上传保留。
+    target
+        .shutdown()
+        .await
+        .map_err(|err| anyhow!("关闭远端临时文件失败：{err}"))?;
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("已取消"));
+    }
+    let remote_temp = optional_remote_metadata(sftp, temp)
+        .await?
+        .ok_or_else(|| anyhow!("远端临时文件在发布前消失：{temp}"))?;
+    if remote_temp.is_dir() || remote_temp.is_symlink() || remote_temp.size != Some(total) {
+        return Err(anyhow!(
+            "远端临时文件校验失败：预期 {total} 字节，实际 {} 字节",
+            remote_temp.size.unwrap_or(0)
+        ));
+    }
+    let after = source
+        .metadata()
+        .await
+        .map_err(|err| anyhow!("重新读取本地文件 {} 失败：{err}", local.display()))?;
+    if transferred != total || !same_local_file(&before, &after) {
+        return Err(anyhow!(
+            "本地文件在上传过程中发生变化，远端原文件未被替换：{}",
+            local.display()
+        ));
+    }
+
+    if let Some(mode) = probe.preserved_mode
+        && let Err(err) = apply_mode(sftp, temp, mode).await
+    {
+        log::warn!("回填权限 {mode:o} 到 {temp} 失败：{err:#}");
+    }
+    replace_remote(sftp, temp, remote).await?;
+
+    // 快速路径不使用旧版断点；发布成功后顺手清掉同名残留，避免下次误报冲突。
+    if probe.filepart_size.is_some() {
+        let _ = sftp.remove_file(filepart_path(remote)).await;
+    }
+    if probe.checkpoint_present {
+        let _ = sftp.remove_file(upload_checkpoint_path(remote)).await;
+    }
+    sink.progress(transferred, total, speedometer.current());
+    Ok(())
+}
+
 /// 把 `mode` 贴到远端文件上（只发 permissions，不动大小/时间）。
 async fn apply_mode(sftp: &SftpSession, path: &str, mode: u32) -> Result<()> {
     let attrs = FileAttributes {
@@ -1539,8 +1852,8 @@ async fn replace_remote(sftp: &SftpSession, temp: &str, target: &str) -> Result<
             "替换失败：临时文件 {temp} 已不存在（rename 报错：{reason}）"
         ));
     };
-    if temp_meta.is_dir() || temp_meta.is_symlink() {
-        return Err(anyhow!("替换失败：临时路径不是普通文件：{temp}"));
+    if temp_meta.is_dir() {
+        return Err(anyhow!("替换失败：临时路径不能是目录：{temp}"));
     }
 
     let Some(target_meta) = optional_remote_metadata(sftp, target).await? else {
@@ -1705,8 +2018,8 @@ const WRITE_OR_CREATE: russh_sftp::protocol::OpenFlags =
 
 /// 上传一整个本地目录。
 ///
-/// 三步：扫本地树 → 在远端建目录（`mkdir -p` 语义）→ 逐个文件走单文件那套流程
-/// （探针 / `.filepart` / 原子替换）。队列里只占一行，进度按整批字节汇总。
+/// 逐层扫描本地目录，处理到一层就建立/读取对应远端目录并立即上传该层文件；不会先
+/// 预处理整棵树。队列里只占一行，总字节随扫描动态增长。
 ///
 /// 单个文件失败**不中断**整批：剩下的照传，最后把首个错误连同失败个数一起报回去。
 /// 传 500 个文件时因为第 3 个没权限就全放弃，比失败本身更让人恼火。
@@ -1738,6 +2051,171 @@ pub async fn run_upload_dir(
     let _ = events.send(SftpEvent::TransferCompleted { id, outcome });
 }
 
+enum DirUploadResult {
+    Uploaded,
+    Skipped,
+    Ignored,
+    Failed(String),
+}
+
+struct PendingSymlink {
+    link: TreeSymlink,
+    existed: bool,
+}
+
+struct UploadedDirectory {
+    children: Vec<PathBuf>,
+    symlinks: Vec<PendingSymlink>,
+    files: Vec<DirUploadResult>,
+    scan_skipped: usize,
+}
+
+async fn upload_remote_symlink(sftp: &SftpSession, remote: &str, target: &str) -> Result<()> {
+    let sequence = NEXT_REMOTE_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temp = format!("{remote}.symlink.tmp-{}-{sequence}", std::process::id());
+    let result = async {
+        sftp.symlink(&temp, target)
+            .await
+            .map_err(|err| anyhow!("创建远端符号链接失败：{err}"))?;
+        replace_remote(sftp, &temp, remote).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = sftp.remove_file(&temp).await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_local_directory(
+    sftp: &SftpSession,
+    id: TransferId,
+    local_root: &Path,
+    relative: PathBuf,
+    remote_root: &str,
+    on_existing: ExistingPolicy,
+    cancel: &AtomicBool,
+    events: &flume::Sender<SftpEvent>,
+    progress: Arc<Mutex<ConcurrentBatchProgress>>,
+    file_slots: Arc<Semaphore>,
+) -> Result<UploadedDirectory> {
+    let scan_root = local_root.to_path_buf();
+    let scan_relative = relative.clone();
+    let directory =
+        tokio::task::spawn_blocking(move || local_tree::scan_directory(&scan_root, &scan_relative))
+            .await
+            .map_err(|err| anyhow!("扫描本地目录失败：{err}"))?
+            .map_err(|err| anyhow!("{err}"))?;
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("已取消"));
+    }
+    let remote_dir = if relative.as_os_str().is_empty() {
+        remote_root.to_string()
+    } else {
+        join_remote(remote_root, &local_tree::relative_to_posix(&relative))
+    };
+    let created = ensure_dir(sftp, &remote_dir).await?;
+    let entries = if created {
+        Vec::new()
+    } else {
+        session::list_dir(sftp, &remote_dir)
+            .await
+            .map_err(|err| anyhow!("{err}"))?
+    };
+    let cache: RemoteEntryCache = entries
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.path,
+                CachedRemoteEntry {
+                    kind: entry.kind,
+                    size: entry.size,
+                    mode: entry.mode,
+                },
+            )
+        })
+        .collect();
+
+    let progress_reporter = ConcurrentBatchSink::new(id, events, progress.clone());
+    if directory.total_bytes > 0 {
+        progress_reporter.add_discovered(directory.total_bytes);
+    }
+
+    let files = stream::iter(directory.files.into_iter().map(|file| {
+        let name = local_tree::relative_to_posix(&file.relative);
+        let target = join_remote(remote_root, &name);
+        let progress = progress.clone();
+        let slots = file_slots.clone();
+        let cache = &cache;
+        async move {
+            if cancel.load(Ordering::Relaxed) {
+                return DirUploadResult::Ignored;
+            }
+            let probe = match cached_upload_probe(cache, file.size, &target) {
+                Ok(probe) => probe,
+                Err(err) => return DirUploadResult::Failed(format!("{name}：{err}")),
+            };
+            let mut sink = ConcurrentBatchSink::new(id, events, progress);
+            if on_existing == ExistingPolicy::Skip && probe.existing_size.is_some() {
+                sink.add_completed(probe.local_size);
+                return DirUploadResult::Skipped;
+            }
+
+            let _slot = match slots.acquire_owned().await {
+                Ok(slot) => slot,
+                Err(_) => return DirUploadResult::Failed(format!("{name}：并发控制器已关闭")),
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return DirUploadResult::Ignored;
+            }
+            sink.file_started(name.clone());
+            let result = if file.size <= SMALL_FILE_THRESHOLD {
+                upload_small_file(sftp, &file.local, &target, &probe, cancel, &mut sink).await
+            } else {
+                upload_file(
+                    sftp,
+                    &file.local,
+                    &target,
+                    &probe,
+                    file.size,
+                    UploadDecision::Overwrite,
+                    cancel,
+                    &mut sink,
+                )
+                .await
+            };
+            sink.file_finished(&name);
+            match result {
+                Ok(()) => DirUploadResult::Uploaded,
+                Err(err) => DirUploadResult::Failed(format!("{name}：{err}")),
+            }
+        }
+    }))
+    .buffer_unordered(DIR_UPLOAD_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    let symlinks = directory
+        .symlinks
+        .into_iter()
+        .map(|link| {
+            let target = join_remote(remote_root, &local_tree::relative_to_posix(&link.relative));
+            PendingSymlink {
+                link,
+                existed: cache.contains_key(&target),
+            }
+        })
+        .collect();
+
+    Ok(UploadedDirectory {
+        children: directory.dirs,
+        symlinks,
+        files,
+        scan_skipped: directory.skipped,
+    })
+}
+
 async fn upload_dir_inner(
     sftp: &SftpSession,
     id: TransferId,
@@ -1747,125 +2225,132 @@ async fn upload_dir_inner(
     cancel: &AtomicBool,
     events: &flume::Sender<SftpEvent>,
 ) -> Result<TransferOutcome> {
-    // 扫目录是纯本地 I/O，可能读几千个目录。丢到 blocking 池里，
-    // 别占住 runtime 的工作线程（另一条线程还在跑别的传输）。
-    let root = local.to_path_buf();
-    let tree: LocalTree = tokio::task::spawn_blocking(move || local_tree::scan(&root))
-        .await
-        .map_err(|err| anyhow!("扫描本地目录失败：{err}"))?
-        .map_err(|err| anyhow!("{err}"))?;
-
-    if tree.skipped > 0 {
-        log::warn!(
-            "上传 {}：跳过 {} 个符号链接 / 特殊文件",
-            local.display(),
-            tree.skipped
-        );
-    }
-    log::info!(
-        "上传目录 {} → {}：{} 个文件 / {} 个子目录，共 {} 字节",
-        local.display(),
-        remote,
-        tree.files.len(),
-        tree.dirs.len(),
-        tree.total_bytes
-    );
-
-    let total = tree.total_bytes;
+    // 先把队列行切到 Running，再逐层扫描、建目录和上传；不等待整棵树预处理完成。
     let _ = events.send(SftpEvent::TransferStarted {
         id,
         resumed_from: 0,
-        total,
+        total: 0,
     });
-
-    // 目标目录本身 + 树里每个子目录。扫描时已按深度排好，父目录一定在前面。
-    // 根目录建不出来就整批没戏，直接失败。
-    ensure_dir(sftp, remote).await?;
-
-    let mut done = 0u64;
+    let progress = Arc::new(Mutex::new(ConcurrentBatchProgress::default()));
+    let file_slots = Arc::new(Semaphore::new(DIR_UPLOAD_CONCURRENCY));
+    let mut pending = vec![PathBuf::new()];
+    let mut pending_symlinks = Vec::new();
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
-    let mut failures: Vec<String> = Vec::new();
-    // 建不出来的子目录（带结尾 `/`）：它下面的文件不再逐个尝试，
-    // 错误已经在目录那一条记过了，否则一个没权限的子目录会刷出几百条失败。
-    let mut broken_dirs: Vec<String> = Vec::new();
+    let mut failures = Vec::new();
+    let mut scan_skipped = 0usize;
 
-    for relative in &tree.dirs {
+    while !pending.is_empty() {
         if cancel.load(Ordering::Relaxed) {
             return Ok(TransferOutcome::Cancelled);
         }
-        let name = local_tree::relative_to_posix(relative);
-        if let Err(err) = ensure_dir(sftp, &join_remote(remote, &name)).await {
-            // 一个没权限的子目录不该毁掉整棵树：记下来，继续建别的。
-            failures.push(format!("{name}/：{err:#}"));
-            broken_dirs.push(format!("{name}/"));
-        }
-    }
-
-    for file in &tree.files {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(TransferOutcome::Cancelled);
-        }
-
-        let name = local_tree::relative_to_posix(&file.relative);
-        let target = join_remote(remote, &name);
-
-        // 父目录根本没建出来：跳过，别为它再刷一条失败。
-        if broken_dirs.iter().any(|dir| name.starts_with(dir.as_str())) {
-            continue;
-        }
-
-        let probe = match probe_upload(sftp, &file.local, &target).await {
-            Ok(probe) => probe,
-            Err(err) => {
-                failures.push(format!("{name}：{err}"));
-                continue;
+        let current = std::mem::take(&mut pending);
+        let directories = stream::iter(current.into_iter().map(|relative| {
+            let progress = progress.clone();
+            let file_slots = file_slots.clone();
+            async move {
+                let result = upload_local_directory(
+                    sftp,
+                    id,
+                    local,
+                    relative.clone(),
+                    remote,
+                    on_existing,
+                    cancel,
+                    events,
+                    progress,
+                    file_slots,
+                )
+                .await;
+                (relative, result)
             }
-        };
+        }))
+        .buffer_unordered(DIR_UPLOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
 
-        // 「跳过同名」且远端确实有这个文件：一个字节都不动。
-        // 但进度要往前走 —— 否则用户看着进度条卡住，不知道是在干活还是卡死了。
-        if on_existing == ExistingPolicy::Skip && probe.existing_size.is_some() {
-            skipped += 1;
-            done += probe.local_size;
-            let _ = events.send(SftpEvent::TransferProgress {
-                id,
-                transferred: done,
-                total,
-                speed: 0.,
-            });
-            continue;
-        }
-
-        // 整批没有逐文件的“确认这份断点可信”步骤，因此不能只凭长度自动续传；
-        // 残留 `.filepart` 可能来自旧版本文件，混接会悄悄产出损坏内容。
-        let decision = UploadDecision::Overwrite;
-
-        let mut sink = BatchSink::new(id, events, done, total);
-        match upload_file(
-            sftp,
-            &file.local,
-            &target,
-            &probe,
-            file.size,
-            decision,
-            cancel,
-            &mut sink,
-        )
-        .await
-        {
-            Ok(()) => uploaded += 1,
-            Err(err) => {
-                if cancel.load(Ordering::Relaxed) {
-                    return Ok(TransferOutcome::Cancelled);
+        for (relative, result) in directories {
+            let name = local_tree::relative_to_posix(&relative);
+            match result {
+                Ok(directory) => {
+                    pending.extend(directory.children);
+                    pending_symlinks.extend(directory.symlinks);
+                    scan_skipped += directory.scan_skipped;
+                    for result in directory.files {
+                        match result {
+                            DirUploadResult::Uploaded => uploaded += 1,
+                            DirUploadResult::Skipped => skipped += 1,
+                            DirUploadResult::Ignored => {}
+                            DirUploadResult::Failed(message) => failures.push(message),
+                        }
+                    }
                 }
-                failures.push(format!("{name}：{err}"));
+                Err(err) if relative.as_os_str().is_empty() => return Err(err),
+                Err(err) => failures.push(format!("{name}/：{err}")),
             }
         }
-
-        // 成功或半途失败，都以「最后一次上报的位置」为准：进度绝不倒退。
-        done = sink.last.max(done);
     }
+
+    // 链接最后创建，保证 Windows SFTP 服务能判断目标是文件还是目录。
+    let link_results = stream::iter(pending_symlinks.into_iter().map(|pending| {
+        let name = local_tree::relative_to_posix(&pending.link.relative);
+        let target_path = join_remote(remote, &name);
+        let link_target = local_tree::relative_to_posix(&pending.link.target);
+        let progress = progress.clone();
+        async move {
+            if cancel.load(Ordering::Relaxed) {
+                return DirUploadResult::Ignored;
+            }
+            if on_existing == ExistingPolicy::Skip && pending.existed {
+                return DirUploadResult::Skipped;
+            }
+            let progress_reporter = ConcurrentBatchSink::new(id, events, progress);
+            progress_reporter.file_started(name.clone());
+            let result = upload_remote_symlink(sftp, &target_path, &link_target).await;
+            progress_reporter.file_finished(&name);
+            match result {
+                Ok(()) => DirUploadResult::Uploaded,
+                Err(err) => DirUploadResult::Failed(format!("{name}：{err}")),
+            }
+        }
+    }))
+    .buffer_unordered(DIR_UPLOAD_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(TransferOutcome::Cancelled);
+    }
+    for result in link_results {
+        match result {
+            DirUploadResult::Uploaded => uploaded += 1,
+            DirUploadResult::Skipped => skipped += 1,
+            DirUploadResult::Ignored => {}
+            DirUploadResult::Failed(message) => failures.push(message),
+        }
+    }
+
+    if scan_skipped > 0 {
+        log::warn!(
+            "上传 {}：跳过 {} 个不安全链接 / 特殊文件",
+            local.display(),
+            scan_skipped
+        );
+    }
+    let (done, total) = {
+        let progress = progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (progress.transferred, progress.total)
+    };
+    log::info!(
+        "上传目录 {} → {}：已处理 {} 项，跳过 {} 项，共 {} 字节",
+        local.display(),
+        remote,
+        uploaded,
+        skipped,
+        total
+    );
 
     let _ = events.send(SftpEvent::TransferProgress {
         id,
@@ -1874,7 +2359,7 @@ async fn upload_dir_inner(
         speed: 0.,
     });
 
-    Ok(batch_outcome(uploaded, skipped, &failures, tree.skipped))
+    Ok(batch_outcome(uploaded, skipped, &failures, scan_skipped))
 }
 
 /// 整批的最终结论：成功传了一部分但另有遗漏时明确显示“部分完成”，不能静默报成功。
@@ -1899,7 +2384,7 @@ fn batch_outcome(
     }
     if scan_skipped > 0 {
         return TransferOutcome::Partial(format!(
-            "主体内容已完成，但扫描时跳过了 {scan_skipped} 个符号链接、特殊文件或不可读目录"
+            "主体内容已完成，但扫描时跳过了 {scan_skipped} 个不安全链接、特殊文件或不可读目录"
         ));
     }
     if transferred == 0 && skipped > 0 {
@@ -1909,21 +2394,17 @@ fn batch_outcome(
     }
 }
 
-/// 建远端目录，已经存在算成功（`mkdir -p` 语义）。
-///
-/// 不猜错误码：`create_dir` 失败后 `stat` 一次，确认那个路径确实是个目录就放过。
-/// 各家服务器在「目录已存在」上返回的状态码并不统一（`Failure` /
-/// `PermissionDenied` / 自定义 message），匹配状态码或字符串太脆。
-async fn ensure_dir(sftp: &SftpSession, path: &str) -> Result<()> {
-    let Err(create_err) = sftp.create_dir(path).await else {
-        return Ok(());
-    };
-
-    match sftp.metadata(path).await {
-        // 已经是个目录：这次是合并上传，不是错误。
-        Ok(meta) if meta.permissions.is_none_or(mode_is_dir) => Ok(()),
-        Ok(_) => Err(anyhow!("远端同名条目不是目录，无法上传文件夹进去：{path}")),
-        Err(_) => Err(anyhow!("创建远端目录 {path} 失败：{create_err}")),
+/// 确保远端目录存在；返回 `true` 表示本次刚创建，因此目录缓存可直接视为空。
+async fn ensure_dir(sftp: &SftpSession, path: &str) -> Result<bool> {
+    match optional_remote_metadata(sftp, path).await? {
+        Some(meta) if !meta.is_symlink() && meta.permissions.is_none_or(mode_is_dir) => Ok(false),
+        Some(_) => Err(anyhow!("远端同名条目不是目录，无法上传文件夹进去：{path}")),
+        None => {
+            sftp.create_dir(path)
+                .await
+                .map_err(|err| anyhow!("创建远端目录 {path} 失败：{err}"))?;
+            Ok(true)
+        }
     }
 }
 

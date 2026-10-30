@@ -12,12 +12,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
-use russh::server::{Auth, ChannelOpenHandle, Msg, Server as _, Session};
-use russh::{Channel, ChannelId};
+use russh::server::{Auth, ChannelOpenHandle, Msg, Response, Server as _, Session};
+use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
@@ -28,6 +28,65 @@ const DEFAULT_PORT: u16 = 2022;
 const USERNAME: &str = "zy";
 pub(crate) const DEFAULT_PASSWORD: &str = "88888888";
 const READ_DIR_BATCH: usize = 128;
+
+fn authentication_methods() -> MethodSet {
+    MethodSet::from(&[MethodKind::Password, MethodKind::KeyboardInteractive][..])
+}
+
+#[derive(Clone)]
+pub struct TransferActivity {
+    state: Arc<StdMutex<TransferActivityState>>,
+}
+
+struct TransferActivityState {
+    active: usize,
+    events: flume::Sender<bool>,
+}
+
+struct TransferActivityGuard {
+    activity: TransferActivity,
+}
+
+/// 创建内置服务端传输活动监视器；`true`/`false` 分别表示首项开始和末项结束。
+pub fn transfer_activity() -> (TransferActivity, flume::Receiver<bool>) {
+    let (events, receiver) = flume::unbounded();
+    (
+        TransferActivity {
+            state: Arc::new(StdMutex::new(TransferActivityState { active: 0, events })),
+        },
+        receiver,
+    )
+}
+
+impl TransferActivity {
+    fn begin(&self) -> TransferActivityGuard {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active += 1;
+        if state.active == 1 {
+            let _ = state.events.send(true);
+        }
+        TransferActivityGuard {
+            activity: self.clone(),
+        }
+    }
+}
+
+impl Drop for TransferActivityGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .activity
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            let _ = state.events.send(false);
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ServerInfo {
@@ -84,6 +143,7 @@ impl ServerInfo {
 pub fn start(
     configured_root: Option<PathBuf>,
     manual_password: Option<String>,
+    transfer_activity: TransferActivity,
 ) -> Result<ServerInfo, String> {
     let root = canonical_root(configured_root)?;
     let username = USERNAME.to_string();
@@ -122,6 +182,7 @@ pub fn start(
                 };
                 let config = Arc::new(russh::server::Config {
                     keys: vec![key],
+                    methods: authentication_methods(),
                     auth_rejection_time: Duration::from_millis(300),
                     auth_rejection_time_initial: Some(Duration::ZERO),
                     ..Default::default()
@@ -129,6 +190,7 @@ pub fn start(
                 let mut server = LanServer {
                     credentials,
                     root: server_root,
+                    transfer_activity,
                 };
                 if let Err(err) = server.run_on_socket(config, &listener).await {
                     log::error!("局域网 SFTP 服务意外停止：{err}");
@@ -245,10 +307,21 @@ struct Credentials {
     password: Arc<RwLock<String>>,
 }
 
+impl Credentials {
+    fn accepts(&self, user: &str, password: &[u8]) -> bool {
+        let expected = self
+            .password
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        user == self.username && password == expected.as_bytes()
+    }
+}
+
 #[derive(Clone)]
 struct LanServer {
     credentials: Arc<Credentials>,
     root: Arc<RwLock<PathBuf>>,
+    transfer_activity: TransferActivity,
 }
 
 impl russh::server::Server for LanServer {
@@ -258,6 +331,7 @@ impl russh::server::Server for LanServer {
         SshSession {
             credentials: self.credentials.clone(),
             root: self.root.clone(),
+            transfer_activity: self.transfer_activity.clone(),
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -266,6 +340,7 @@ impl russh::server::Server for LanServer {
 struct SshSession {
     credentials: Arc<Credentials>,
     root: Arc<RwLock<PathBuf>>,
+    transfer_activity: TransferActivity,
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
 }
 
@@ -273,12 +348,30 @@ impl russh::server::Handler for SshSession {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        let expected = self
-            .credentials
-            .password
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if user == self.credentials.username && password == expected.as_str() {
+        if self.credentials.accepts(user, password.as_bytes()) {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::reject())
+        }
+    }
+
+    async fn auth_keyboard_interactive(
+        &mut self,
+        user: &str,
+        _submethods: &str,
+        response: Option<Response<'_>>,
+    ) -> Result<Auth, Self::Error> {
+        let Some(mut response) = response else {
+            return Ok(Auth::Partial {
+                name: "Blip".into(),
+                instructions: "".into(),
+                prompts: vec![("Password: ".into(), false)].into(),
+            });
+        };
+        let accepted = response
+            .next()
+            .is_some_and(|password| self.credentials.accepts(user, &password));
+        if accepted && response.next().is_none() {
             Ok(Auth::Accept)
         } else {
             Ok(Auth::reject())
@@ -312,7 +405,11 @@ impl russh::server::Handler for SshSession {
         };
 
         session.channel_success(channel_id)?;
-        russh_sftp::server::run(channel.into_stream(), LocalSftp::new(self.root.clone())).await;
+        russh_sftp::server::run(
+            channel.into_stream(),
+            LocalSftp::new(self.root.clone(), self.transfer_activity.clone()),
+        )
+        .await;
         Ok(())
     }
 }
@@ -324,15 +421,22 @@ struct DirectoryCursor {
 
 struct LocalSftp {
     root: Arc<RwLock<PathBuf>>,
-    files: HashMap<String, Arc<Mutex<tokio::fs::File>>>,
+    transfer_activity: TransferActivity,
+    files: HashMap<String, OpenFile>,
     directories: HashMap<String, DirectoryCursor>,
     next_handle: u64,
 }
 
+struct OpenFile {
+    file: Arc<Mutex<tokio::fs::File>>,
+    _activity: TransferActivityGuard,
+}
+
 impl LocalSftp {
-    fn new(root: Arc<RwLock<PathBuf>>) -> Self {
+    fn new(root: Arc<RwLock<PathBuf>>, transfer_activity: TransferActivity) -> Self {
         Self {
             root,
+            transfer_activity,
             files: HashMap::new(),
             directories: HashMap::new(),
             next_handle: 1,
@@ -404,6 +508,37 @@ impl LocalSftp {
         Ok(canonical_parent.join(name))
     }
 
+    /// 校验相对链接按「链接所在目录 + target」解析后仍在共享根目录内。
+    fn resolve_link_target(&self, link: &Path, target: &str) -> Result<PathBuf, StatusCode> {
+        let root = self.root();
+        let parent = link.parent().ok_or(StatusCode::PermissionDenied)?;
+        let mut relative = parent
+            .strip_prefix(&root)
+            .map_err(|_| StatusCode::PermissionDenied)?
+            .to_path_buf();
+        for component in Path::new(target).components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(name) => relative.push(name),
+                Component::ParentDir => {
+                    if !relative.pop() {
+                        return Err(StatusCode::PermissionDenied);
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(StatusCode::PermissionDenied);
+                }
+            }
+        }
+        let resolved = root.join(relative);
+        if let Ok(canonical) = resolved.canonicalize()
+            && !canonical.starts_with(&root)
+        {
+            return Err(StatusCode::PermissionDenied);
+        }
+        Ok(resolved)
+    }
+
     fn resolve_for_open(&self, path: &str) -> Result<PathBuf, StatusCode> {
         let entry = self.resolve_entry(path)?;
         // `Path::exists` 会把悬空符号链接当作不存在；CREATE 随后会跟随它写出共享目录。
@@ -430,6 +565,46 @@ impl LocalSftp {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+async fn create_local_symlink(
+    target: &str,
+    link: &Path,
+    _resolved_target: &Path,
+) -> Result<(), StatusCode> {
+    tokio::fs::symlink(Path::new(target), link)
+        .await
+        .map_err(io_status)
+}
+
+#[cfg(windows)]
+async fn create_local_symlink(
+    target: &str,
+    link: &Path,
+    resolved_target: &Path,
+) -> Result<(), StatusCode> {
+    let metadata = tokio::fs::metadata(resolved_target)
+        .await
+        .map_err(io_status)?;
+    if metadata.is_dir() {
+        tokio::fs::symlink_dir(Path::new(target), link)
+            .await
+            .map_err(io_status)
+    } else {
+        tokio::fs::symlink_file(Path::new(target), link)
+            .await
+            .map_err(io_status)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn create_local_symlink(
+    _target: &str,
+    _link: &Path,
+    _resolved_target: &Path,
+) -> Result<(), StatusCode> {
+    Err(StatusCode::OpUnsupported)
 }
 
 #[cfg(unix)]
@@ -538,8 +713,13 @@ impl russh_sftp::server::Handler for LocalSftp {
         }
         let file = options.open(path).await.map_err(io_status)?;
         let handle = self.next_handle("file");
-        self.files
-            .insert(handle.clone(), Arc::new(Mutex::new(file)));
+        self.files.insert(
+            handle.clone(),
+            OpenFile {
+                file: Arc::new(Mutex::new(file)),
+                _activity: self.transfer_activity.begin(),
+            },
+        );
         Ok(Handle { id, handle })
     }
 
@@ -558,7 +738,7 @@ impl russh_sftp::server::Handler for LocalSftp {
         len: u32,
     ) -> Result<Data, Self::Error> {
         let file = self.files.get(&handle).ok_or(StatusCode::Failure)?;
-        let mut file = file.lock().await;
+        let mut file = file.file.lock().await;
         file.seek(std::io::SeekFrom::Start(offset))
             .await
             .map_err(io_status)?;
@@ -579,7 +759,7 @@ impl russh_sftp::server::Handler for LocalSftp {
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
         let file = self.files.get(&handle).ok_or(StatusCode::Failure)?;
-        let mut file = file.lock().await;
+        let mut file = file.file.lock().await;
         file.seek(std::io::SeekFrom::Start(offset))
             .await
             .map_err(io_status)?;
@@ -589,7 +769,7 @@ impl russh_sftp::server::Handler for LocalSftp {
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
         let file = self.files.get(&handle).ok_or(StatusCode::Failure)?;
-        let metadata = file.lock().await.metadata().await.map_err(io_status)?;
+        let metadata = file.file.lock().await.metadata().await.map_err(io_status)?;
         Ok(Attrs {
             id,
             attrs: FileAttributes::from(&metadata),
@@ -651,6 +831,18 @@ impl russh_sftp::server::Handler for LocalSftp {
         Ok(ok(id))
     }
 
+    async fn symlink(
+        &mut self,
+        id: u32,
+        linkpath: String,
+        targetpath: String,
+    ) -> Result<Status, Self::Error> {
+        let link = self.resolve_entry(&linkpath)?;
+        let resolved_target = self.resolve_link_target(&link, &targetpath)?;
+        create_local_symlink(&targetpath, &link, &resolved_target).await?;
+        Ok(ok(id))
+    }
+
     async fn rename(
         &mut self,
         id: u32,
@@ -671,7 +863,22 @@ mod tests {
     use super::*;
     use crate::sftp::session::{self, HostKeyPolicy};
     use crate::sftp::types::{AuthMethod, SessionConfig};
+    use russh::client;
+    use russh::keys::PublicKeyOrCertificate;
     use russh_sftp::server::Handler as _;
+
+    struct AcceptServerKey;
+
+    impl client::Handler for AcceptServerKey {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
 
     fn temp_root(tag: &str) -> PathBuf {
         let root =
@@ -679,6 +886,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("创建临时目录");
         root.canonicalize().expect("规范化临时目录")
+    }
+
+    fn test_activity() -> TransferActivity {
+        transfer_activity().0
     }
 
     #[test]
@@ -711,13 +922,14 @@ mod tests {
         assert!(selected_password(Some(String::new())).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn paths_cannot_escape_the_shared_root() {
         let root = temp_root("sandbox");
         let outside = root.with_file_name("macscp-lan-server-outside");
         let _ = std::fs::remove_file(root.join("escape"));
         std::os::unix::fs::symlink(&outside, root.join("escape")).expect("创建悬空符号链接");
-        let sftp = LocalSftp::new(Arc::new(RwLock::new(root)));
+        let sftp = LocalSftp::new(Arc::new(RwLock::new(root)), test_activity());
         assert_eq!(
             sftp.resolve_existing("/../../etc"),
             Err(StatusCode::PermissionDenied)
@@ -732,7 +944,7 @@ mod tests {
         std::fs::write(first.join("first.txt"), b"first").expect("写第一个目录");
         std::fs::write(second.join("second.txt"), b"second").expect("写第二个目录");
         let shared_root = Arc::new(RwLock::new(first));
-        let sftp = LocalSftp::new(shared_root.clone());
+        let sftp = LocalSftp::new(shared_root.clone(), test_activity());
         assert!(sftp.resolve_existing("/first.txt").is_ok());
 
         *shared_root.write().expect("切换共享目录") = second;
@@ -743,7 +955,7 @@ mod tests {
     #[tokio::test]
     async fn reads_and_writes_real_files() {
         let root = temp_root("io");
-        let mut sftp = LocalSftp::new(Arc::new(RwLock::new(root.clone())));
+        let mut sftp = LocalSftp::new(Arc::new(RwLock::new(root.clone())), test_activity());
         let handle = sftp
             .open(
                 1,
@@ -777,6 +989,64 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_keeps_relative_target_inside_shared_root() {
+        let root = temp_root("symlink");
+        std::fs::create_dir(root.join("bin")).expect("创建链接目录");
+        std::fs::write(root.join("tool.js"), b"tool").expect("创建链接目标");
+        let mut sftp = LocalSftp::new(Arc::new(RwLock::new(root.clone())), test_activity());
+
+        sftp.symlink(1, "/bin/tool".into(), "../tool.js".into())
+            .await
+            .expect("创建安全相对链接");
+        assert_eq!(
+            std::fs::read_link(root.join("bin/tool")).expect("读取链接"),
+            PathBuf::from("../tool.js")
+        );
+        assert!(matches!(
+            sftp.symlink(2, "/bin/escape".into(), "../../outside".into())
+                .await,
+            Err(StatusCode::PermissionDenied)
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_files_report_one_activity_until_the_session_ends() {
+        let root = temp_root("activity");
+        let (activity, events) = transfer_activity();
+        let mut sftp = LocalSftp::new(Arc::new(RwLock::new(root)), activity);
+
+        let first = sftp
+            .open(
+                1,
+                "/first.bin".into(),
+                OpenFlags::WRITE | OpenFlags::CREATE,
+                FileAttributes::default(),
+            )
+            .await
+            .expect("打开第一个文件")
+            .handle;
+        assert_eq!(events.recv(), Ok(true));
+
+        sftp.open(
+            2,
+            "/second.bin".into(),
+            OpenFlags::WRITE | OpenFlags::CREATE,
+            FileAttributes::default(),
+        )
+        .await
+        .expect("打开第二个文件");
+        assert_eq!(events.try_recv(), Err(flume::TryRecvError::Empty));
+
+        sftp.close(3, first).await.expect("关闭第一个文件");
+        assert_eq!(events.try_recv(), Err(flume::TryRecvError::Empty));
+
+        // 客户端异常断开时 LocalSftp 会整体释放，最后一个活动句柄也必须结束。
+        drop(sftp);
+        assert_eq!(events.recv(), Ok(false));
+    }
+
     #[tokio::test]
     async fn accepts_password_and_lists_the_shared_root_over_ssh() {
         let root = temp_root("ssh");
@@ -795,9 +1065,11 @@ mod tests {
         let mut server = LanServer {
             credentials,
             root: Arc::new(RwLock::new(root)),
+            transfer_activity: test_activity(),
         };
         let config = Arc::new(russh::server::Config {
             keys: vec![key],
+            methods: authentication_methods(),
             auth_rejection_time: Duration::from_millis(10),
             auth_rejection_time_initial: Some(Duration::ZERO),
             ..Default::default()
@@ -825,6 +1097,30 @@ mod tests {
             .await
             .expect("列共享根目录");
         assert!(entries.iter().any(|entry| entry.name == "visible.txt"));
+
+        let mut interactive = client::connect(
+            Arc::new(client::Config::default()),
+            address,
+            AcceptServerKey,
+        )
+        .await
+        .expect("建立 keyboard-interactive 测试连接");
+        let challenge = interactive
+            .authenticate_keyboard_interactive_start("lan-user", None::<String>)
+            .await
+            .expect("请求密码挑战");
+        assert!(matches!(
+            challenge,
+            client::KeyboardInteractiveAuthResponse::InfoRequest { .. }
+        ));
+        let authenticated = interactive
+            .authenticate_keyboard_interactive_respond(vec!["123456".into()])
+            .await
+            .expect("提交 keyboard-interactive 密码");
+        assert!(matches!(
+            authenticated,
+            client::KeyboardInteractiveAuthResponse::Success
+        ));
 
         server_task.abort();
     }
