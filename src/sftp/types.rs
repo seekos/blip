@@ -406,10 +406,17 @@ pub enum SftpEvent {
     /// 连接 + 认证 + SFTP 握手全部成功。`home` 是服务器给出的登录目录。
     Connected {
         home: String,
+        upload_sources: Vec<String>,
+        upload_concurrency: usize,
     },
     /// 已建立的连接意外关闭；worker 会保留连接意图并持续尝试恢复。
     Reconnecting,
     Disconnected,
+    /// 后台附加网卡连接建立或失效后，刷新状态栏里的上传链路信息。
+    TransferPoolChanged {
+        upload_sources: Vec<String>,
+        upload_concurrency: usize,
+    },
     /// 目录读取完成，`entries` 已按「文件夹优先、名称字母序」排好。
     DirListed {
         request_id: u64,

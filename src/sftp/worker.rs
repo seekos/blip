@@ -24,11 +24,13 @@ use std::thread;
 use std::time::Duration;
 
 use log::{debug, error, info, warn};
-use russh_sftp::client::SftpSession;
 use tokio::sync::Semaphore;
 
 use super::path_lock::{PathLocks, local_key, remote_key};
-use super::session::{self, ActiveSession, ConnectError, HostKeyChallenge, HostKeyPolicy};
+use super::session::{
+    self, ActiveSession, ConnectError, HostKeyChallenge, HostKeyPolicy, TransferPool,
+    TransferPoolStatus,
+};
 use super::transfer;
 use super::types::{
     ErrorContext, HostKeyDecision, HostKeyPrompt, SftpCommand, SftpEvent, TransferId,
@@ -44,11 +46,13 @@ type CancelFlag = Arc<AtomicBool>;
 /// 结束时需要自己把条目摘掉 —— 否则长时间运行的客户端会把这张表越撑越大。
 type CancelRegistry = Arc<Mutex<HashMap<TransferId, CancelFlag>>>;
 
-/// 同一条 SFTP 会话上同时搬运的数据流上限。
+/// 所有上传连接合计的数据流上限：最多四条连接，每条八路。
 ///
 /// 大批单文件传输如果全部直接 `spawn`，会让服务器、SSH channel 和本地文件 I/O
 /// 同时争抢资源，看起来像整批卡死。控制并发后，剩余任务仍留在队列中等待。
-const MAX_CONCURRENT_TRANSFERS: usize = 4;
+const MAX_CONCURRENT_UPLOADS: usize = 32;
+/// 下载仍共用主 SFTP 会话，保持较保守的并发上限。
+const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 type TransferSlots = Arc<Semaphore>;
 
 /// 等 UI 决定「续传 / 覆盖 / 跳过」的上传任务。
@@ -154,8 +158,8 @@ impl Drop for SftpWorker {
 
 fn worker_main(commands: flume::Receiver<SftpCommand>, events: flume::Sender<SftpEvent>) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
-        // 两条线程足够：一条跑命令循环，一条给并发的传输任务。
-        .worker_threads(2)
+        // 多条 SSH 连接会并行做加密和网络 I/O，四条 runtime 线程避免互相饿死。
+        .worker_threads(4)
         .thread_name("macscp-tokio")
         .enable_all()
         .build()
@@ -182,10 +186,12 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
     let cancels: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
     let pending: PendingRegistry = Arc::new(Mutex::new(HashMap::new()));
     let path_locks = PathLocks::new();
-    let transfer_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS));
+    let upload_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS));
+    let download_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
     // 短文件操作没有 TransferId；连接切换时用这一枚共享标志终止尚未开始/递归中的任务。
     let mut connection_cancel = Arc::new(AtomicBool::new(false));
     let mut pending_host: Option<PendingHostTrust> = None;
+    let mut transfer_pool_status: Option<TransferPoolStatus> = None;
     // 「对后续冲突执行相同操作」的选择，本次连接内有效。
     let mut upload_policy: Option<UploadDecision> = None;
 
@@ -205,6 +211,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                     cancel_all(&cancels);
                     cancel_pending_uploads(&pending, &cancels, &events);
                     session = None;
+                    transfer_pool_status = None;
                     pending_host = None;
                     upload_policy = None;
                     next_reconnect = tokio::time::Instant::now();
@@ -219,10 +226,16 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                     match session::connect(&target.config, target.host_key_policy.clone()).await {
                         Ok(active) => {
                             let home = active.home.clone();
+                            let pool_status = active.transfer_pool.status();
                             info!("已自动重连 {}，登录目录 {home}", target.config.endpoint());
                             connection_cancel = Arc::new(AtomicBool::new(false));
                             session = Some(active);
-                            let _ = events.send(SftpEvent::Connected { home });
+                            transfer_pool_status = Some(pool_status.clone());
+                            let _ = events.send(SftpEvent::Connected {
+                                home,
+                                upload_sources: pool_status.sources,
+                                upload_concurrency: pool_status.max_concurrency,
+                            });
                         }
                         Err(ConnectError::HostKey(challenge)) => {
                             let prompt = HostKeyPrompt {
@@ -244,6 +257,9 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                         }
                     }
                 }
+                if let Some(active) = session.as_ref() {
+                    publish_transfer_pool_status(active, &mut transfer_pool_status, &events);
+                }
                 continue;
             }
         };
@@ -260,6 +276,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 cancel_all(&cancels);
                 cancel_pending_uploads(&pending, &cancels, &events);
                 session = None;
+                transfer_pool_status = None;
                 reconnect_target = None;
                 pending_host = None;
                 upload_policy = None;
@@ -267,13 +284,19 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 match session::connect(&config, HostKeyPolicy::KnownHosts).await {
                     Ok(active) => {
                         let home = active.home.clone();
+                        let pool_status = active.transfer_pool.status();
                         info!("已连接 {}，登录目录 {home}", config.endpoint());
                         session = Some(active);
+                        transfer_pool_status = Some(pool_status.clone());
                         reconnect_target = Some(ReconnectTarget {
                             config,
                             host_key_policy: HostKeyPolicy::KnownHosts,
                         });
-                        let _ = events.send(SftpEvent::Connected { home });
+                        let _ = events.send(SftpEvent::Connected {
+                            home,
+                            upload_sources: pool_status.sources,
+                            upload_concurrency: pool_status.max_concurrency,
+                        });
                     }
                     Err(ConnectError::HostKey(challenge)) => {
                         let prompt = HostKeyPrompt {
@@ -301,6 +324,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 cancel_all(&cancels);
                 cancel_pending_uploads(&pending, &cancels, &events);
                 session = None;
+                transfer_pool_status = None;
                 reconnect_target = None;
                 pending_host = None;
                 upload_policy = None;
@@ -336,14 +360,20 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 match session::connect(&waiting.config, host_key_policy.clone()).await {
                     Ok(active) => {
                         let home = active.home.clone();
+                        let pool_status = active.transfer_pool.status();
                         info!("已确认主机密钥，登录目录 {home}");
                         connection_cancel = Arc::new(AtomicBool::new(false));
                         session = Some(active);
+                        transfer_pool_status = Some(pool_status.clone());
                         reconnect_target = Some(ReconnectTarget {
                             config: waiting.config,
                             host_key_policy,
                         });
-                        let _ = events.send(SftpEvent::Connected { home });
+                        let _ = events.send(SftpEvent::Connected {
+                            home,
+                            upload_sources: pool_status.sources,
+                            upload_concurrency: pool_status.max_concurrency,
+                        });
                     }
                     Err(err) => {
                         let _ = events
@@ -468,7 +498,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let registry = cancels.clone();
                 let events = events.clone();
                 let locks = path_locks.clone();
-                let slots = transfer_slots.clone();
+                let slots = download_slots.clone();
                 let path_key = local_key(&local);
                 tokio::spawn(async move {
                     let _path_guard = locks.acquire([path_key]).await;
@@ -605,11 +635,11 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                         cancel,
                     },
                     decision,
-                    active.sftp.clone(),
+                    active.transfer_pool.clone(),
                     &cancels,
                     &events,
                     &path_locks,
-                    &transfer_slots,
+                    &upload_slots,
                 );
             }
 
@@ -639,11 +669,11 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                         cancel,
                     },
                     UploadDecision::Overwrite,
-                    active.sftp.clone(),
+                    active.transfer_pool.clone(),
                     &cancels,
                     &events,
                     &path_locks,
-                    &transfer_slots,
+                    &upload_slots,
                 );
             }
 
@@ -673,7 +703,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let registry = cancels.clone();
                 let events = events.clone();
                 let locks = path_locks.clone();
-                let slots = transfer_slots.clone();
+                let slots = download_slots.clone();
                 let path_key = local_key(&local);
                 tokio::spawn(async move {
                     let _path_guard = locks.acquire([path_key]).await;
@@ -719,19 +749,26 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 register_cancel(&cancels, id, cancel.clone());
 
                 let sftp = active.sftp.clone();
+                let transfer_pool = active.transfer_pool.clone();
                 let registry = cancels.clone();
                 let events = events.clone();
                 let locks = path_locks.clone();
-                let slots = transfer_slots.clone();
+                let slots = upload_slots.clone();
                 let path_key = remote_key(&remote);
                 tokio::spawn(async move {
                     let _path_guard = locks.acquire([path_key]).await;
-                    let _slot = slots
-                        .acquire_owned()
-                        .await
-                        .expect("传输并发控制器不应被关闭");
-                    transfer::run_upload_dir(sftp, id, local, remote, on_existing, cancel, events)
-                        .await;
+                    transfer::run_upload_dir_pooled(
+                        sftp,
+                        transfer_pool,
+                        slots,
+                        id,
+                        local,
+                        remote,
+                        on_existing,
+                        cancel,
+                        events,
+                    )
+                    .await;
                     unregister_cancel(&registry, id);
                 });
             }
@@ -800,11 +837,11 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                             task_id,
                             job,
                             decision,
-                            active.sftp.clone(),
+                            active.transfer_pool.clone(),
                             &cancels,
                             &events,
                             &path_locks,
-                            &transfer_slots,
+                            &upload_slots,
                         );
                     } else {
                         debug!("上传 {task_id} 被用户跳过");
@@ -1065,6 +1102,22 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
 // 小工具
 // ---------------------------------------------------------------------------
 
+fn publish_transfer_pool_status(
+    active: &ActiveSession,
+    previous: &mut Option<TransferPoolStatus>,
+    events: &flume::Sender<SftpEvent>,
+) {
+    let current = active.transfer_pool.status();
+    if previous.as_ref() == Some(&current) {
+        return;
+    }
+    let _ = events.send(SftpEvent::TransferPoolChanged {
+        upload_sources: current.sources.clone(),
+        upload_concurrency: current.max_concurrency,
+    });
+    *previous = Some(current);
+}
+
 /// 给一次网络操作套上超时：卡住的连接不应该让界面永远转圈。
 async fn guard<T>(
     label: &str,
@@ -1098,11 +1151,11 @@ fn spawn_upload(
     id: TransferId,
     job: PendingUpload,
     decision: UploadDecision,
-    sftp: Arc<SftpSession>,
+    transfer_pool: TransferPool,
     cancels: &CancelRegistry,
     events: &flume::Sender<SftpEvent>,
     path_locks: &Arc<PathLocks>,
-    transfer_slots: &TransferSlots,
+    upload_slots: &TransferSlots,
 ) {
     // 关掉续传时，「断点续传」等价于「从头覆盖」。
     let decision = if job.resume || decision != UploadDecision::Resume {
@@ -1115,7 +1168,7 @@ fn spawn_upload(
     let registry = cancels.clone();
     let events = events.clone();
     let locks = path_locks.clone();
-    let slots = transfer_slots.clone();
+    let slots = upload_slots.clone();
     let path_key = remote_key(&job.remote);
     tokio::spawn(async move {
         let _path_guard = locks.acquire([path_key]).await;
@@ -1123,6 +1176,8 @@ fn spawn_upload(
             .acquire_owned()
             .await
             .expect("传输并发控制器不应被关闭");
+        let lane = transfer_pool.acquire().await;
+        let sftp = lane.sftp();
         transfer::run_upload(
             sftp, id, job.local, job.remote, job.total, decision, cancel, events,
         )

@@ -18,6 +18,7 @@ use gpui_kit::component::{
     input::{Input, InputState},
     notification::Notification,
     radio::{Radio, RadioGroup},
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::prelude::*;
@@ -253,6 +254,7 @@ impl ScpApp {
                             app.pending_config = None;
                         }
                     }
+                    WorkspaceEvent::TransferPoolChanged => cx.notify(),
                     WorkspaceEvent::PublicKeyInstalled { private_key } => {
                         app.toolbar.update(cx, |toolbar, cx| {
                             toolbar.finish_public_key_install(Ok(private_key.clone()), cx)
@@ -1322,7 +1324,11 @@ impl ScpApp {
         let local_path = self.local.read(cx).path().to_string();
         let remote_path = self.remote.read(cx).path().to_string();
         let active = self.transfers.read(cx).active_count();
-        let last_error = self.workspace.read(cx).last_error();
+        let (last_error, upload_sources, upload_concurrency) = {
+            let workspace = self.workspace.read(cx);
+            let (upload_sources, upload_concurrency) = workspace.upload_pool_status();
+            (workspace.last_error(), upload_sources, upload_concurrency)
+        };
 
         h_flex()
             .w_full()
@@ -1356,6 +1362,27 @@ impl ScpApp {
                         .gap_1()
                         .text_color(theme.danger)
                         .child(error),
+                )
+            })
+            .when(!upload_sources.is_empty(), |this| {
+                let upload_links = upload_sources.len();
+                let tooltip = format!(
+                    "上传连接：\n{}\n\n当前总并发上限：{upload_concurrency} 路",
+                    upload_sources.join("\n")
+                );
+                this.child(
+                    div()
+                        .id("upload-pool-status")
+                        .flex_shrink_0()
+                        .text_color(if upload_links > 1 {
+                            theme.success
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .child(SharedString::from(format!(
+                            "上传 {upload_links} 链路 · {upload_concurrency} 路"
+                        )))
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
                 )
             })
             .child(

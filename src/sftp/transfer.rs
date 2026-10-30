@@ -37,7 +37,7 @@ use tokio::sync::Semaphore;
 
 use super::local_tree::{self, TreeSymlink};
 use super::remote_tree;
-use super::session::{self, join_remote};
+use super::session::{self, TransferPool, join_remote};
 use super::types::{
     EntryKind, ExistingPolicy, SftpEvent, TransferId, TransferOutcome, UploadDecision,
 };
@@ -48,8 +48,11 @@ const CHUNK_SIZE: usize = 64 * 1024;
 /// 小文件不值得为断点身份和远端回读校验支付多轮 SFTP 往返。
 const SMALL_FILE_THRESHOLD: u64 = CHUNK_SIZE as u64;
 
-/// 一棵目录内部同时处理的文件数。四路足以隐藏局域网延迟，又不会把同一 SSH 会话打满。
-const DIR_UPLOAD_CONCURRENCY: usize = 4;
+/// 最多四条网卡连接、每条八路；实际并发还会受共享信号量和每连接上限约束。
+const DIR_UPLOAD_CONCURRENCY: usize = 32;
+
+/// 写入失败后再试两次；临时文件会从安全偏移重新写，不触碰原目标。
+const UPLOAD_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(600)];
 
 /// 进度上报的最小间隔。
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -69,6 +72,45 @@ const MAX_PUBLIC_KEY_SIZE: u64 = 64 * 1024;
 
 static NEXT_EDIT_TEMP: AtomicU64 = AtomicU64::new(1);
 static NEXT_REMOTE_TEMP: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct RetryableUploadError(String);
+
+impl std::fmt::Display for RetryableUploadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RetryableUploadError {}
+
+fn retryable_upload_error(message: String) -> anyhow::Error {
+    anyhow::Error::new(RetryableUploadError(message))
+}
+
+fn remote_write_error(action: &str, error: impl std::fmt::Display) -> anyhow::Error {
+    let message = format!("{action}失败：{error}");
+    let lower = error.to_string().to_ascii_lowercase();
+    if [
+        "permission denied",
+        "no space",
+        "disk full",
+        "read-only",
+        "quota exceeded",
+        "invalid argument",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        anyhow!(message)
+    } else {
+        retryable_upload_error(message)
+    }
+}
+
+fn is_retryable_upload_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RetryableUploadError>().is_some()
+}
 
 fn edit_temp_path(path: &str) -> String {
     let sequence = NEXT_EDIT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -420,7 +462,12 @@ async fn download_once(
     events: &flume::Sender<SftpEvent>,
 ) -> Result<()> {
     let plan = plan_download(sftp, remote, local, total, resume, cancel).await?;
-    let mut sink = RowSink { id, events };
+    let mut sink = RowSink {
+        id,
+        events,
+        started: false,
+        last: 0,
+    };
     download_file(sftp, remote, local, &plan, cancel, &mut sink).await
 }
 
@@ -1261,16 +1308,16 @@ async fn write_upload_checkpoint(
         .map_err(|err| anyhow!("创建远端断点身份临时文件失败：{err}"))?;
     file.write_all(&raw)
         .await
-        .map_err(|err| anyhow!("写入远端断点身份失败：{err}"))?;
+        .map_err(|err| remote_write_error("写入远端断点身份", err))?;
     file.flush()
         .await
-        .map_err(|err| anyhow!("刷新远端断点身份失败：{err}"))?;
+        .map_err(|err| remote_write_error("刷新远端断点身份", err))?;
     file.sync_all()
         .await
-        .map_err(|err| anyhow!("同步远端断点身份失败：{err}"))?;
+        .map_err(|err| remote_write_error("同步远端断点身份", err))?;
     file.shutdown()
         .await
-        .map_err(|err| anyhow!("关闭远端断点身份失败：{err}"))?;
+        .map_err(|err| remote_write_error("关闭远端断点身份", err))?;
     replace_remote(sftp, &temp, path).await
 }
 
@@ -1331,10 +1378,18 @@ pub trait UploadSink: Send {
 struct RowSink<'a> {
     id: TransferId,
     events: &'a flume::Sender<SftpEvent>,
+    started: bool,
+    last: u64,
 }
 
 impl UploadSink for RowSink<'_> {
     fn started(&mut self, total: u64, resumed_from: u64) {
+        if self.started {
+            self.last = self.last.max(resumed_from);
+            return;
+        }
+        self.started = true;
+        self.last = resumed_from;
         let _ = self.events.send(SftpEvent::TransferStarted {
             id: self.id,
             resumed_from,
@@ -1343,9 +1398,10 @@ impl UploadSink for RowSink<'_> {
     }
 
     fn progress(&mut self, transferred: u64, total: u64, speed: f64) {
+        self.last = self.last.max(transferred);
         let _ = self.events.send(SftpEvent::TransferProgress {
             id: self.id,
-            transferred,
+            transferred: self.last,
             total,
             speed,
         });
@@ -1490,10 +1546,10 @@ impl ConcurrentBatchSink {
 
 impl UploadSink for ConcurrentBatchSink {
     fn started(&mut self, _total: u64, resumed_from: u64) {
-        self.file_transferred = resumed_from;
-        if resumed_from > 0 {
+        if self.file_transferred == 0 && resumed_from > 0 {
             self.add_completed(resumed_from);
         }
+        self.file_transferred = self.file_transferred.max(resumed_from);
     }
 
     fn progress(&mut self, transferred: u64, _total: u64, speed: f64) {
@@ -1572,7 +1628,12 @@ async fn upload_once(
     }
 
     let probe = probe_upload(sftp, local, remote).await?;
-    let mut sink = RowSink { id, events };
+    let mut sink = RowSink {
+        id,
+        events,
+        started: false,
+        last: 0,
+    };
     upload_file(
         sftp, local, remote, &probe, total, decision, cancel, &mut sink,
     )
@@ -1585,6 +1646,45 @@ async fn upload_once(
 /// 再决定传不传 —— 两次 `stat` 没必要跑两遍。
 #[allow(clippy::too_many_arguments)]
 async fn upload_file(
+    sftp: &SftpSession,
+    local: &Path,
+    remote: &str,
+    probe: &UploadProbe,
+    total_hint: u64,
+    decision: UploadDecision,
+    cancel: &AtomicBool,
+    sink: &mut dyn UploadSink,
+) -> Result<()> {
+    let mut retries = 0;
+    loop {
+        match upload_file_once(
+            sftp, local, remote, probe, total_hint, decision, cancel, sink,
+        )
+        .await
+        {
+            Err(error)
+                if is_retryable_upload_error(&error)
+                    && !cancel.load(Ordering::Relaxed)
+                    && retries < UPLOAD_RETRY_DELAYS.len() =>
+            {
+                let delay = UPLOAD_RETRY_DELAYS[retries];
+                retries += 1;
+                log::warn!(
+                    "上传 {remote} 写入失败（{error}），{} ms 后进行第 {retries} 次重试",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) if retries > 0 => {
+                return Err(anyhow!("{error:#}（已自动重试 {retries} 次）"));
+            }
+            result => return result,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_file_once(
     sftp: &SftpSession,
     local: &Path,
     remote: &str,
@@ -1655,12 +1755,12 @@ async fn upload_file(
 
     let remote_temp = optional_remote_metadata(sftp, &temp)
         .await?
-        .ok_or_else(|| anyhow!("远端临时文件在发布前消失：{temp}"))?;
+        .ok_or_else(|| retryable_upload_error(format!("远端临时文件在发布前消失：{temp}")))?;
     if remote_temp.is_dir() || remote_temp.is_symlink() || remote_temp.size != Some(total) {
-        return Err(anyhow!(
+        return Err(retryable_upload_error(format!(
             "远端临时文件校验失败：预期 {total} 字节，实际 {} 字节",
             remote_temp.size.unwrap_or(0)
-        ));
+        )));
     }
     let remote_hash = hash_remote_file(sftp, &temp, cancel).await?;
     if remote_hash != prepared.checkpoint.sha256 {
@@ -1701,12 +1801,33 @@ async fn upload_small_file(
     cancel: &AtomicBool,
     sink: &mut dyn UploadSink,
 ) -> Result<()> {
-    let temp = small_filepart_path(remote);
-    let result = upload_small_file_inner(sftp, local, remote, &temp, probe, cancel, sink).await;
-    if result.is_err() {
-        let _ = sftp.remove_file(&temp).await;
+    let mut retries = 0;
+    loop {
+        let temp = small_filepart_path(remote);
+        let result = upload_small_file_inner(sftp, local, remote, &temp, probe, cancel, sink).await;
+        if result.is_err() {
+            let _ = sftp.remove_file(&temp).await;
+        }
+        match result {
+            Err(error)
+                if is_retryable_upload_error(&error)
+                    && !cancel.load(Ordering::Relaxed)
+                    && retries < UPLOAD_RETRY_DELAYS.len() =>
+            {
+                let delay = UPLOAD_RETRY_DELAYS[retries];
+                retries += 1;
+                log::warn!(
+                    "上传 {remote} 写入失败（{error}），{} ms 后进行第 {retries} 次重试",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) if retries > 0 => {
+                return Err(anyhow!("{error:#}（已自动重试 {retries} 次）"));
+            }
+            result => return result,
+        }
     }
-    result
 }
 
 async fn upload_small_file_inner(
@@ -1764,7 +1885,7 @@ async fn upload_small_file_inner(
         target
             .write_all(&buffer[..read])
             .await
-            .map_err(|err| anyhow!("写入远端临时文件失败：{err}"))?;
+            .map_err(|err| remote_write_error("写入远端临时文件", err))?;
         transferred += read as u64;
         if throttle.ready() {
             sink.progress(transferred, total, speedometer.sample(transferred));
@@ -1773,25 +1894,25 @@ async fn upload_small_file_inner(
     target
         .flush()
         .await
-        .map_err(|err| anyhow!("刷新远端临时文件失败：{err}"))?;
+        .map_err(|err| remote_write_error("刷新远端临时文件", err))?;
     // 小文件批量模式不逐文件 fsync：那会把几字节写入变成一次磁盘屏障。
     // CLOSE 成功后再检查远端尺寸并原子发布；严格耐久路径仍由大文件上传保留。
     target
         .shutdown()
         .await
-        .map_err(|err| anyhow!("关闭远端临时文件失败：{err}"))?;
+        .map_err(|err| remote_write_error("关闭远端临时文件", err))?;
 
     if cancel.load(Ordering::Relaxed) {
         return Err(anyhow!("已取消"));
     }
     let remote_temp = optional_remote_metadata(sftp, temp)
         .await?
-        .ok_or_else(|| anyhow!("远端临时文件在发布前消失：{temp}"))?;
+        .ok_or_else(|| retryable_upload_error(format!("远端临时文件在发布前消失：{temp}")))?;
     if remote_temp.is_dir() || remote_temp.is_symlink() || remote_temp.size != Some(total) {
-        return Err(anyhow!(
+        return Err(retryable_upload_error(format!(
             "远端临时文件校验失败：预期 {total} 字节，实际 {} 字节",
             remote_temp.size.unwrap_or(0)
-        ));
+        )));
     }
     let after = source
         .metadata()
@@ -1915,12 +2036,11 @@ async fn upload_stream(
 ) -> Result<u64> {
     let source = &mut prepared.file;
 
-    if plan.offset > 0 {
-        source
-            .seek(SeekFrom::Start(plan.offset))
-            .await
-            .map_err(|err| anyhow!("定位本地文件偏移失败：{err}"))?;
-    }
+    // 重试也走这里，必须把本地文件退回计划偏移，不能沿用上一次失败后的读指针。
+    source
+        .seek(SeekFrom::Start(plan.offset))
+        .await
+        .map_err(|err| anyhow!("定位本地文件偏移失败：{err}"))?;
 
     // 从头传用 create（CREATE|TRUNCATE），续传用 WRITE|CREATE 保住已有的字节。
     let mut target = if plan.offset > 0 {
@@ -1964,7 +2084,7 @@ async fn upload_stream(
         target
             .write_all(&buffer[..read])
             .await
-            .map_err(|err| anyhow!("写入远端临时文件失败：{err}"))?;
+            .map_err(|err| remote_write_error("写入远端临时文件", err))?;
 
         transferred += read as u64;
         if throttle.ready() {
@@ -1975,17 +2095,17 @@ async fn upload_stream(
     target
         .flush()
         .await
-        .map_err(|err| anyhow!("刷新远端临时文件失败：{err}"))?;
+        .map_err(|err| remote_write_error("刷新远端临时文件", err))?;
     // 服务器支持 fsync@openssh.com 时把数据刷到磁盘；不支持时是空操作。
     target
         .sync_all()
         .await
-        .map_err(|err| anyhow!("同步远端临时文件失败：{err}"))?;
+        .map_err(|err| remote_write_error("同步远端临时文件", err))?;
     // 先关句柄再 rename：有的服务器在还有写句柄时 rename 会报 busy。
     target
         .shutdown()
         .await
-        .map_err(|err| anyhow!("关闭远端临时文件失败：{err}"))?;
+        .map_err(|err| remote_write_error("关闭远端临时文件", err))?;
 
     // 终值：即使最后一次节流没触发，进度条也要走到头。
     sink.progress(
@@ -2023,8 +2143,37 @@ const WRITE_OR_CREATE: russh_sftp::protocol::OpenFlags =
 ///
 /// 单个文件失败**不中断**整批：剩下的照传，最后把首个错误连同失败个数一起报回去。
 /// 传 500 个文件时因为第 3 个没权限就全放弃，比失败本身更让人恼火。
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn run_upload_dir(
     sftp: Arc<SftpSession>,
+    id: TransferId,
+    local: PathBuf,
+    remote: String,
+    on_existing: ExistingPolicy,
+    cancel: Arc<AtomicBool>,
+    events: flume::Sender<SftpEvent>,
+) {
+    let transfer_pool = TransferPool::single(sftp.clone());
+    let file_slots = Arc::new(Semaphore::new(DIR_UPLOAD_CONCURRENCY));
+    run_upload_dir_pooled(
+        sftp,
+        transfer_pool,
+        file_slots,
+        id,
+        local,
+        remote,
+        on_existing,
+        cancel,
+        events,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_upload_dir_pooled(
+    sftp: Arc<SftpSession>,
+    transfer_pool: TransferPool,
+    file_slots: Arc<Semaphore>,
     id: TransferId,
     local: PathBuf,
     remote: String,
@@ -2035,7 +2184,18 @@ pub async fn run_upload_dir(
     let result = if cancel.load(Ordering::Relaxed) {
         Ok(TransferOutcome::Cancelled)
     } else {
-        upload_dir_inner(&sftp, id, &local, &remote, on_existing, &cancel, &events).await
+        upload_dir_inner(
+            &sftp,
+            &transfer_pool,
+            file_slots,
+            id,
+            &local,
+            &remote,
+            on_existing,
+            &cancel,
+            &events,
+        )
+        .await
     };
     let outcome = match result {
         Ok(outcome) => outcome,
@@ -2089,6 +2249,7 @@ async fn upload_remote_symlink(sftp: &SftpSession, remote: &str, target: &str) -
 #[allow(clippy::too_many_arguments)]
 async fn upload_local_directory(
     sftp: &SftpSession,
+    transfer_pool: &TransferPool,
     id: TransferId,
     local_root: &Path,
     relative: PathBuf,
@@ -2147,6 +2308,7 @@ async fn upload_local_directory(
         let target = join_remote(remote_root, &name);
         let progress = progress.clone();
         let slots = file_slots.clone();
+        let transfer_pool = transfer_pool.clone();
         let cache = &cache;
         async move {
             if cancel.load(Ordering::Relaxed) {
@@ -2169,12 +2331,17 @@ async fn upload_local_directory(
             if cancel.load(Ordering::Relaxed) {
                 return DirUploadResult::Ignored;
             }
+            let lane = transfer_pool.acquire().await;
+            let file_sftp = lane.sftp();
+            if cancel.load(Ordering::Relaxed) {
+                return DirUploadResult::Ignored;
+            }
             sink.file_started(name.clone());
             let result = if file.size <= SMALL_FILE_THRESHOLD {
-                upload_small_file(sftp, &file.local, &target, &probe, cancel, &mut sink).await
+                upload_small_file(&file_sftp, &file.local, &target, &probe, cancel, &mut sink).await
             } else {
                 upload_file(
-                    sftp,
+                    &file_sftp,
                     &file.local,
                     &target,
                     &probe,
@@ -2216,8 +2383,11 @@ async fn upload_local_directory(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_dir_inner(
     sftp: &SftpSession,
+    transfer_pool: &TransferPool,
+    file_slots: Arc<Semaphore>,
     id: TransferId,
     local: &Path,
     remote: &str,
@@ -2232,7 +2402,6 @@ async fn upload_dir_inner(
         total: 0,
     });
     let progress = Arc::new(Mutex::new(ConcurrentBatchProgress::default()));
-    let file_slots = Arc::new(Semaphore::new(DIR_UPLOAD_CONCURRENCY));
     let mut pending = vec![PathBuf::new()];
     let mut pending_symlinks = Vec::new();
     let mut uploaded = 0usize;
@@ -2251,6 +2420,7 @@ async fn upload_dir_inner(
             async move {
                 let result = upload_local_directory(
                     sftp,
+                    transfer_pool,
                     id,
                     local,
                     relative.clone(),
@@ -2662,6 +2832,21 @@ mod tests {
         assert_eq!(resume_offset(true, 300, 200), 0);
         // 一样长：偏移正好等于源长度，调用方会判定为「已完成」。
         assert_eq!(resume_offset(true, 200, 200), 200);
+    }
+
+    #[test]
+    fn upload_retry_skips_deterministic_write_errors() {
+        let permission = remote_write_error(
+            "写入远端临时文件",
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(!is_retryable_upload_error(&permission));
+
+        let interrupted = remote_write_error(
+            "写入远端临时文件",
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        );
+        assert!(is_retryable_upload_error(&interrupted));
     }
 
     /// 临时文件必须和目标同目录 —— 跨目录 rename 会退化成复制。

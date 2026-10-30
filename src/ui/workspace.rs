@@ -47,6 +47,7 @@ pub enum WorkspaceEvent {
     /// 会话状态变化。**只从事件泵方向发出**：工具栏自己发起的
     /// 「连接中 / 已断开」不会再回传给它（那时它正被更新，重入会 panic）。
     SessionStateChanged(SessionState),
+    TransferPoolChanged,
     PublicKeyInstalled {
         private_key: PathBuf,
     },
@@ -72,6 +73,8 @@ pub struct Workspace {
     /// 服务器给出的登录目录。
     home: Option<String>,
     last_error: Option<SharedString>,
+    upload_sources: Vec<String>,
+    upload_concurrency: usize,
     /// 目录列表请求序号，用于丢弃迟到的响应。
     request_seq: u64,
     directory_refresh_request: Option<u64>,
@@ -285,6 +288,8 @@ impl Workspace {
             connection_generation: 0,
             home: None,
             last_error: None,
+            upload_sources: Vec::new(),
+            upload_concurrency: 0,
             request_seq: 0,
             directory_refresh_request: None,
             next_transfer_id: 1,
@@ -326,6 +331,10 @@ impl Workspace {
         self.last_error.clone()
     }
 
+    pub fn upload_pool_status(&self) -> (Vec<String>, usize) {
+        (self.upload_sources.clone(), self.upload_concurrency)
+    }
+
     pub fn set_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
         if self.collapsed != collapsed {
             self.collapsed = collapsed;
@@ -349,6 +358,8 @@ impl Workspace {
         self.connection_generation = self.connection_generation.wrapping_add(1);
         self.state = SessionState::Connecting;
         self.last_error = None;
+        self.upload_sources.clear();
+        self.upload_concurrency = 0;
         self.remote_endpoint = Some((config.host.clone(), config.username.clone()));
         self.worker.send(SftpCommand::Connect(config));
         cx.notify();
@@ -360,6 +371,8 @@ impl Workspace {
         self.worker.send(SftpCommand::Disconnect);
         self.state = SessionState::Disconnected;
         self.home = None;
+        self.upload_sources.clear();
+        self.upload_concurrency = 0;
         self.remote_endpoint = None;
         self.set_online(false, cx);
         cx.notify();
@@ -440,11 +453,18 @@ impl Workspace {
                 self.ask_host_key(prompt, window, cx);
             }
 
-            SftpEvent::Connected { home } => {
+            SftpEvent::Connected {
+                home,
+                upload_sources,
+                upload_concurrency,
+            } => {
+                let upload_links = upload_sources.len();
                 self.state = SessionState::Connected;
                 self.directory_refresh_request = None;
                 self.home = Some(home.clone());
                 self.last_error = None;
+                self.upload_sources = upload_sources;
+                self.upload_concurrency = upload_concurrency;
                 self.transfers.update(cx, |queue, cx| queue.clear_all(cx));
 
                 let remembered = self.remote_endpoint.as_ref().and_then(|(host, username)| {
@@ -458,7 +478,12 @@ impl Workspace {
                 self.request_remote_listing_with_fallback(initial_path, fallback, cx);
 
                 self.emit_state(cx);
-                self.toast(window, cx, Notification::success("已连接到服务器"));
+                let message = if upload_links > 1 {
+                    format!("已连接到服务器 · 已启用 {upload_links} 条上传链路")
+                } else {
+                    "已连接到服务器".to_string()
+                };
+                self.toast(window, cx, Notification::success(message));
 
                 // 演示模式：`MACSCP_DEMO_UPLOAD=1` 时自动上传一个与远端同名的文件，
                 // 用来手工验证「上传冲突」弹窗 —— 那个弹窗平时点不出来。
@@ -516,8 +541,11 @@ impl Workspace {
             SftpEvent::Reconnecting => {
                 self.connection_generation = self.connection_generation.wrapping_add(1);
                 self.home = None;
+                self.upload_sources.clear();
+                self.upload_concurrency = 0;
                 self.directory_refresh_request = None;
                 self.set_online(false, cx);
+                cx.emit(WorkspaceEvent::TransferPoolChanged);
                 self.toast(window, cx, Notification::info("连接已中断，正在自动重连…"));
             }
 
@@ -525,10 +553,30 @@ impl Workspace {
                 self.connection_generation = self.connection_generation.wrapping_add(1);
                 self.state = SessionState::Disconnected;
                 self.home = None;
+                self.upload_sources.clear();
+                self.upload_concurrency = 0;
                 self.directory_refresh_request = None;
                 self.remote_endpoint = None;
                 self.set_online(false, cx);
                 self.emit_state(cx);
+            }
+
+            SftpEvent::TransferPoolChanged {
+                upload_sources,
+                upload_concurrency,
+            } => {
+                let previous_links = self.upload_sources.len();
+                let upload_links = upload_sources.len();
+                self.upload_sources = upload_sources;
+                self.upload_concurrency = upload_concurrency;
+                cx.emit(WorkspaceEvent::TransferPoolChanged);
+                if upload_links > previous_links && upload_links > 1 {
+                    self.toast(
+                        window,
+                        cx,
+                        Notification::success(format!("已启用第 {upload_links} 条上传链路")),
+                    );
+                }
             }
 
             SftpEvent::DirListed {
@@ -707,6 +755,8 @@ impl Workspace {
                     ErrorContext::Connect => {
                         self.state = SessionState::Disconnected;
                         self.last_error = Some(SharedString::from(message.clone()));
+                        self.upload_sources.clear();
+                        self.upload_concurrency = 0;
                         self.emit_state(cx);
                     }
                     ErrorContext::List => {

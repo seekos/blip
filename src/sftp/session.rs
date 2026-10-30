@@ -7,7 +7,7 @@ use std::future::Future;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -19,6 +19,7 @@ use russh_sftp::{
     client::{SftpSession, error::Error as SftpClientError},
     protocol::StatusCode,
 };
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use super::types::{AuthMethod, EntryKind, FileEntry, SessionConfig};
@@ -241,12 +242,234 @@ fn replace_known_host_line(path: &Path, line: usize, key: &PublicKey) -> Result<
     result
 }
 
-/// 一条已建立的连接。`handle` 只用来“持有”SSH 会话，读不读无所谓，但必须保活。
+struct TransferLane {
+    handle: Option<Arc<Handle<ClientHandler>>>,
+    sftp: Arc<SftpSession>,
+    source: Option<Ipv4Addr>,
+    in_flight: AtomicUsize,
+    slots: Arc<Semaphore>,
+}
+
+const MAX_TRANSFERS_PER_LANE: usize = 8;
+
+impl TransferLane {
+    fn is_healthy(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(|handle| !handle.is_closed())
+    }
+}
+
+struct TransferPoolInner {
+    lanes: Mutex<Vec<Arc<TransferLane>>>,
+    cursor: AtomicUsize,
+    closed: AtomicBool,
+    available: Notify,
+}
+
+/// 上传文件使用的 SFTP 连接池。每条连接固定绑定一张网卡的本地 IPv4。
+#[derive(Clone)]
+pub struct TransferPool {
+    inner: Arc<TransferPoolInner>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TransferPoolStatus {
+    pub sources: Vec<String>,
+    pub max_concurrency: usize,
+}
+
+impl TransferPool {
+    fn with_primary(
+        handle: Arc<Handle<ClientHandler>>,
+        sftp: Arc<SftpSession>,
+        source: Option<Ipv4Addr>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(TransferPoolInner {
+                lanes: Mutex::new(vec![Arc::new(TransferLane {
+                    handle: Some(handle),
+                    sftp,
+                    source,
+                    in_flight: AtomicUsize::new(0),
+                    slots: Arc::new(Semaphore::new(MAX_TRANSFERS_PER_LANE)),
+                })]),
+                cursor: AtomicUsize::new(0),
+                closed: AtomicBool::new(false),
+                available: Notify::new(),
+            }),
+        }
+    }
+
+    /// 测试和单会话调用方仍可沿用原来的 SFTP 会话。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn single(sftp: Arc<SftpSession>) -> Self {
+        Self {
+            inner: Arc::new(TransferPoolInner {
+                lanes: Mutex::new(vec![Arc::new(TransferLane {
+                    handle: None,
+                    sftp,
+                    source: None,
+                    in_flight: AtomicUsize::new(0),
+                    slots: Arc::new(Semaphore::new(MAX_TRANSFERS_PER_LANE)),
+                })]),
+                cursor: AtomicUsize::new(0),
+                closed: AtomicBool::new(false),
+                available: Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn add_lane(
+        &self,
+        handle: Arc<Handle<ClientHandler>>,
+        sftp: Arc<SftpSession>,
+        source: Ipv4Addr,
+    ) {
+        if self.inner.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut lanes) = self.inner.lanes.lock() else {
+            warn!("传输连接池状态异常，忽略本机地址 {source}");
+            return;
+        };
+        if lanes.iter().any(|lane| lane.source == Some(source)) {
+            return;
+        }
+        lanes.push(Arc::new(TransferLane {
+            handle: Some(handle),
+            sftp,
+            source: Some(source),
+            in_flight: AtomicUsize::new(0),
+            slots: Arc::new(Semaphore::new(MAX_TRANSFERS_PER_LANE)),
+        }));
+        log::info!(
+            "传输连接池已启用本机地址 {source}，当前 {} 条连接",
+            lanes.len()
+        );
+        self.inner.available.notify_waiters();
+    }
+
+    pub(crate) async fn acquire(&self) -> TransferLease {
+        loop {
+            let notified = self.inner.available.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let candidate = {
+                let lanes = self
+                    .inner
+                    .lanes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let start = self.inner.cursor.fetch_add(1, Ordering::Relaxed);
+                let loads = lanes
+                    .iter()
+                    .map(|lane| {
+                        (lane.is_healthy() && lane.slots.available_permits() > 0)
+                            .then(|| lane.in_flight.load(Ordering::Relaxed))
+                    })
+                    .collect::<Vec<_>>();
+                let selected = select_lane_index(&loads, start).or_else(|| {
+                    (!lanes.iter().any(|lane| lane.is_healthy())).then(|| {
+                        lanes
+                            .iter()
+                            .position(|lane| lane.slots.available_permits() > 0)
+                    })?
+                });
+                selected.map(|index| lanes[index].clone())
+            };
+
+            if let Some(lane) = candidate
+                && let Ok(permit) = lane.slots.clone().try_acquire_owned()
+            {
+                lane.in_flight.fetch_add(1, Ordering::Relaxed);
+                return TransferLease {
+                    lane,
+                    inner: self.inner.clone(),
+                    _permit: permit,
+                };
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn status(&self) -> TransferPoolStatus {
+        let lanes = self
+            .inner
+            .lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sources = lanes
+            .iter()
+            .filter(|lane| lane.is_healthy())
+            .map(|lane| {
+                lane.source
+                    .map(|source| source.to_string())
+                    .unwrap_or_else(|| "系统默认路由".to_string())
+            })
+            .collect::<Vec<_>>();
+        TransferPoolStatus {
+            max_concurrency: sources.len() * MAX_TRANSFERS_PER_LANE,
+            sources,
+        }
+    }
+
+    fn close(&self) {
+        self.inner.closed.store(true, Ordering::Relaxed);
+        self.inner.available.notify_waiters();
+    }
+}
+
+pub(crate) struct TransferLease {
+    lane: Arc<TransferLane>,
+    inner: Arc<TransferPoolInner>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl TransferLease {
+    pub(crate) fn sftp(&self) -> Arc<SftpSession> {
+        self.lane.sftp.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> Option<Ipv4Addr> {
+        self.lane.source
+    }
+}
+
+impl Drop for TransferLease {
+    fn drop(&mut self) {
+        self.lane.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.inner.available.notify_one();
+    }
+}
+
+fn select_lane_index(loads: &[Option<usize>], start: usize) -> Option<usize> {
+    let len = loads.len();
+    (0..len)
+        .filter_map(|offset| {
+            let index = (start + offset) % len;
+            loads[index].map(|load| (index, load, offset))
+        })
+        .min_by_key(|(_, load, offset)| (*load, *offset))
+        .map(|(index, _, _)| index)
+}
+
+/// 一条已建立的连接。主会话负责目录与控制操作，传输池负责分配上传文件。
 pub struct ActiveSession {
     #[allow(dead_code)]
-    pub handle: Handle<ClientHandler>,
+    pub handle: Arc<Handle<ClientHandler>>,
     pub sftp: Arc<SftpSession>,
     pub home: String,
+    pub transfer_pool: TransferPool,
+    primary_source: Option<Ipv4Addr>,
+}
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        self.transfer_pool.close();
+    }
 }
 
 /// 自动查找私钥时的候选文件名，按优先级排列。
@@ -426,15 +649,32 @@ async fn rsa_hash_candidates(
 }
 
 /// 建连尝试次数（含首次）。
-const CONNECT_ATTEMPTS: usize = 3;
+const CONNECT_ATTEMPTS: usize = 4;
 
 /// 每次重试前等多久：400ms、1200ms。
 ///
 /// 刻意很短（这类失败通常只需要「再发一个 SYN」），但也留够 ARP 重新解析的
 /// 时间 —— 只在已经失败的路径上多花这 1.6 秒，成功路径零成本。
 /// 数组长度和 [`CONNECT_ATTEMPTS`] 绑在一起：改次数忘了改等待会直接编译不过。
-const CONNECT_RETRY_DELAYS: [Duration; CONNECT_ATTEMPTS - 1] =
-    [Duration::from_millis(400), Duration::from_millis(1200)];
+const CONNECT_RETRY_DELAYS: [Duration; CONNECT_ATTEMPTS - 1] = [
+    Duration::from_millis(400),
+    Duration::from_millis(1200),
+    Duration::from_millis(2000),
+];
+
+/// 查询系统访问目标 IPv4 时会选择的本地出口地址，不发送任何数据。
+fn default_ipv4_source(target: Ipv4Addr) -> Option<Ipv4Addr> {
+    UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|socket| {
+            socket.connect((target, 9))?;
+            socket.local_addr()
+        })
+        .ok()
+        .and_then(|address| match address.ip() {
+            std::net::IpAddr::V4(address) => Some(address),
+            std::net::IpAddr::V6(_) => None,
+        })
+}
 
 /// 为同网段重复地址准备真正不同的 TCP 出口。
 ///
@@ -445,16 +685,7 @@ fn connection_sources(host: &str) -> [Option<Ipv4Addr>; CONNECT_ATTEMPTS] {
     let Ok(target) = host.parse::<Ipv4Addr>() else {
         return [None; CONNECT_ATTEMPTS];
     };
-    let default_source = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .and_then(|socket| {
-            socket.connect((target, 9))?;
-            socket.local_addr()
-        })
-        .ok()
-        .and_then(|address| match address.ip() {
-            std::net::IpAddr::V4(address) => Some(address),
-            std::net::IpAddr::V6(_) => None,
-        });
+    let default_source = default_ipv4_source(target);
     let networks = netdev::get_interfaces()
         .into_iter()
         .filter(|interface| {
@@ -467,6 +698,40 @@ fn connection_sources(host: &str) -> [Option<Ipv4Addr>; CONNECT_ATTEMPTS] {
                 .map(|network| (network.addr(), network.prefix_len()))
         });
     connection_sources_from(target, default_source, networks)
+}
+
+/// 附加传输连接可以走不同网段，只要该物理网卡有到服务器的有效路由。
+fn transfer_sources(host: &str) -> Vec<Ipv4Addr> {
+    let Ok(target) = host.parse::<Ipv4Addr>() else {
+        return Vec::new();
+    };
+    if target.is_loopback() {
+        return Vec::new();
+    }
+    let default_source = default_ipv4_source(target);
+    let mut candidates = netdev::get_interfaces()
+        .into_iter()
+        .filter(|interface| interface.is_up() && interface.is_physical())
+        .flat_map(|interface| {
+            let speed = interface.transmit_speed.unwrap_or(0);
+            interface.ipv4.into_iter().map(move |network| {
+                let source = network.addr();
+                let direct = same_ipv4_subnet(source, target, network.prefix_len());
+                (source, direct, speed)
+            })
+        })
+        .filter(|(source, _, _)| {
+            Some(*source) != default_source && !source.is_unspecified() && !source.is_loopback()
+        })
+        .collect::<Vec<_>>();
+    candidates
+        .sort_by_key(|(_, direct, speed)| (std::cmp::Reverse(*direct), std::cmp::Reverse(*speed)));
+    candidates.dedup_by_key(|(source, _, _)| *source);
+    candidates
+        .into_iter()
+        .map(|(source, _, _)| source)
+        .take(CONNECT_ATTEMPTS - 1)
+        .collect()
 }
 
 fn connection_sources_from(
@@ -540,7 +805,7 @@ fn is_transient_connect_error(err: &russh::Error) -> bool {
 /// 反复调用 `attempt`，直到成功、碰到不可重试的错误、或次数用尽。
 ///
 /// 失败时把「最后一次的原始错误」和「总共试了几次」一起返回 —— 最终文案里
-/// 要能说清楚「已经自动重试过 3 次还是不行」，否则用户会以为程序没努力过。
+/// 要能说清楚「已经自动重试过多次还是不行」，否则用户会以为程序没努力过。
 async fn connect_with_retries<T, F, Fut>(mut attempt: F) -> std::result::Result<T, ConnectFailure>
 where
     F: FnMut(usize) -> Fut,
@@ -616,7 +881,17 @@ pub async fn connect(
     host_key_policy: HostKeyPolicy,
 ) -> std::result::Result<ActiveSession, ConnectError> {
     // russh 会在没有业务数据时发送 SSH keepalive；服务器的响应也会重置空闲计时。
-    connect_with_ssh_config(config, host_key_policy, Arc::new(ssh_client_config())).await
+    let ssh_config = Arc::new(ssh_client_config());
+    let active =
+        connect_with_ssh_config(config, host_key_policy.clone(), ssh_config.clone()).await?;
+    spawn_transfer_lanes(
+        config.clone(),
+        host_key_policy,
+        ssh_config,
+        active.primary_source,
+        active.transfer_pool.clone(),
+    );
+    Ok(active)
 }
 
 async fn connect_with_ssh_config(
@@ -624,11 +899,25 @@ async fn connect_with_ssh_config(
     host_key_policy: HostKeyPolicy,
     ssh_config: Arc<client::Config>,
 ) -> std::result::Result<ActiveSession, ConnectError> {
+    connect_with_sources(
+        config,
+        host_key_policy,
+        ssh_config,
+        connection_sources(&config.host),
+    )
+    .await
+}
+
+async fn connect_with_sources(
+    config: &SessionConfig,
+    host_key_policy: HostKeyPolicy,
+    ssh_config: Arc<client::Config>,
+    sources: [Option<Ipv4Addr>; CONNECT_ATTEMPTS],
+) -> std::result::Result<ActiveSession, ConnectError> {
     let verification = Arc::new(Mutex::new(VerificationState::default()));
 
     let addr = (config.host.as_str(), config.port);
     let target = config.host.parse::<Ipv4Addr>().ok();
-    let sources = connection_sources(&config.host);
     // TCP + 版本交换 + 密钥交换这一段带重试（见 `is_transient_connect_error`）；
     // 后面的认证与 SFTP 握手不重试 —— 那两步失败重试也没用。
     let handle_result = connect_with_retries(|round| {
@@ -647,7 +936,9 @@ async fn connect_with_ssh_config(
                     verification,
                 };
                 let Some((source, target)) = source.zip(target) else {
-                    return client::connect(ssh_config, addr, handler).await;
+                    return client::connect(ssh_config, addr, handler)
+                        .await
+                        .map(|handle| (handle, None));
                 };
 
                 warn!("建连第 {round}/{CONNECT_ATTEMPTS} 次改用本机地址 {source}");
@@ -664,7 +955,9 @@ async fn connect_with_ssh_config(
                 {
                     warn!("设置 TCP_NODELAY 失败：{err}");
                 }
-                client::connect_stream(ssh_config, stream, handler).await
+                client::connect_stream(ssh_config, stream, handler)
+                    .await
+                    .map(|handle| (handle, Some(source)))
             })
             .await;
             match transport {
@@ -676,8 +969,8 @@ async fn connect_with_ssh_config(
     })
     .await;
 
-    let mut handle = match handle_result {
-        Ok(handle) => handle,
+    let (mut handle, primary_source) = match handle_result {
+        Ok(connected) => connected,
         Err((err, rounds)) => {
             let mut state = verification
                 .lock()
@@ -693,6 +986,9 @@ async fn connect_with_ssh_config(
             )));
         }
     };
+    // 默认路由成功时 russh 不返回底层 socket；用同一目标的路由选择补出实际
+    // 本地 IPv4，既用于状态栏展示，也避免附加连接重复使用这张网卡。
+    let primary_source = primary_source.or_else(|| target.and_then(default_ipv4_source));
 
     let auth_result = match &config.auth {
         AuthMethod::Password(password) => timeout(
@@ -770,7 +1066,40 @@ async fn connect_with_ssh_config(
         .await
         .unwrap_or_else(|_| "/".to_string());
 
-    Ok(ActiveSession { handle, sftp, home })
+    let handle = Arc::new(handle);
+    let transfer_pool = TransferPool::with_primary(handle.clone(), sftp.clone(), primary_source);
+    Ok(ActiveSession {
+        handle,
+        sftp,
+        home,
+        transfer_pool,
+        primary_source,
+    })
+}
+
+fn spawn_transfer_lanes(
+    config: SessionConfig,
+    host_key_policy: HostKeyPolicy,
+    ssh_config: Arc<client::Config>,
+    primary_source: Option<Ipv4Addr>,
+    pool: TransferPool,
+) {
+    for source in transfer_sources(&config.host) {
+        if Some(source) == primary_source {
+            continue;
+        }
+        let config = config.clone();
+        let host_key_policy = host_key_policy.clone();
+        let ssh_config = ssh_config.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let sources = [Some(source); CONNECT_ATTEMPTS];
+            match connect_with_sources(&config, host_key_policy, ssh_config, sources).await {
+                Ok(extra) => pool.add_lane(extra.handle.clone(), extra.sftp.clone(), source),
+                Err(err) => warn!("本机地址 {source} 的附加 SFTP 连接不可用：{err}"),
+            }
+        });
+    }
 }
 
 /// 测试时缩短保活周期，验证真实 TCP/SSH/SFTP 空闲连接，而不用让测试等待 15 秒。
@@ -1299,7 +1628,18 @@ mod tests {
             ],
         );
 
-        assert_eq!(sources, [None, Some(Ipv4Addr::new(192, 168, 146, 4)), None]);
+        assert_eq!(
+            sources,
+            [None, Some(Ipv4Addr::new(192, 168, 146, 4)), None, None]
+        );
+    }
+
+    #[test]
+    fn transfer_pool_prefers_the_least_loaded_healthy_lane() {
+        let loads = [Some(3), None, Some(1), Some(1)];
+        assert_eq!(select_lane_index(&loads, 0), Some(2));
+        assert_eq!(select_lane_index(&loads, 3), Some(3));
+        assert_eq!(select_lane_index(&[None, None], 0), None);
     }
 
     /// 前两次「主机不可达」、第三次成功 → 整体成功，且确实试了三次。
@@ -1329,7 +1669,7 @@ mod tests {
         assert_eq!(calls.get(), 3);
     }
 
-    /// 一直不可达 → 试满三次就放弃，并把次数一起报上来（文案里要写「已重试 3 次」）。
+    /// 一直不可达 → 试满全部次数就放弃，并把次数一起报上来。
     #[tokio::test]
     async fn persistent_failure_gives_up_after_all_attempts() {
         use std::io::ErrorKind;

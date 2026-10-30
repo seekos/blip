@@ -380,6 +380,8 @@ static RENAME_REFUSES_EXISTING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static FAIL_FILEPART_PUBLISH_ONCE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static FAIL_FILEPART_WRITE_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static WRITE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static READ_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STAT_FAILURE_PATH: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
@@ -395,6 +397,11 @@ pub fn set_rename_refuses_existing(enabled: bool) {
 #[cfg(test)]
 fn fail_filepart_publish_once() {
     FAIL_FILEPART_PUBLISH_ONCE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn fail_filepart_write_once() {
+    FAIL_FILEPART_WRITE_ONCE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -818,6 +825,11 @@ impl russh_sftp::server::Handler for TestSftp {
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
+        if handle.ends_with(".filepart")
+            && FAIL_FILEPART_WRITE_ONCE.swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(StatusCode::Failure);
+        }
         let mut disk = vfs().lock().await;
         let entry = disk.entry(handle.clone()).or_default();
         let offset = offset as usize;
@@ -1087,6 +1099,51 @@ mod tests {
         assert_eq!(format_mode(env.mode), "-rw-------");
     }
 
+    #[tokio::test]
+    async fn transfer_pool_allows_eight_uploads_per_connection() {
+        let addr = spawn().await;
+        let primary = connect_test(&config_for(addr, PASSWORD))
+            .await
+            .expect("连接主传输会话");
+        let extra = connect_test(&config_for(addr, PASSWORD))
+            .await
+            .expect("连接附加传输会话");
+        let extra_source = "192.0.2.2".parse().expect("解析测试地址");
+        primary
+            .transfer_pool
+            .add_lane(extra.handle.clone(), extra.sftp.clone(), extra_source);
+        let status = primary.transfer_pool.status();
+        assert_eq!(status.sources.len(), 2);
+        assert_eq!(status.max_concurrency, 16);
+
+        let mut leases = Vec::new();
+        for _ in 0..16 {
+            leases.push(
+                tokio::time::timeout(Duration::from_secs(1), primary.transfer_pool.acquire())
+                    .await
+                    .expect("两条连接应立即提供十六个传输槽"),
+            );
+        }
+        assert_eq!(
+            leases
+                .iter()
+                .filter(|lease| lease.source() == Some(extra_source))
+                .count(),
+            8
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), primary.transfer_pool.acquire())
+                .await
+                .is_err(),
+            "第十七路应等待已有传输释放槽位"
+        );
+
+        leases.pop();
+        tokio::time::timeout(Duration::from_secs(1), primary.transfer_pool.acquire())
+            .await
+            .expect("释放一个槽位后等待任务应立即继续");
+    }
+
     /// 业务层完全空闲时，SSH keepalive 也必须让服务器和客户端都保持会话。
     #[tokio::test]
     async fn keepalive_preserves_an_idle_sftp_session() {
@@ -1301,7 +1358,15 @@ mod tests {
         }
         worker.send(SftpCommand::ResolveHostKey(HostKeyDecision::TrustOnce));
         match next_event(worker).await {
-            SftpEvent::Connected { home } => assert_eq!(home, HOME),
+            SftpEvent::Connected {
+                home,
+                upload_sources,
+                upload_concurrency,
+            } => {
+                assert_eq!(home, HOME);
+                assert_eq!(upload_sources.len(), 1);
+                assert_eq!(upload_concurrency, 8);
+            }
             other => panic!("期望 Connected，实际 {other:?}"),
         }
     }
@@ -1346,7 +1411,7 @@ mod tests {
 
         let _restarted = spawn_controlled(Some(addr)).await;
         match next_event(&worker).await {
-            SftpEvent::Connected { home } => assert_eq!(home, HOME),
+            SftpEvent::Connected { home, .. } => assert_eq!(home, HOME),
             other => panic!("服务恢复后应自动重连，实际 {other:?}"),
         }
 
@@ -1859,6 +1924,39 @@ mod tests {
             !vfs_exists(&transfer::filepart_path(REMOTE)).await,
             "临时文件必须被 rename 成目标文件，不能留在目录里"
         );
+    }
+
+    #[tokio::test]
+    async fn upload_retries_a_transient_partial_write() {
+        let ctx = connect_and_dir("up-write-retry").await;
+        const REMOTE: &str = "/home/tester/write-retry.bin";
+        let local = ctx.dir.join("write-retry.bin");
+        let payload: Vec<u8> = (0..300 * 1024).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&local, &payload).expect("写本地文件");
+        fail_filepart_write_once();
+
+        let (tx, rx) = flume::unbounded::<SftpEvent>();
+        transfer::run_upload(
+            ctx.active.sftp.clone(),
+            63,
+            local,
+            REMOTE.to_string(),
+            payload.len() as u64,
+            UploadDecision::Overwrite,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )
+        .await;
+
+        assert!(rx.drain().into_iter().any(|event| matches!(
+            event,
+            SftpEvent::TransferCompleted {
+                outcome: TransferOutcome::Completed,
+                ..
+            }
+        )));
+        assert_eq!(vfs_read(REMOTE).await.as_deref(), Some(payload.as_slice()));
+        assert!(!vfs_exists(&transfer::filepart_path(REMOTE)).await);
     }
 
     /// 断点续传上传：`.filepart` 已有 50 KiB 时，只应补剩下的部分。
