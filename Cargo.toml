@@ -79,6 +79,10 @@ objc2-foundation = { version = "0.3", features = [
 ] }
 security-framework = { version = "3.7", features = ["OSX_10_15"] }
 
+# Linux 窗口图标：Wayland 用 app_id，X11 还需要把 PNG 解码后交给 GPUI。
+[target.'cfg(target_os = "linux")'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
 

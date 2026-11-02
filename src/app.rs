@@ -665,22 +665,25 @@ impl ScpApp {
             .update(cx, |toolbar, cx| toolbar.prefill(&profile, window, cx));
     }
 
-    /// 把连接状态写进窗口标题栏：`Blip — root@192.168.146.7`。
-    ///
-    /// 这串 `user@host` 原来贴在表单行的最右边，和输入框挤在一起，
-    /// 长得就像一个输入框；挪到窗口顶部后，表单那一行也宽松了。
-    /// 断开时退回纯 `Blip`。
-    fn sync_window_title(&self, window: &mut Window, cx: &App) {
+    fn window_title(&self, cx: &App) -> String {
         let toolbar = self.toolbar.read(cx);
-        let title = match toolbar.state() {
+        match toolbar.state() {
             SessionState::Connected => {
                 let snapshot = toolbar.snapshot(cx);
                 format!("Blip — {}@{}", snapshot.username, snapshot.host)
             }
             SessionState::Connecting => "Blip — 正在连接…".to_string(),
             SessionState::Disconnected => "Blip".to_string(),
-        };
-        window.set_window_title(&title);
+        }
+    }
+
+    /// 把连接状态写进窗口标题栏：`Blip — root@192.168.146.7`。
+    ///
+    /// 这串 `user@host` 原来贴在表单行的最右边，和输入框挤在一起，
+    /// 长得就像一个输入框；挪到窗口顶部后，表单那一行也宽松了。
+    /// 断开时退回纯 `Blip`。
+    fn sync_window_title(&self, window: &mut Window, cx: &App) {
+        window.set_window_title(&self.window_title(cx));
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1440,11 +1443,27 @@ impl Render for ScpApp {
         let theme = cx.theme().clone();
         let status = self.render_status_bar(cx);
 
-        v_flex()
+        let root = v_flex()
             .size_full()
             .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(self.toolbar.clone())
+            .text_color(theme.foreground);
+
+        #[cfg(target_os = "linux")]
+        let root = root.child(
+            gpui_kit::component::TitleBar::new().child(
+                h_flex()
+                    .h_full()
+                    .gap_2()
+                    .child(img(crate::ui::app_icon::image()).size(px(18.)))
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(SharedString::from(self.window_title(cx))),
+                    ),
+            ),
+        );
+
+        root.child(self.toolbar.clone())
             .child(div().flex_1().min_h_0().child(self.workspace.clone()))
             .child(status)
     }

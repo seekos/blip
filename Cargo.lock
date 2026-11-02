@@ -772,6 +772,7 @@ dependencies = [
  "gethostname",
  "gpui-kit",
  "gpui-pre",
+ "image",
  "keyring",
  "libc",
  "log",

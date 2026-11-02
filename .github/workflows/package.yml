@@ -59,5 +59,9 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: linux-x86_64
-          path: dist/*-linux-x86_64.tar.gz
+          path: |
+            dist/blip
+            dist/install.sh
+            dist/com.amov.Blip.desktop
+            dist/blip-app.png
           if-no-files-found: error

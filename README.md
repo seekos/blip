@@ -168,7 +168,17 @@ GitHub Actions 会在三个原生构建环境中并行生成发布包：
 
 - `Blip-<version>-macos-arm64.dmg`
 - `Blip-<version>-windows-x86_64.exe`
-- `Blip-<version>-linux-x86_64.tar.gz`
+- Linux 直接输出 `dist/blip`、`dist/install.sh`、桌面入口和 PNG 图标
+
+Linux 构建完成后直接安装；Wayland/GNOME 会用 `com.amov.Blip` 的应用 ID 匹配命名图标：
+
+```bash
+cd dist
+sudo ./install.sh
+blip
+```
+
+不使用 `sudo` 时会安装到 `~/.local`；已运行的旧进程需要退出后重新启动。
 
 可在 Actions 中手动运行“跨平台打包”，推送 `v*` 标签时也会自动执行。Windows release
 必须使用 Windows SDK 的 `fxc.exe` 编译 GPUI 着色器，因此不能从 macOS 直接交叉生成可靠的发布包。

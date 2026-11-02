@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Blip
+Comment=Native SFTP file transfer client
+Exec="@BLIP_EXEC@"
+Icon=blip-app
+Terminal=false
+Categories=Network;FileTransfer;
+StartupNotify=true
+StartupWMClass=com.amov.Blip

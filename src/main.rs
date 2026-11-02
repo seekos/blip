@@ -48,6 +48,12 @@ fn main() {
                     appears_transparent: false,
                     traffic_light_position: None,
                 }),
+                #[cfg(target_os = "linux")]
+                window_decorations: Some(WindowDecorations::Client),
+                #[cfg(target_os = "linux")]
+                app_id: Some("com.amov.Blip".into()),
+                #[cfg(target_os = "linux")]
+                icon: ui::app_icon::linux_window_icon(),
                 ..Default::default()
             };
 

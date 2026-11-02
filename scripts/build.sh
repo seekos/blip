@@ -4,7 +4,7 @@
 #
 # 产物：
 #   macOS: dist/Blip.app + dist/Blip-<version>-macos-<arch>.dmg
-#   Linux: dist/Blip-<version>-linux-<arch>.tar.gz
+#   Linux: dist/blip + dist/install.sh + 桌面入口与图标
 #   Windows: dist/Blip-<version>-windows-<arch>.exe
 #
 # 用法：
@@ -89,19 +89,19 @@ if [ "${PLATFORM}" = "Linux" ]; then
   # shellcheck disable=SC2086
   cargo build --locked ${CARGO_FLAGS}
 
-  ARCH=$(uname -m)
-  ARCHIVE="${DIST}/Blip-${VERSION}-linux-${ARCH}.tar.gz"
-  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/blip-linux.XXXXXX")
-  trap 'rm -rf "${STAGE}"' EXIT
-  cp "${ROOT}/target/${PROFILE}/blip" "${STAGE}/blip"
-  cp "${ROOT}/README.md" "${STAGE}/README.md"
-  tar -czf "${ARCHIVE}" -C "${STAGE}" blip README.md
+  cp "${ROOT}/target/${PROFILE}/blip" "${DIST}/blip"
+  cp "${ROOT}/assets/linux/com.amov.Blip.desktop" "${DIST}/com.amov.Blip.desktop"
+  cp "${ROOT}/docs/app-icon.png" "${DIST}/blip-app.png"
+  cp "${ROOT}/scripts/install-linux.sh" "${DIST}/install.sh"
+  chmod 644 "${DIST}/com.amov.Blip.desktop" "${DIST}/blip-app.png"
+  chmod +x "${DIST}/blip" "${DIST}/install.sh"
   printf '%s\n' "${VERSION}" > "${VERSION_FILE}"
 
   ELAPSED=$(( $(date +%s) - START ))
   echo
   echo "产物（${PROFILE}，${ELAPSED}s）："
-  du -sh "${ARCHIVE}" | awk -v p="${ARCHIVE}" '{printf "  %-6s %s\n", $1, p}'
+  du -sh "${DIST}/blip" | awk -v p="${DIST}/blip" '{printf "  %-6s %s\n", $1, p}'
+  echo "  安装：cd \"${DIST}\" && sudo ./install.sh"
   exit 0
 fi
 
