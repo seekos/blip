@@ -1,4 +1,4 @@
-//! 顶部工具栏：收藏夹 + 连接表单（Host / Port / Username / Password）+ 连接状态。
+//! 顶部工具栏：连接表单（Host / Port / Username / Password）+ 连接状态。
 //!
 //! 文件操作（上传 / 下载 / 新建目录 / 删除 / 刷新）不再占一行按钮，全部收进
 //! 两个文件面板的右键菜单 —— 见 `file_pane::menu_spec`。
@@ -6,7 +6,7 @@
 //! 工具栏自己持有输入状态，只把「用户想干什么」以 [`ToolbarEvent`] 抛给根实体，
 //! 不直接碰 worker、也不碰文件面板 —— 这样连接表单和网络层可以各自演进。
 
-use std::{cell::Cell, path::PathBuf, rc::Rc};
+use std::path::PathBuf;
 
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
@@ -19,7 +19,6 @@ use gpui_kit::component::{
     input::{Input, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
-    radio::{Radio, RadioGroup},
     v_flex,
 };
 use gpui_kit::prelude::*;
@@ -312,6 +311,12 @@ impl Toolbar {
         cx.notify();
     }
 
+    pub(crate) fn profiles_for_display(&self) -> Vec<SavedProfile> {
+        let mut profiles = self.profiles.clone();
+        store::sort_profiles_for_display(&mut profiles);
+        profiles
+    }
+
     pub fn set_discovered_devices(
         &mut self,
         devices: Vec<DiscoveredDevice>,
@@ -346,7 +351,7 @@ impl Toolbar {
         cx.notify();
     }
 
-    fn connect_profile(
+    pub(crate) fn connect_profile(
         &mut self,
         profile: &SavedProfile,
         window: &mut Window,
@@ -399,7 +404,7 @@ impl Toolbar {
         }
     }
 
-    fn commit_profile(
+    pub(crate) fn commit_profile(
         &mut self,
         profile: SavedProfile,
         migrate_previous_password: bool,
@@ -446,7 +451,7 @@ impl Toolbar {
         Ok(())
     }
 
-    fn favorite_current(
+    pub(crate) fn favorite_current(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -499,7 +504,7 @@ impl Toolbar {
         Ok(())
     }
 
-    fn set_profile_pinned(
+    pub(crate) fn set_profile_pinned(
         &mut self,
         mut profile: SavedProfile,
         pinned: bool,
@@ -510,7 +515,7 @@ impl Toolbar {
         self.commit_profile(profile, true, window, cx)
     }
 
-    fn confirm_remove_profile(
+    pub(crate) fn confirm_remove_profile(
         &mut self,
         profile: SavedProfile,
         window: &mut Window,
@@ -582,172 +587,6 @@ impl Toolbar {
                                             Notification::error(format!("删除收藏失败：{error}")),
                                             cx,
                                         ),
-                                    }
-                                }),
-                        ),
-                )
-        });
-    }
-
-    fn open_profile_editor(
-        &mut self,
-        profile: SavedProfile,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let name = cx.new(|cx| {
-            InputState::new(window, cx).default_value(profile.name.clone().unwrap_or_default())
-        });
-        let port = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(profile.port.to_string())
-                .placeholder("1–65535")
-        });
-        let use_key = cx.new(|_| matches!(profile.auth, SavedAuth::Key { .. }));
-        let error = cx.new(|_| Option::<SharedString>::None);
-        let toolbar = cx.entity().downgrade();
-        let focus_on_mount = Rc::new(Cell::new(true));
-
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let name = name.clone();
-            let port = port.clone();
-            let use_key = use_key.clone();
-            let error = error.clone();
-            let profile = profile.clone();
-            let toolbar = toolbar.clone();
-            let focus_on_mount = focus_on_mount.clone();
-            let selected_auth = usize::from(*use_key.read(cx));
-            let auth_use_key = use_key.clone();
-            let auth_error = error.clone();
-            let save_use_key = use_key.clone();
-            let save_error = error.clone();
-
-            if focus_on_mount.replace(false) {
-                let name = name.clone();
-                window.defer(cx, move |window, cx| {
-                    name.focus_handle(cx).focus(window, cx);
-                });
-            }
-
-            dialog
-                .title("编辑收藏")
-                .w(px(480.))
-                .close_button(false)
-                .overlay_closable(false)
-                .child(
-                    v_flex()
-                        .w_full()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(SharedString::from(profile.endpoint_label())),
-                        )
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .child(div().text_sm().child("名称（可选）"))
-                                .child(Input::new(&name).w_full()),
-                        )
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .child(div().text_sm().child("端口"))
-                                .child(Input::new(&port).w_full()),
-                        )
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .child(div().text_sm().child("认证方式"))
-                                .child(
-                                    RadioGroup::horizontal("profile-auth")
-                                        .selected_index(Some(selected_auth))
-                                        .on_click(move |index, _, cx| {
-                                            auth_use_key.update(cx, |use_key, cx| {
-                                                *use_key = *index == 1;
-                                                cx.notify();
-                                            });
-                                            auth_error.update(cx, |error, cx| {
-                                                *error = None;
-                                                cx.notify();
-                                            });
-                                        })
-                                        .child(Radio::new("profile-auth-password").label("密码"))
-                                        .child(Radio::new("profile-auth-key").label("私钥")),
-                                ),
-                        )
-                        .when_some(error.read(cx).clone(), |this, message| {
-                            this.child(div().text_xs().text_color(cx.theme().danger).child(message))
-                        }),
-                )
-                .footer(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("profile-edit-cancel")
-                                .label("取消")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                        )
-                        .child(
-                            Button::new("profile-edit-save")
-                                .primary()
-                                .label("保存")
-                                .on_click(move |_, window, cx| {
-                                    let port_value = port.read(cx).value().trim().parse::<u16>();
-                                    let Ok(port_value) = port_value else {
-                                        save_error.update(cx, |error, cx| {
-                                            *error = Some("端口必须是 1–65535 之间的整数".into());
-                                            cx.notify();
-                                        });
-                                        return;
-                                    };
-                                    if port_value == 0 {
-                                        save_error.update(cx, |error, cx| {
-                                            *error = Some("端口必须是 1–65535 之间的整数".into());
-                                            cx.notify();
-                                        });
-                                        return;
-                                    }
-                                    let mut edited = profile.clone();
-                                    edited.name = match name.read(cx).value().trim() {
-                                        "" => None,
-                                        value => Some(value.to_string()),
-                                    };
-                                    edited.port = port_value;
-                                    edited.auth = if *save_use_key.read(cx) {
-                                        match &profile.auth {
-                                            SavedAuth::Key { path } => {
-                                                SavedAuth::Key { path: path.clone() }
-                                            }
-                                            SavedAuth::Password => SavedAuth::Key {
-                                                path: String::new(),
-                                            },
-                                        }
-                                    } else {
-                                        SavedAuth::Password
-                                    };
-                                    match toolbar.update(cx, |toolbar, cx| {
-                                        toolbar.commit_profile(edited, true, window, cx)
-                                    }) {
-                                        Ok(Ok(())) => {
-                                            window.push_notification(
-                                                Notification::success("收藏已保存"),
-                                                cx,
-                                            );
-                                            window.close_dialog(cx);
-                                        }
-                                        Ok(Err(message)) => save_error.update(cx, |error, cx| {
-                                            *error = Some(message.into());
-                                            cx.notify();
-                                        }),
-                                        Err(update_error) => save_error.update(cx, |error, cx| {
-                                            *error = Some(
-                                                format!("保存收藏失败：{update_error}").into(),
-                                            );
-                                            cx.notify();
-                                        }),
                                     }
                                 }),
                         ),
@@ -880,8 +719,6 @@ impl Toolbar {
         let connecting = self.state == SessionState::Connecting;
         let form_locked = connected || connecting;
         let use_key = self.use_key;
-        let mut profiles = self.profiles.clone();
-        store::sort_profiles_for_display(&mut profiles);
         let discovered_devices = self.discovered_devices.clone();
         let discovered_count = discovered_devices.len();
         let toolbar = cx.entity().downgrade();
@@ -971,231 +808,6 @@ impl Toolbar {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Blip"),
                     ),
-            )
-            .child(
-                Button::new("favorites")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Bookmark)
-                    .accessibility_label("收藏夹")
-                    .tooltip("收藏夹")
-                    .disabled(form_locked)
-                    .dropdown_menu(move |menu, _window, _cx| {
-                        if profiles.is_empty() {
-                            return menu.min_w(px(180.)).item(
-                                PopupMenuItem::new("暂无收藏，连接后可点旁边按钮收藏")
-                                    .disabled(true),
-                            );
-                        }
-
-                        profiles.iter().enumerate().fold(
-                            menu.min_w(px(260.)).max_h(px(320.)).scrollable(true),
-                            |menu, (index, profile)| {
-                                let profile = profile.clone();
-                                let item_toolbar = toolbar.clone();
-                                let action_profile = profile.clone();
-                                let action_toolbar = toolbar.clone();
-                                let icon = match profile.auth {
-                                    SavedAuth::Password => IconName::Lock,
-                                    SavedAuth::Key { .. } => IconName::KeyRound,
-                                };
-                                let title = profile.title();
-                                let endpoint = profile.endpoint_label();
-                                let pinned = profile.pinned;
-
-                                menu.item(
-                                    PopupMenuItem::element(move |_, _cx| {
-                                        let pin_profile = action_profile.clone();
-                                        let pin_toolbar = action_toolbar.clone();
-                                        let edit_profile = action_profile.clone();
-                                        let edit_toolbar = action_toolbar.clone();
-                                        let delete_profile = action_profile.clone();
-                                        let delete_toolbar = action_toolbar.clone();
-                                        h_flex()
-                                            .group("favorite-row")
-                                            .flex_1()
-                                            .min_w_0()
-                                            .justify_between()
-                                            .gap_2()
-                                            .child(
-                                                v_flex()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .gap_0p5()
-                                                    .child(
-                                                        div()
-                                                            .whitespace_nowrap()
-                                                            .text_ellipsis()
-                                                            .child(SharedString::from(
-                                                                title.clone(),
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(
-                                                                _cx.theme().muted_foreground,
-                                                            )
-                                                            .whitespace_nowrap()
-                                                            .text_ellipsis()
-                                                            .child(SharedString::from(
-                                                                endpoint.clone(),
-                                                            )),
-                                                    ),
-                                            )
-                                            .child(
-                                                h_flex()
-                                                    .gap_0p5()
-                                                    .child(
-                                                        Button::new(format!(
-                                                            "pin-favorite-{index}"
-                                                        ))
-                                                        .ghost()
-                                                        .xsmall()
-                                                        .icon(if pinned {
-                                                            IconName::PinOff
-                                                        } else {
-                                                            IconName::Pin
-                                                        })
-                                                        .when(!pinned, |this| {
-                                                            this.invisible().group_hover(
-                                                                "favorite-row",
-                                                                |this| this.visible(),
-                                                            )
-                                                        })
-                                                        .focus(|this| this.visible())
-                                                        .accessibility_label(if pinned {
-                                                            "取消置顶收藏"
-                                                        } else {
-                                                            "置顶收藏"
-                                                        })
-                                                        .tooltip(if pinned {
-                                                            "取消置顶"
-                                                        } else {
-                                                            "置顶"
-                                                        })
-                                                        .on_click(move |_, window, cx| {
-                                                            cx.stop_propagation();
-                                                            window.dispatch_action(
-                                                                Box::new(Cancel),
-                                                                cx,
-                                                            );
-                                                            let result = pin_toolbar.update(
-                                                                cx,
-                                                                |toolbar, cx| {
-                                                                    toolbar.set_profile_pinned(
-                                                                        pin_profile.clone(),
-                                                                        !pinned,
-                                                                        window,
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            );
-                                                            if let Ok(Err(message)) = result {
-                                                                window.push_notification(
-                                                                    Notification::error(message),
-                                                                    cx,
-                                                                );
-                                                            }
-                                                        }),
-                                                    )
-                                                    .child(
-                                                        Button::new(format!(
-                                                            "edit-favorite-{index}"
-                                                        ))
-                                                        .ghost()
-                                                        .xsmall()
-                                                        .icon(IconName::Pencil)
-                                                        .invisible()
-                                                        .group_hover("favorite-row", |this| {
-                                                            this.visible()
-                                                        })
-                                                        .focus(|this| this.visible())
-                                                        .accessibility_label("编辑收藏")
-                                                        .tooltip("编辑收藏")
-                                                        .on_click(move |_, window, cx| {
-                                                            cx.stop_propagation();
-                                                            window.dispatch_action(
-                                                                Box::new(Cancel),
-                                                                cx,
-                                                            );
-                                                            let _ = edit_toolbar.update(
-                                                                cx,
-                                                                |toolbar, cx| {
-                                                                    toolbar.open_profile_editor(
-                                                                        edit_profile.clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            );
-                                                        }),
-                                                    )
-                                                    .child(
-                                                        Button::new(format!(
-                                                            "delete-favorite-{index}"
-                                                        ))
-                                                        .ghost()
-                                                        .xsmall()
-                                                        .icon(IconName::Trash)
-                                                        .invisible()
-                                                        .group_hover("favorite-row", |this| {
-                                                            this.visible()
-                                                        })
-                                                        .focus(|this| this.visible())
-                                                        .accessibility_label("删除收藏")
-                                                        .tooltip("删除收藏")
-                                                        .on_click(move |_, window, cx| {
-                                                            cx.stop_propagation();
-                                                            window.dispatch_action(
-                                                                Box::new(Cancel),
-                                                                cx,
-                                                            );
-                                                            let _ = delete_toolbar.update(
-                                                                cx,
-                                                                |toolbar, cx| {
-                                                                    toolbar.confirm_remove_profile(
-                                                                        delete_profile.clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            );
-                                                        }),
-                                                    ),
-                                            )
-                                    })
-                                    .icon(icon)
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            let profile = profile.clone();
-                                            let _ = item_toolbar.update(cx, |toolbar, cx| {
-                                                toolbar.connect_profile(&profile, window, cx)
-                                            });
-                                        },
-                                    ),
-                                )
-                            },
-                        )
-                    }),
-            )
-            .child(
-                Button::new("favorite-current")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::BookmarkPlus)
-                    .accessibility_label("收藏当前连接")
-                    .tooltip(if connected {
-                        "收藏当前连接（不保存密码）"
-                    } else {
-                        "连接后可收藏"
-                    })
-                    .disabled(!connected)
-                    .on_click(cx.listener(|toolbar, _, window, cx| {
-                        if let Err(message) = toolbar.favorite_current(window, cx) {
-                            window.push_notification(Notification::error(message), cx);
-                        }
-                    })),
             )
             .child(
                 Button::new("discovered-devices")
@@ -1438,7 +1050,7 @@ fn expand_tilde(input: &str) -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn private_key_initial_directory(selected: Option<&std::path::Path>) -> Option<PathBuf> {
+pub(crate) fn private_key_initial_directory(selected: Option<&std::path::Path>) -> Option<PathBuf> {
     selected
         .and_then(std::path::Path::parent)
         .filter(|path| path.is_dir())
@@ -1471,8 +1083,8 @@ fn deployment_key_pair(public_key: &std::path::Path) -> Result<PathBuf, String> 
 }
 
 #[cfg(target_os = "macos")]
-struct KeyPickerResult {
-    path: Option<PathBuf>,
+pub(crate) struct KeyPickerResult {
+    pub(crate) path: Option<PathBuf>,
     show_hidden_files: bool,
 }
 
@@ -1480,7 +1092,7 @@ struct KeyPickerResult {
 /// 使用原生 `NSOpenPanel`。面板内的复选框与 `showsHiddenFiles` 双向绑定，用户也可
 /// 随时用系统快捷键 Command-Shift-. 切换，两种方式会保持同步。
 #[cfg(target_os = "macos")]
-fn prompt_for_key_file(
+pub(crate) fn prompt_for_key_file(
     prompt: &str,
     show_hidden_files: bool,
     initial_directory: Option<&std::path::Path>,

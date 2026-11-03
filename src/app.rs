@@ -11,13 +11,16 @@
 
 use std::path::PathBuf;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
     notification::Notification,
     radio::{Radio, RadioGroup},
+    scroll::ScrollableElement as _,
+    tab::{Tab, TabBar},
     tooltip::Tooltip,
     v_flex,
 };
@@ -63,12 +66,34 @@ pub struct ScpApp {
 }
 
 struct SettingsDraft {
+    active_tab: SettingsTab,
+    profiles: Vec<SavedProfile>,
+    selected_profile: Option<SavedProfile>,
+    profile_use_key: bool,
+    profile_password_visible: bool,
+    profile_error: Option<SharedString>,
     remote_open_behavior: RemoteOpenBehavior,
     editor_path: Option<PathBuf>,
     lan_sftp_root: Option<PathBuf>,
     lan_sftp_password_mode: LanSftpPasswordMode,
     password_visible: bool,
     error: Option<SharedString>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsTab {
+    #[default]
+    Favorites,
+    General,
+}
+
+impl SettingsTab {
+    fn index(self) -> usize {
+        match self {
+            Self::Favorites => 0,
+            Self::General => 1,
+        }
+    }
 }
 
 struct ProfilePersistence {
@@ -108,6 +133,20 @@ fn profile_password_config(profile: &SavedProfile) -> SessionConfig {
         username: profile.username.clone(),
         auth: AuthMethod::Password(String::new()),
     }
+}
+
+fn favorite_password_update(
+    original_auth: &SavedAuth,
+    use_key: bool,
+    typed: &str,
+) -> Result<Option<String>, SharedString> {
+    if use_key {
+        return Ok(None);
+    }
+    if typed.is_empty() && matches!(original_auth, SavedAuth::Key { .. }) {
+        return Err("切换为密码认证时，请输入新密码".into());
+    }
+    Ok((!typed.is_empty()).then(|| typed.to_string()))
 }
 
 impl ScpApp {
@@ -581,7 +620,7 @@ impl ScpApp {
     // -----------------------------------------------------------------------
 
     /// 连接成功后只持久化“记住密码”偏好，并刷新已有收藏的最近使用时间。
-    /// 新收藏只能由工具栏的“收藏当前连接”显式创建。
+    /// 新收藏只能由设置弹层的“收藏当前连接”显式创建。
     fn persist_connection(&mut self, cx: &mut Context<Self>) {
         let Some(config) = self.pending_config.clone() else {
             log::warn!("连接成功但缺少实际连接配置，跳过连接持久化");
@@ -762,6 +801,8 @@ impl ScpApp {
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let password_mode = self.settings.lan_sftp_password_mode;
+        let profiles = self.toolbar.read(cx).profiles_for_display();
+        let can_favorite_current = self.toolbar.read(cx).state() == SessionState::Connected;
         let (manual_password, password_error) = match store::load_lan_sftp_password() {
             Ok(password) => (password.unwrap_or_default(), None),
             Err(message) => (String::new(), Some(SharedString::from(message))),
@@ -772,7 +813,23 @@ impl ScpApp {
                 .masked(true)
                 .placeholder("输入手动密码")
         });
+        let profile_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("名称（可选）"));
+        let profile_port_input = cx.new(|cx| InputState::new(window, cx).placeholder("1–65535"));
+        let profile_key_path_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("私钥文件路径；留空则自动查找"));
+        let profile_password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("留空则保留原密码")
+        });
         let draft = cx.new(|_| SettingsDraft {
+            active_tab: SettingsTab::Favorites,
+            profiles,
+            selected_profile: None,
+            profile_use_key: false,
+            profile_password_visible: false,
+            profile_error: None,
             remote_open_behavior: self.settings.remote_open_behavior,
             editor_path: self.settings.editor_path.clone(),
             lan_sftp_root: self.settings.lan_sftp_root.clone(),
@@ -785,10 +842,18 @@ impl ScpApp {
             },
         });
         let app = cx.entity().downgrade();
+        let toolbar = self.toolbar.clone();
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, dialog_window, cx| {
             let theme = cx.theme().clone();
+            let dialog_window_handle = dialog_window.window_handle();
             let (
+                active_tab,
+                profiles,
+                selected_profile,
+                profile_use_key,
+                profile_password_visible,
+                profile_error,
                 selected,
                 editor_path,
                 lan_sftp_root,
@@ -798,6 +863,12 @@ impl ScpApp {
             ) = {
                 let snapshot = draft.read(cx);
                 (
+                    snapshot.active_tab,
+                    snapshot.profiles.clone(),
+                    snapshot.selected_profile.clone(),
+                    snapshot.profile_use_key,
+                    snapshot.profile_password_visible,
+                    snapshot.profile_error.clone(),
                     match snapshot.remote_open_behavior {
                         RemoteOpenBehavior::SystemDefault => 0,
                         RemoteOpenBehavior::CustomEditor => 1,
@@ -821,27 +892,647 @@ impl ScpApp {
             let save_draft = draft.clone();
             let save_password_input = manual_password_input.clone();
             let save_app = app.clone();
+            let favorite_current_toolbar = toolbar.clone();
+            let favorite_current_draft = draft.clone();
+            let tabs_draft = draft.clone();
+
+            let favorite_auth_draft = draft.clone();
+            let favorite_password_visibility_draft = draft.clone();
+            let favorite_password_visibility_input = profile_password_input.clone();
+            let choose_profile_key_input = profile_key_path_input.clone();
+            let choose_profile_key_draft = draft.clone();
+            let favorites = h_flex()
+                .items_stretch()
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    v_flex()
+                        .h_full()
+                        .w(px(260.))
+                        .flex_shrink_0()
+                        .gap_3()
+                        .pr_4()
+                        .border_r_1()
+                        .border_color(theme.border)
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(Icon::new(IconName::Bookmark).xsmall())
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child("收藏"),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("settings-favorite-current")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::BookmarkPlus)
+                                        .accessibility_label("收藏当前连接")
+                                        .tooltip(if can_favorite_current {
+                                            "收藏当前连接（不保存密码）"
+                                        } else {
+                                            "连接后可收藏"
+                                        })
+                                        .disabled(!can_favorite_current)
+                                        .on_click(move |_, window, cx| {
+                                            match favorite_current_toolbar.update(
+                                                cx,
+                                                |toolbar, cx| {
+                                                    toolbar.favorite_current(window, cx)
+                                                },
+                                            ) {
+                                                Ok(()) => {
+                                                    let profiles = favorite_current_toolbar
+                                                        .read(cx)
+                                                        .profiles_for_display();
+                                                    favorite_current_draft.update(
+                                                        cx,
+                                                        |draft, cx| {
+                                                            draft.profiles = profiles;
+                                                            cx.notify();
+                                                        },
+                                                    );
+                                                }
+                                                Err(message) => window.push_notification(
+                                                    Notification::error(message),
+                                                    cx,
+                                                ),
+                                            }
+                                        }),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_h_0()
+                                .gap_1()
+                                .overflow_y_scrollbar()
+                                .when(profiles.is_empty(), |this| {
+                                    this.child(
+                                        v_flex()
+                                            .flex_1()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap_1()
+                                            .text_center()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .child("暂无收藏"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("连接服务器后，可收藏当前连接"),
+                                            ),
+                                    )
+                                })
+                                .children(profiles.clone().into_iter().map(|profile| {
+                                    let key = format!("{}@{}", profile.username, profile.host);
+                                    let title = profile.title();
+                                    let endpoint = profile.endpoint_label();
+                                    let auth_icon = match profile.auth {
+                                        SavedAuth::Password => IconName::Lock,
+                                        SavedAuth::Key { .. } => IconName::KeyRound,
+                                    };
+                                    let is_selected = selected_profile.as_ref() == Some(&profile);
+                                    let select_draft = draft.clone();
+                                    let select_name_input = profile_name_input.clone();
+                                    let select_port_input = profile_port_input.clone();
+                                    let select_key_path_input = profile_key_path_input.clone();
+                                    let select_password_input = profile_password_input.clone();
+                                    let select_profile = profile.clone();
+
+                                    Button::new(format!("settings-favorite-{key}"))
+                                        .ghost()
+                                        .small()
+                                        .w_full()
+                                        .min_w_0()
+                                        .justify_start()
+                                        .selected(is_selected)
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .min_w_0()
+                                                .gap_2()
+                                                .child(Icon::new(auth_icon).xsmall())
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .text_left()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
+                                                        .child(SharedString::from(title.clone())),
+                                                )
+                                                .when(profile.pinned, |this| {
+                                                    this.child(Icon::new(IconName::Pin).xsmall())
+                                                }),
+                                        )
+                                        .accessibility_label(SharedString::from(format!(
+                                            "选择收藏 {title}，{endpoint}"
+                                        )))
+                                        .tooltip(SharedString::from(endpoint))
+                                        .on_click(move |_, window, cx| {
+                                            select_name_input.update(cx, |input, cx| {
+                                                input.set_value(
+                                                    select_profile
+                                                        .name
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                            select_port_input.update(cx, |input, cx| {
+                                                input.set_value(
+                                                    select_profile.port.to_string(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                            select_key_path_input.update(cx, |input, cx| {
+                                                let path = match &select_profile.auth {
+                                                    SavedAuth::Key { path } => path.clone(),
+                                                    SavedAuth::Password => String::new(),
+                                                };
+                                                input.set_value(path, window, cx);
+                                            });
+                                            select_password_input.update(cx, |input, cx| {
+                                                input.set_value(String::new(), window, cx);
+                                                input.set_masked(true, window, cx);
+                                            });
+                                            select_draft.update(cx, |draft, cx| {
+                                                draft.profile_use_key = matches!(
+                                                    select_profile.auth,
+                                                    SavedAuth::Key { .. }
+                                                );
+                                                draft.selected_profile =
+                                                    Some(select_profile.clone());
+                                                draft.profile_password_visible = false;
+                                                draft.profile_error = None;
+                                                cx.notify();
+                                            });
+                                        })
+                                })),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .pl_5()
+                        .when(selected_profile.is_none(), |this| {
+                            this.items_center().justify_center().gap_2().child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child("选择左侧收藏以查看和编辑"),
+                            )
+                        })
+                        .when_some(selected_profile.clone(), |this, profile| {
+                            let password_hint = if matches!(&profile.auth, SavedAuth::Password) {
+                                "留空则保留系统凭据库中的原密码。"
+                            } else {
+                                "从私钥切换为密码认证时，请输入新密码。"
+                            };
+                            this.gap_4()
+                                .child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child("收藏详情"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(SharedString::from(profile.endpoint_label())),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(div().text_xs().child("名称"))
+                                        .child(
+                                            Input::new(&profile_name_input)
+                                                .id("favorite-profile-name")
+                                                .w_full(),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_3()
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_2()
+                                                .child(div().text_xs().child("主机名"))
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .px_3()
+                                                        .py_2()
+                                                        .rounded_md()
+                                                        .border_1()
+                                                        .border_color(theme.border)
+                                                        .text_sm()
+                                                        .truncate()
+                                                        .child(SharedString::from(
+                                                            profile.host.clone(),
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .w(px(150.))
+                                                .gap_2()
+                                                .child(div().text_xs().child("端口"))
+                                                .child(
+                                                    Input::new(&profile_port_input)
+                                                        .id("favorite-profile-port")
+                                                        .w_full(),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(div().text_xs().child("用户名"))
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .text_sm()
+                                                .child(SharedString::from(
+                                                    profile.username.clone(),
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(div().text_xs().child("认证方式"))
+                                        .child(
+                                            RadioGroup::horizontal("favorite-auth-method")
+                                                .selected_index(Some(if profile_use_key {
+                                                    1
+                                                } else {
+                                                    0
+                                                }))
+                                                .on_click(move |index, _, cx| {
+                                                    favorite_auth_draft.update(
+                                                        cx,
+                                                        |draft, cx| {
+                                                            draft.profile_use_key = *index == 1;
+                                                            draft.profile_error = None;
+                                                            cx.notify();
+                                                        },
+                                                    );
+                                                })
+                                                .child(
+                                                    Radio::new("favorite-auth-password")
+                                                        .label("密码"),
+                                                )
+                                                .child(
+                                                    Radio::new("favorite-auth-key")
+                                                        .label("私钥"),
+                                                ),
+                                        ),
+                                )
+                                .when(!profile_use_key, |this| {
+                                    this.child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(div().text_xs().child("密码"))
+                                            .child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .child(
+                                                                Input::new(
+                                                                    &profile_password_input,
+                                                                )
+                                                                .id("favorite-profile-password")
+                                                                .w_full(),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        Button::new(
+                                                            "favorite-password-visibility",
+                                                        )
+                                                        .label(if profile_password_visible {
+                                                            "隐藏"
+                                                        } else {
+                                                            "显示"
+                                                        })
+                                                        .on_click(move |_, window, cx| {
+                                                            let visible =
+                                                                !favorite_password_visibility_draft
+                                                                    .read(cx)
+                                                                    .profile_password_visible;
+                                                            favorite_password_visibility_input
+                                                                .update(cx, |input, cx| {
+                                                                    input.set_masked(
+                                                                        !visible, window, cx,
+                                                                    )
+                                                                });
+                                                            favorite_password_visibility_draft
+                                                                .update(cx, |draft, cx| {
+                                                                    draft.profile_password_visible =
+                                                                        visible;
+                                                                    cx.notify();
+                                                                });
+                                                        }),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(password_hint),
+                                            ),
+                                    )
+                                })
+                                .when(profile_use_key, |this| {
+                                    this.child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(div().text_xs().child("密钥位置"))
+                                            .child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .child(
+                                                                Input::new(
+                                                                    &profile_key_path_input,
+                                                                )
+                                                                .id(
+                                                                    "favorite-profile-key-path",
+                                                                )
+                                                                .w_full(),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        Button::new("choose-favorite-key-file")
+                                                            .label("选择文件…")
+                                                            .on_click(move |_, _, cx| {
+                                                                #[cfg(target_os = "macos")]
+                                                                {
+                                                                    let current =
+                                                                        choose_profile_key_input
+                                                                            .read(cx)
+                                                                            .value()
+                                                                            .trim()
+                                                                            .to_string();
+                                                                    let expanded =
+                                                                        expand_tilde(&current);
+                                                                    let initial = crate::ui::toolbar::private_key_initial_directory(
+                                                                        (!current.is_empty())
+                                                                            .then_some(expanded.as_path()),
+                                                                    );
+                                                                    let receiver = crate::ui::toolbar::prompt_for_key_file(
+                                                                        "选择 SSH 私钥文件",
+                                                                        true,
+                                                                        initial.as_deref(),
+                                                                    );
+                                                                    let input =
+                                                                        choose_profile_key_input
+                                                                            .clone();
+                                                                    let draft =
+                                                                        choose_profile_key_draft
+                                                                            .clone();
+                                                                    cx.spawn(async move |cx| {
+                                                                        match receiver
+                                                                            .recv_async()
+                                                                            .await
+                                                                        {
+                                                                            Ok(Ok(selection)) => {
+                                                                                if let Some(path) =
+                                                                                    selection.path
+                                                                                {
+                                                                                    let _ = cx.update_window(
+                                                                                        dialog_window_handle,
+                                                                                        |_, window, cx| {
+                                                                                            input.update(cx, |input, cx| {
+                                                                                                input.set_value(
+                                                                                                    path.to_string_lossy().to_string(),
+                                                                                                    window,
+                                                                                                    cx,
+                                                                                                )
+                                                                                            });
+                                                                                        },
+                                                                                    );
+                                                                                    draft.update(
+                                                                                        cx,
+                                                                                        |draft, cx| {
+                                                                                            draft.profile_error = None;
+                                                                                            cx.notify();
+                                                                                        },
+                                                                                    );
+                                                                                }
+                                                                            }
+                                                                            Ok(Err(message)) => {
+                                                                                draft.update(
+                                                                                    cx,
+                                                                                    |draft, cx| {
+                                                                                        draft.profile_error = Some(
+                                                                                            SharedString::from(message),
+                                                                                        );
+                                                                                        cx.notify();
+                                                                                    },
+                                                                                );
+                                                                            }
+                                                                            Err(_) => {
+                                                                                draft.update(
+                                                                                    cx,
+                                                                                    |draft, cx| {
+                                                                                        draft.profile_error = Some(
+                                                                                            "私钥选择器意外关闭，请重试"
+                                                                                                .into(),
+                                                                                        );
+                                                                                        cx.notify();
+                                                                                    },
+                                                                                );
+                                                                            }
+                                                                        }
+                                                                    })
+                                                                    .detach();
+                                                                }
+                                                                #[cfg(not(target_os = "macos"))]
+                                                                {
+                                                                    let receiver = cx.prompt_for_paths(
+                                                                        PathPromptOptions {
+                                                                            files: true,
+                                                                            directories: false,
+                                                                            multiple: false,
+                                                                            prompt: Some(
+                                                                                "选择 SSH 私钥文件"
+                                                                                    .into(),
+                                                                            ),
+                                                                        },
+                                                                    );
+                                                                    let input =
+                                                                        choose_profile_key_input
+                                                                            .clone();
+                                                                    let draft =
+                                                                        choose_profile_key_draft
+                                                                            .clone();
+                                                                    cx.spawn(async move |cx| {
+                                                                        match receiver.await {
+                                                                            Ok(Ok(Some(paths))) => {
+                                                                                if let Some(path) =
+                                                                                    paths.into_iter().next()
+                                                                                {
+                                                                                    let _ = cx.update_window(
+                                                                                        dialog_window_handle,
+                                                                                        |_, window, cx| {
+                                                                                            input.update(cx, |input, cx| {
+                                                                                                input.set_value(
+                                                                                                    path.to_string_lossy().to_string(),
+                                                                                                    window,
+                                                                                                    cx,
+                                                                                                )
+                                                                                            });
+                                                                                        },
+                                                                                    );
+                                                                                    draft.update(
+                                                                                        cx,
+                                                                                        |draft, cx| {
+                                                                                            draft.profile_error = None;
+                                                                                            cx.notify();
+                                                                                        },
+                                                                                    );
+                                                                                }
+                                                                            }
+                                                                            Ok(Err(error)) => {
+                                                                                draft.update(
+                                                                                    cx,
+                                                                                    |draft, cx| {
+                                                                                        draft.profile_error = Some(
+                                                                                            format!(
+                                                                                                "无法选择私钥：{error}"
+                                                                                            )
+                                                                                            .into(),
+                                                                                        );
+                                                                                        cx.notify();
+                                                                                    },
+                                                                                );
+                                                                            }
+                                                                            Ok(Ok(None)) => {}
+                                                                            Err(_) => {
+                                                                                draft.update(
+                                                                                    cx,
+                                                                                    |draft, cx| {
+                                                                                        draft.profile_error = Some(
+                                                                                            "私钥选择器意外关闭，请重试"
+                                                                                                .into(),
+                                                                                        );
+                                                                                        cx.notify();
+                                                                                    },
+                                                                                );
+                                                                            }
+                                                                        }
+                                                                    })
+                                                                    .detach();
+                                                                }
+                                                            }),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("支持 ~/ 开头的路径；留空时自动查找 ~/.ssh 中的私钥。"),
+                                            ),
+                                    )
+                                })
+                                .when_some(profile_error, |this, error| {
+                                    this.child(
+                                        div().text_xs().text_color(theme.danger).child(error),
+                                    )
+                                })
+                        }),
+                );
 
             dialog
                 .title("设置")
-                .w(px(600.))
+                .w(px(900.))
                 .close_button(false)
                 .overlay_closable(false)
                 .child(
                     v_flex()
                         .w_full()
-                        .gap_3()
+                        .h(px(520.))
+                        .gap_4()
                         .child(
+                            TabBar::new("settings-tabs")
+                                .segmented()
+                                .selected_index(active_tab.index())
+                                .on_click(move |index, _, cx| {
+                                    tabs_draft.update(cx, |draft, cx| {
+                                        draft.active_tab = if *index == 0 {
+                                            SettingsTab::Favorites
+                                        } else {
+                                            SettingsTab::General
+                                        };
+                                        draft.error = None;
+                                        draft.profile_error = None;
+                                        cx.notify();
+                                    });
+                                })
+                                .child(Tab::new().label("收藏"))
+                                .child(Tab::new().label("设置")),
+                        )
+                        .when(active_tab == SettingsTab::Favorites, |this| {
+                            this.child(favorites)
+                        })
+                        .when(active_tab == SettingsTab::General, |this| this.child(
                             v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
                                 .gap_2()
+                                .overflow_y_scrollbar()
                                 .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("默认编辑器"),
-                                )
-                                .child(
-                                    RadioGroup::vertical("remote-open-behavior")
+                                    v_flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child("默认编辑器"),
+                                        )
+                                        .child(
+                                            RadioGroup::vertical("remote-open-behavior")
                                         .selected_index(Some(selected))
                                         .on_click(move |index, _, cx| {
                                             mode_draft.update(cx, |draft, cx| {
@@ -1189,8 +1880,10 @@ impl ScpApp {
                         .when_some(error, |this, error| {
                             this.child(div().text_xs().text_color(theme.danger).child(error))
                         }),
+                ))
                 )
                 .footer(
+                    if active_tab == SettingsTab::General {
                     h_flex()
                         .justify_end()
                         .gap_2()
@@ -1355,7 +2048,293 @@ impl ScpApp {
                                         );
                                     }
                                 }),
-                        ),
+                        )
+                        .into_any_element()
+                    } else if let Some(profile) = selected_profile.clone() {
+                        let pin_toolbar = toolbar.clone();
+                        let pin_draft = draft.clone();
+                        let pin_profile = profile.clone();
+                        let pinned = profile.pinned;
+                        let delete_toolbar = toolbar.clone();
+                        let delete_profile = profile.clone();
+                        let connect_toolbar = toolbar.clone();
+                        let connect_profile = profile.clone();
+                        let save_toolbar = toolbar.clone();
+                        let save_profile = profile.clone();
+                        let save_profile_draft = draft.clone();
+                        let save_name_input = profile_name_input.clone();
+                        let save_port_input = profile_port_input.clone();
+                        let save_key_path_input = profile_key_path_input.clone();
+                        let save_profile_password_input = profile_password_input.clone();
+
+                        h_flex()
+                            .w_full()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("favorite-delete")
+                                            .danger()
+                                            .label("删除")
+                                            .on_click(move |_, window, cx| {
+                                                window.close_dialog(cx);
+                                                delete_toolbar.update(cx, |toolbar, cx| {
+                                                    toolbar.confirm_remove_profile(
+                                                        delete_profile.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("favorite-pin")
+                                            .label(if pinned { "取消置顶" } else { "置顶" })
+                                            .on_click(move |_, window, cx| {
+                                                match pin_toolbar.update(cx, |toolbar, cx| {
+                                                    toolbar.set_profile_pinned(
+                                                        pin_profile.clone(),
+                                                        !pinned,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                }) {
+                                                    Ok(()) => {
+                                                        let mut selected = pin_profile.clone();
+                                                        selected.pinned = !pinned;
+                                                        let profiles = pin_toolbar
+                                                            .read(cx)
+                                                            .profiles_for_display();
+                                                        pin_draft.update(cx, |draft, cx| {
+                                                            draft.profiles = profiles;
+                                                            draft.selected_profile =
+                                                                Some(selected.clone());
+                                                            draft.profile_error = None;
+                                                            cx.notify();
+                                                        });
+                                                    }
+                                                    Err(message) => pin_draft.update(
+                                                        cx,
+                                                        |draft, cx| {
+                                                            draft.profile_error = Some(
+                                                                SharedString::from(message),
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    ),
+                                                }
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("favorite-close")
+                                            .label("关闭")
+                                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                                    )
+                                    .child(
+                                        Button::new("favorite-connect")
+                                            .label("连接")
+                                            .on_click(move |_, window, cx| {
+                                                connect_toolbar.update(cx, |toolbar, cx| {
+                                                    toolbar.connect_profile(
+                                                        &connect_profile,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                });
+                                                window.close_dialog(cx);
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("favorite-save")
+                                            .primary()
+                                            .label("保存")
+                                            .on_click(move |_, window, cx| {
+                                                let port_text = save_port_input
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_string();
+                                                let Ok(port) = port_text.parse::<u16>() else {
+                                                    save_profile_draft.update(
+                                                        cx,
+                                                        |draft, cx| {
+                                                            draft.profile_error = Some(
+                                                                "端口号必须是 1–65535 之间的整数"
+                                                                    .into(),
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    );
+                                                    return;
+                                                };
+                                                if port == 0 {
+                                                    save_profile_draft.update(
+                                                        cx,
+                                                        |draft, cx| {
+                                                            draft.profile_error = Some(
+                                                                "端口号必须是 1–65535 之间的整数"
+                                                                    .into(),
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    );
+                                                    return;
+                                                }
+
+                                                let mut edited = save_profile.clone();
+                                                let name = save_name_input
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_string();
+                                                edited.name = (!name.is_empty()).then_some(name);
+                                                edited.port = port;
+                                                let use_key = save_profile_draft
+                                                    .read(cx)
+                                                    .profile_use_key;
+                                                let password = save_profile_password_input
+                                                    .read(cx)
+                                                    .value()
+                                                    .to_string();
+                                                let new_password = match favorite_password_update(
+                                                    &save_profile.auth,
+                                                    use_key,
+                                                    &password,
+                                                ) {
+                                                    Ok(password) => password,
+                                                    Err(message) => {
+                                                        save_profile_draft.update(
+                                                            cx,
+                                                            |draft, cx| {
+                                                                draft.profile_error =
+                                                                    Some(message.clone());
+                                                                cx.notify();
+                                                            },
+                                                        );
+                                                        return;
+                                                    }
+                                                };
+                                                edited.auth = if use_key {
+                                                    let key_path = save_key_path_input
+                                                        .read(cx)
+                                                        .value()
+                                                        .trim()
+                                                        .to_string();
+                                                    SavedAuth::Key {
+                                                        path: expand_tilde(&key_path)
+                                                            .to_string_lossy()
+                                                            .to_string(),
+                                                    }
+                                                } else {
+                                                    SavedAuth::Password
+                                                };
+
+                                                let password_config =
+                                                    profile_password_config(&edited);
+                                                if let Some(password) = new_password.as_deref()
+                                                    && let Err(message) = store::store_password(
+                                                        &password_config,
+                                                        password,
+                                                    )
+                                                {
+                                                    save_profile_draft.update(
+                                                        cx,
+                                                        |draft, cx| {
+                                                            draft.profile_error = Some(
+                                                                SharedString::from(message),
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    );
+                                                    return;
+                                                }
+
+                                                match save_toolbar.update(cx, |toolbar, cx| {
+                                                    toolbar.commit_profile(
+                                                        edited.clone(),
+                                                        new_password.is_none(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                }) {
+                                                    Ok(()) => {
+                                                        if new_password.is_some()
+                                                            && matches!(
+                                                                &save_profile.auth,
+                                                                SavedAuth::Password
+                                                            )
+                                                        {
+                                                            let previous = profile_password_config(
+                                                                &save_profile,
+                                                            );
+                                                            if previous.keyring_account()
+                                                                != password_config.keyring_account()
+                                                            {
+                                                                store::forget_password(&previous);
+                                                            }
+                                                        }
+                                                        let profiles = save_toolbar
+                                                            .read(cx)
+                                                            .profiles_for_display();
+                                                        save_profile_password_input.update(
+                                                            cx,
+                                                            |input, cx| {
+                                                                input.set_value(
+                                                                    String::new(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                                input.set_masked(true, window, cx);
+                                                            },
+                                                        );
+                                                        save_profile_draft.update(
+                                                            cx,
+                                                            |draft, cx| {
+                                                                draft.profiles = profiles;
+                                                                draft.selected_profile =
+                                                                    Some(edited.clone());
+                                                                draft.profile_password_visible =
+                                                                    false;
+                                                                draft.profile_error = None;
+                                                                cx.notify();
+                                                            },
+                                                        );
+                                                        window.push_notification(
+                                                            Notification::success("收藏已保存"),
+                                                            cx,
+                                                        );
+                                                    }
+                                                    Err(message) => save_profile_draft.update(
+                                                        cx,
+                                                        |draft, cx| {
+                                                            draft.profile_error = Some(
+                                                                SharedString::from(message),
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    ),
+                                                }
+                                            }),
+                                    ),
+                            )
+                            .into_any_element()
+                    } else {
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .child(
+                                Button::new("favorites-close")
+                                    .label("关闭")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .into_any_element()
+                    },
                 )
         });
     }
@@ -1570,7 +2549,6 @@ fn strip_windows_verbatim_prefix(path: &str) -> String {
 /// 把 `~/xxx` 展开成真实路径；其它输入原样返回。
 ///
 /// 留空时返回空 `PathBuf`，交给 worker 去 `~/.ssh` 里自动找私钥。
-#[allow(dead_code)]
 fn expand_tilde(input: &str) -> PathBuf {
     if let Some(rest) = input.strip_prefix("~/")
         && let Some(home) = dirs::home_dir()
@@ -1585,6 +2563,32 @@ mod tests {
     use ::core::prelude::v1::test;
 
     use super::*;
+
+    #[test]
+    fn favorite_password_edit_preserves_or_requires_credentials_as_needed() {
+        assert_eq!(
+            favorite_password_update(&SavedAuth::Password, false, "").unwrap(),
+            None
+        );
+        assert_eq!(
+            favorite_password_update(&SavedAuth::Password, false, " new secret ").unwrap(),
+            Some(" new secret ".to_string())
+        );
+        assert!(
+            favorite_password_update(
+                &SavedAuth::Key {
+                    path: "/tmp/id_ed25519".to_string(),
+                },
+                false,
+                "",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            favorite_password_update(&SavedAuth::Password, true, "ignored").unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn favorite_persists_the_password_that_was_actually_used() {
