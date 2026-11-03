@@ -217,10 +217,7 @@ fn replace_known_host_line(path: &Path, line: usize, key: &PublicKey) -> Result<
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let temp = parent.join(format!(
-        ".known_hosts.macscp-{}-{nonce}",
-        std::process::id()
-    ));
+    let temp = parent.join(format!(".known_hosts.blip-{}-{nonce}", std::process::id()));
     let result = (|| -> Result<(), String> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -415,6 +412,15 @@ impl TransferPool {
         }
     }
 
+    pub(crate) fn has_healthy_lane(&self) -> bool {
+        self.inner
+            .lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|lane| lane.is_healthy())
+    }
+
     fn close(&self) {
         self.inner.closed.store(true, Ordering::Relaxed);
         self.inner.available.notify_waiters();
@@ -430,6 +436,10 @@ pub(crate) struct TransferLease {
 impl TransferLease {
     pub(crate) fn sftp(&self) -> Arc<SftpSession> {
         self.lane.sftp.clone()
+    }
+
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.lane.is_healthy()
     }
 
     #[cfg(test)]
@@ -1026,7 +1036,7 @@ async fn connect_with_sources(
                 }
                 result = Some(attempt);
             }
-            result.expect("至少尝试一种签名算法")
+            result.ok_or_else(|| anyhow!("没有可用的 RSA 签名算法"))?
         }
     };
 
@@ -1139,17 +1149,17 @@ pub async fn list_dir_or_fallback(
 ) -> Result<(String, Vec<FileEntry>), String> {
     match read_dir(sftp, path).await {
         Ok(entries) => Ok((path.to_string(), entries)),
-        Err(err)
-            if err.not_found
-                && fallback.is_some_and(|fallback| !fallback.is_empty() && fallback != path) =>
-        {
-            let fallback = fallback.expect("上面已检查 fallback 存在");
+        Err(err) => {
+            let Some(fallback) = fallback
+                .filter(|fallback| err.not_found && !fallback.is_empty() && *fallback != path)
+            else {
+                return Err(err.message);
+            };
             let entries = read_dir(sftp, fallback)
                 .await
                 .map_err(|fallback_err| fallback_err.message)?;
             Ok((fallback.to_string(), entries))
         }
-        Err(err) => Err(err.message),
     }
 }
 
@@ -1732,7 +1742,7 @@ mod tests {
 
     #[test]
     fn discover_private_key_prefers_ed25519() {
-        let dir = std::env::temp_dir().join(format!("macscp-keys-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blip-keys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时目录");
 
@@ -1757,10 +1767,8 @@ mod tests {
 
     #[test]
     fn selecting_a_public_key_uses_its_private_key_pair() {
-        let dir = std::env::temp_dir().join(format!(
-            "macscp-public-key-selection-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("blip-public-key-selection-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时密钥目录");
         let private_key = dir.join("id_ed25519");
@@ -1778,10 +1786,8 @@ mod tests {
 
     #[test]
     fn loads_private_keys_saved_with_windows_byte_order_marks() {
-        let dir = std::env::temp_dir().join(format!(
-            "macscp-windows-key-encoding-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("blip-windows-key-encoding-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时密钥目录");
 
@@ -1814,7 +1820,7 @@ mod tests {
     #[test]
     fn changed_known_host_line_is_replaced_atomically() {
         let dir = std::env::temp_dir().join(format!(
-            "macscp-known-hosts-{}-{:?}",
+            "blip-known-hosts-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1837,7 +1843,7 @@ mod tests {
         let updated = std::fs::read_to_string(&path).expect("读回 known_hosts");
         assert!(updated.starts_with(&format!("other.example {old}\n")));
         assert!(updated.contains(&format!("example.com,alias.example {new}\n")));
-        assert!(!updated.contains(".known_hosts.macscp"));
+        assert!(!updated.contains(".known_hosts.blip"));
         assert!(
             russh::keys::check_known_hosts_path("example.com", 22, &key, &path)
                 .expect("校验 known_hosts"),

@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 
-SVG="${ROOT}/assets/icon/macscp-icon.svg"
+SVG="${ROOT}/assets/icon/blip-icon.svg"
 ICONSET="${ROOT}/assets/icon/AppIcon.iconset"
 ICNS="${ROOT}/assets/icon/AppIcon.icns"
 ICO="${ROOT}/assets/icon/AppIcon.ico"

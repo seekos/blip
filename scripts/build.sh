@@ -23,7 +23,8 @@ PROFILE="release"
 CLEAN=1
 WITH_ICON=1
 VERSION=""
-VERSION_FILE="${ROOT}/.macscp-build-version"
+VERSION_FILE="${ROOT}/.blip-build-version"
+LEGACY_VERSION_FILE="${ROOT}/.macscp-build-version"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -53,6 +54,9 @@ done
 if [ -z "${VERSION}" ] && [ -s "${VERSION_FILE}" ]; then
   VERSION=$(<"${VERSION_FILE}")
 fi
+if [ -z "${VERSION}" ] && [ -s "${LEGACY_VERSION_FILE}" ]; then
+  VERSION=$(<"${LEGACY_VERSION_FILE}")
+fi
 if [ -z "${VERSION}" ]; then
   VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "${ROOT}/Cargo.toml" | head -1)
 fi
@@ -66,7 +70,7 @@ case "${PROFILE}" in
 esac
 
 DIST="${ROOT}/dist"
-SVG="${ROOT}/assets/icon/macscp-icon.svg"
+SVG="${ROOT}/assets/icon/blip-icon.svg"
 ICNS="${ROOT}/assets/icon/AppIcon.icns"
 START=$(date +%s)
 PLATFORM=$(uname -s)

@@ -772,6 +772,7 @@ dependencies = [
  "gethostname",
  "gpui-kit",
  "gpui-pre",
+ "ignore",
  "image",
  "keyring",
  "libc",
@@ -791,6 +792,7 @@ dependencies = [
  "tokio",
  "trash",
  "uuid",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

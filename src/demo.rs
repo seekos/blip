@@ -34,7 +34,7 @@ pub struct DemoLogin {
 const LARGE_FILE: &str = "demo-large.bin";
 const LARGE_FILE_LEN: usize = 64 * 1024 * 1024;
 
-/// `MACSCP_DEMO_PKG=1` 时预置的远端目录树，用来演示「整目录下载」。
+/// `BLIP_DEMO_PKG=1` 时预置的远端目录树，用来演示「整目录下载」。
 ///
 /// 形状和本地那棵演示树（`workspace::demo_tree`）保持一致：
 /// 两个文件 + 两层子目录 + 一个空目录。
@@ -84,11 +84,11 @@ fn boot() -> Result<SocketAddr, String> {
     let (tx, rx) = flume::bounded::<Result<SocketAddr, String>>(1);
 
     std::thread::Builder::new()
-        .name("macscp-demo".to_string())
+        .name("blip-demo".to_string())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
-                .thread_name("macscp-demo-rt")
+                .thread_name("blip-demo-rt")
                 .enable_all()
                 .build()
             {
@@ -135,19 +135,19 @@ async fn seed() {
         testserver::add_extra_entry(name, file_attrs(size));
     }
 
-    // `MACSCP_DEMO_RESUME=1`：给 notes.md 留一个「上次没传完」的临时文件，
+    // `BLIP_DEMO_RESUME=1`：给 notes.md 留一个「上次没传完」的临时文件，
     // 这样冲突弹窗会走「可以续传」的那一支（高亮 + 断点续传按钮可用）。
     // 本地演示文件是 14 字节，这里留 6 字节，正好够触发 `can_resume`。
-    if std::env::var_os("MACSCP_DEMO_RESUME").is_some() {
+    if std::env::var_os("BLIP_DEMO_RESUME").is_some() {
         let partial = format!("{}/notes.md.filepart", testserver::HOME);
         testserver::vfs_write(&partial, b"# demo").await;
         log::info!("演示模式：预置了半成品 {partial}（6 字节）");
     }
 
-    // `MACSCP_DEMO_PKG=1`：预置一棵真正的远端目录树，用来手工验证整目录下载。
+    // `BLIP_DEMO_PKG=1`：预置一棵真正的远端目录树，用来手工验证整目录下载。
     // 目录必须登记成「额外目录项」才会出现在家目录列表里（`readdir` 只列
     // `fixture()` + 额外项，不会把 VFS 里所有键倒出来）。
-    if std::env::var_os("MACSCP_DEMO_PKG").is_some() {
+    if std::env::var_os("BLIP_DEMO_PKG").is_some() {
         seed_pkg().await;
     }
 }

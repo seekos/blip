@@ -108,13 +108,15 @@ fn remote_write_error(action: &str, error: impl std::fmt::Display) -> anyhow::Er
     }
 }
 
-fn is_retryable_upload_error(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<RetryableUploadError>().is_some()
+pub(crate) fn is_retryable_upload_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<RetryableUploadError>())
 }
 
 fn edit_temp_path(path: &str) -> String {
     let sequence = NEXT_EDIT_TEMP.fetch_add(1, Ordering::Relaxed);
-    format!("{path}.macscp-editpart-{}-{sequence}", std::process::id())
+    format!("{path}.blip-editpart-{}-{sequence}", std::process::id())
 }
 
 pub(crate) fn decode_text_for_editor(bytes: &[u8]) -> String {
@@ -271,7 +273,7 @@ fn merge_authorized_key(existing: &str, canonical: &str) -> (String, bool) {
     let blob = canonical
         .split_ascii_whitespace()
         .nth(1)
-        .expect("规范化公钥必定包含类型和编码");
+        .unwrap_or(canonical);
     if existing
         .lines()
         .any(|line| line.split_ascii_whitespace().any(|token| token == blob))
@@ -1016,7 +1018,7 @@ async fn replace_local_with_backup(
 async fn unique_local_backup_path(target: &Path) -> Result<PathBuf> {
     for sequence in 0..1000 {
         let mut name = target.as_os_str().to_os_string();
-        name.push(format!(".macscp-backup-{}-{sequence}", std::process::id()));
+        name.push(format!(".blip-backup-{}-{sequence}", std::process::id()));
         let candidate = PathBuf::from(name);
         match tokio::fs::symlink_metadata(&candidate).await {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
@@ -1095,20 +1097,23 @@ fn cached_upload_probe(
         return Err(anyhow!("远端临时路径不是普通文件，拒绝写入：{temp}"));
     }
 
-    let checkpoint_path = upload_checkpoint_path(remote);
-    let checkpoint = cache.get(&checkpoint_path).copied();
-    if checkpoint.is_some_and(|entry| entry.kind != EntryKind::File) {
-        return Err(anyhow!("远端断点身份路径不是普通文件：{checkpoint_path}"));
-    }
-    if checkpoint.is_some_and(|entry| entry.size > 16 * 1024) {
-        return Err(anyhow!("远端断点身份文件过大：{checkpoint_path}"));
+    let mut checkpoint_present = false;
+    for checkpoint_path in upload_checkpoint_paths(remote) {
+        let checkpoint = cache.get(&checkpoint_path).copied();
+        if checkpoint.is_some_and(|entry| entry.kind != EntryKind::File) {
+            return Err(anyhow!("远端断点身份路径不是普通文件：{checkpoint_path}"));
+        }
+        if checkpoint.is_some_and(|entry| entry.size > 16 * 1024) {
+            return Err(anyhow!("远端断点身份文件过大：{checkpoint_path}"));
+        }
+        checkpoint_present |= checkpoint.is_some();
     }
 
     Ok(UploadProbe {
         local_size,
         existing_size: existing.map(|entry| entry.size),
         filepart_size: filepart.map(|entry| entry.size),
-        checkpoint_present: checkpoint.is_some(),
+        checkpoint_present,
         preserved_mode: existing
             .filter(|entry| entry.kind == EntryKind::File)
             .and_then(|entry| entry.mode.map(|mode| mode & 0o7777)),
@@ -1151,17 +1156,19 @@ pub async fn probe_upload(sftp: &SftpSession, local: &Path, remote: &str) -> Res
         Some(meta) => Some(meta.size.unwrap_or(0)),
         None => None,
     };
-    let checkpoint = upload_checkpoint_path(remote);
-    let checkpoint_present = match optional_remote_metadata(sftp, &checkpoint).await? {
-        Some(meta) if meta.is_dir() || meta.is_symlink() => {
-            return Err(anyhow!("远端断点身份路径不是普通文件：{checkpoint}"));
+    let mut checkpoint_present = false;
+    for checkpoint in upload_checkpoint_paths(remote) {
+        match optional_remote_metadata(sftp, &checkpoint).await? {
+            Some(meta) if meta.is_dir() || meta.is_symlink() => {
+                return Err(anyhow!("远端断点身份路径不是普通文件：{checkpoint}"));
+            }
+            Some(meta) if meta.size.unwrap_or(u64::MAX) > 16 * 1024 => {
+                return Err(anyhow!("远端断点身份文件过大：{checkpoint}"));
+            }
+            Some(_) => checkpoint_present = true,
+            None => {}
         }
-        Some(meta) if meta.size.unwrap_or(u64::MAX) > 16 * 1024 => {
-            return Err(anyhow!("远端断点身份文件过大：{checkpoint}"));
-        }
-        Some(_) => true,
-        None => false,
-    };
+    }
 
     Ok(UploadProbe {
         local_size,
@@ -1187,7 +1194,18 @@ async fn optional_remote_metadata(
 }
 
 fn upload_checkpoint_path(remote: &str) -> String {
+    format!("{}.blip.json", filepart_path(remote))
+}
+
+fn legacy_upload_checkpoint_path(remote: &str) -> String {
     format!("{}.macscp.json", filepart_path(remote))
+}
+
+fn upload_checkpoint_paths(remote: &str) -> [String; 2] {
+    [
+        upload_checkpoint_path(remote),
+        legacy_upload_checkpoint_path(remote),
+    ]
 }
 
 async fn prepare_upload_source(path: &Path, cancel: &AtomicBool) -> Result<PreparedUpload> {
@@ -1291,6 +1309,18 @@ async fn read_upload_checkpoint(
         return Err(anyhow!("远端断点身份版本不受支持：{}", checkpoint.version));
     }
     Ok(Some(checkpoint))
+}
+
+async fn read_upload_checkpoint_for_remote(
+    sftp: &SftpSession,
+    remote: &str,
+) -> Result<Option<UploadCheckpoint>> {
+    for path in upload_checkpoint_paths(remote) {
+        if let Some(checkpoint) = read_upload_checkpoint(sftp, &path).await? {
+            return Ok(Some(checkpoint));
+        }
+    }
+    Ok(None)
 }
 
 async fn write_upload_checkpoint(
@@ -1454,6 +1484,8 @@ impl UploadSink for BatchSink<'_> {
 struct ConcurrentBatchProgress {
     transferred: u64,
     total: u64,
+    completed_files: usize,
+    total_files: usize,
     active_files: Vec<String>,
 }
 
@@ -1479,20 +1511,31 @@ impl ConcurrentBatchSink {
         }
     }
 
-    fn add_discovered(&self, bytes: u64) {
-        let (transferred, total) = {
+    fn add_discovered(&self, bytes: u64, files: usize) {
+        let (transferred, total, completed_files, total_files) = {
             let mut shared = self
                 .shared
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             shared.total = shared.total.saturating_add(bytes);
-            (shared.transferred, shared.total)
+            shared.total_files = shared.total_files.saturating_add(files);
+            (
+                shared.transferred,
+                shared.total,
+                shared.completed_files,
+                shared.total_files,
+            )
         };
         let _ = self.events.send(SftpEvent::TransferProgress {
             id: self.id,
             transferred,
             total,
             speed: 0.,
+        });
+        let _ = self.events.send(SftpEvent::TransferFileProgress {
+            id: self.id,
+            completed: completed_files,
+            total: total_files,
         });
     }
 
@@ -1542,6 +1585,22 @@ impl ConcurrentBatchSink {
             .events
             .send(SftpEvent::TransferActiveFiles { id: self.id, files });
     }
+
+    fn file_completed(&self) {
+        let (completed, total) = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            shared.completed_files = shared.completed_files.saturating_add(1);
+            (shared.completed_files, shared.total_files)
+        };
+        let _ = self.events.send(SftpEvent::TransferFileProgress {
+            id: self.id,
+            completed,
+            total,
+        });
+    }
 }
 
 impl UploadSink for ConcurrentBatchSink {
@@ -1578,6 +1637,7 @@ impl UploadSink for ConcurrentBatchSink {
 /// 写 `.filepart` → 回填权限 → 原子替换目标。
 /// 和 [`run_download`] 对称：参数与 `SftpCommand::Upload` 的字段一一对应。
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn run_upload(
     sftp: Arc<SftpSession>,
     id: TransferId,
@@ -1591,7 +1651,7 @@ pub async fn run_upload(
     let result = if cancel.load(Ordering::Relaxed) {
         Err(anyhow!("已取消"))
     } else {
-        upload_once(
+        upload_attempt(
             &sftp, id, &local, &remote, total, decision, &cancel, &events,
         )
         .await
@@ -1612,7 +1672,7 @@ pub async fn run_upload(
 
 // 同上：只比公开入口少一个 `Arc`，参数照样平铺。
 #[allow(clippy::too_many_arguments)]
-async fn upload_once(
+pub(crate) async fn upload_attempt(
     sftp: &SftpSession,
     id: TransferId,
     local: &Path,
@@ -1676,7 +1736,7 @@ async fn upload_file(
                 tokio::time::sleep(delay).await;
             }
             Err(error) if retries > 0 => {
-                return Err(anyhow!("{error:#}（已自动重试 {retries} 次）"));
+                return Err(error.context(format!("已自动重试 {retries} 次")));
             }
             result => return result,
         }
@@ -1723,7 +1783,7 @@ async fn upload_file_once(
     };
 
     if offset > 0 {
-        let recorded = read_upload_checkpoint(sftp, &checkpoint_path)
+        let recorded = read_upload_checkpoint_for_remote(sftp, remote)
             .await?
             .ok_or_else(|| anyhow!("远端断点缺少身份信息，不能安全续传；请改用安全覆盖"))?;
         if recorded != prepared.checkpoint {
@@ -1779,8 +1839,10 @@ async fn upload_file_once(
 
     // 2) 原子替换。到这一步临时文件已经完整落盘，替换失败也不会丢数据。
     replace_remote(sftp, &temp, remote).await?;
-    if let Err(err) = remove_remote_if_exists(sftp, &checkpoint_path).await {
-        log::warn!("上传完成但清理断点身份文件失败：{err:#}");
+    for path in upload_checkpoint_paths(remote) {
+        if let Err(err) = remove_remote_if_exists(sftp, &path).await {
+            log::warn!("上传完成但清理断点身份文件失败：{err:#}");
+        }
     }
     Ok(())
 }
@@ -1937,7 +1999,9 @@ async fn upload_small_file_inner(
         let _ = sftp.remove_file(filepart_path(remote)).await;
     }
     if probe.checkpoint_present {
-        let _ = sftp.remove_file(upload_checkpoint_path(remote)).await;
+        for path in upload_checkpoint_paths(remote) {
+            let _ = sftp.remove_file(path).await;
+        }
     }
     sink.progress(transferred, total, speedometer.current());
     Ok(())
@@ -2016,7 +2080,7 @@ async fn replace_remote(sftp: &SftpSession, temp: &str, target: &str) -> Result<
 async fn unique_remote_backup_path(sftp: &SftpSession, target: &str) -> Result<String> {
     for _ in 0..32 {
         let sequence = NEXT_REMOTE_TEMP.fetch_add(1, Ordering::Relaxed);
-        let candidate = format!("{target}.macscp-backup-{}-{sequence}", std::process::id());
+        let candidate = format!("{target}.blip-backup-{}-{sequence}", std::process::id());
         if optional_remote_metadata(sftp, &candidate).await?.is_none() {
             return Ok(candidate);
         }
@@ -2181,34 +2245,57 @@ pub(crate) async fn run_upload_dir_pooled(
     cancel: Arc<AtomicBool>,
     events: flume::Sender<SftpEvent>,
 ) {
-    let result = if cancel.load(Ordering::Relaxed) {
-        Ok(TransferOutcome::Cancelled)
-    } else {
-        upload_dir_inner(
-            &sftp,
-            &transfer_pool,
-            file_slots,
-            id,
-            &local,
-            &remote,
-            on_existing,
-            &cancel,
-            &events,
-        )
-        .await
-    };
-    let outcome = match result {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            if cancel.load(Ordering::Relaxed) {
-                TransferOutcome::Cancelled
-            } else {
-                TransferOutcome::Failed(err.to_string())
-            }
-        }
-    };
+    let outcome = upload_dir_attempt(
+        sftp,
+        transfer_pool,
+        file_slots,
+        id,
+        local,
+        remote,
+        on_existing,
+        false,
+        cancel,
+        events.clone(),
+    )
+    .await;
 
     let _ = events.send(SftpEvent::TransferCompleted { id, outcome });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upload_dir_attempt(
+    sftp: Arc<SftpSession>,
+    transfer_pool: TransferPool,
+    file_slots: Arc<Semaphore>,
+    id: TransferId,
+    local: PathBuf,
+    remote: String,
+    on_existing: ExistingPolicy,
+    resume_interrupted: bool,
+    cancel: Arc<AtomicBool>,
+    events: flume::Sender<SftpEvent>,
+) -> TransferOutcome {
+    if cancel.load(Ordering::Relaxed) {
+        return TransferOutcome::Cancelled;
+    }
+    match upload_dir_inner(
+        &sftp,
+        &transfer_pool,
+        file_slots,
+        id,
+        &local,
+        &remote,
+        on_existing,
+        resume_interrupted,
+        &cancel,
+        &events,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) if cancel.load(Ordering::Relaxed) => TransferOutcome::Cancelled,
+        Err(err) => TransferOutcome::Failed(err.to_string()),
+    }
 }
 
 enum DirUploadResult {
@@ -2255,18 +2342,21 @@ async fn upload_local_directory(
     relative: PathBuf,
     remote_root: &str,
     on_existing: ExistingPolicy,
+    resume_interrupted: bool,
     cancel: &AtomicBool,
     events: &flume::Sender<SftpEvent>,
     progress: Arc<Mutex<ConcurrentBatchProgress>>,
     file_slots: Arc<Semaphore>,
+    ignore_rules: local_tree::IgnoreRules,
 ) -> Result<UploadedDirectory> {
     let scan_root = local_root.to_path_buf();
     let scan_relative = relative.clone();
-    let directory =
-        tokio::task::spawn_blocking(move || local_tree::scan_directory(&scan_root, &scan_relative))
-            .await
-            .map_err(|err| anyhow!("扫描本地目录失败：{err}"))?
-            .map_err(|err| anyhow!("{err}"))?;
+    let directory = tokio::task::spawn_blocking(move || {
+        local_tree::scan_directory(&scan_root, &scan_relative, &ignore_rules)
+    })
+    .await
+    .map_err(|err| anyhow!("扫描本地目录失败：{err}"))?
+    .map_err(|err| anyhow!("{err}"))?;
 
     if cancel.load(Ordering::Relaxed) {
         return Err(anyhow!("已取消"));
@@ -2299,8 +2389,8 @@ async fn upload_local_directory(
         .collect();
 
     let progress_reporter = ConcurrentBatchSink::new(id, events, progress.clone());
-    if directory.total_bytes > 0 {
-        progress_reporter.add_discovered(directory.total_bytes);
+    if directory.total_bytes > 0 || !directory.files.is_empty() {
+        progress_reporter.add_discovered(directory.total_bytes, directory.files.len());
     }
 
     let files = stream::iter(directory.files.into_iter().map(|file| {
@@ -2314,19 +2404,26 @@ async fn upload_local_directory(
             if cancel.load(Ordering::Relaxed) {
                 return DirUploadResult::Ignored;
             }
+            let mut sink = ConcurrentBatchSink::new(id, events, progress);
             let probe = match cached_upload_probe(cache, file.size, &target) {
                 Ok(probe) => probe,
-                Err(err) => return DirUploadResult::Failed(format!("{name}：{err}")),
+                Err(err) => {
+                    sink.file_completed();
+                    return DirUploadResult::Failed(format!("{name}：{err}"));
+                }
             };
-            let mut sink = ConcurrentBatchSink::new(id, events, progress);
             if on_existing == ExistingPolicy::Skip && probe.existing_size.is_some() {
                 sink.add_completed(probe.local_size);
+                sink.file_completed();
                 return DirUploadResult::Skipped;
             }
 
             let _slot = match slots.acquire_owned().await {
                 Ok(slot) => slot,
-                Err(_) => return DirUploadResult::Failed(format!("{name}：并发控制器已关闭")),
+                Err(_) => {
+                    sink.file_completed();
+                    return DirUploadResult::Failed(format!("{name}：并发控制器已关闭"));
+                }
             };
             if cancel.load(Ordering::Relaxed) {
                 return DirUploadResult::Ignored;
@@ -2346,13 +2443,18 @@ async fn upload_local_directory(
                     &target,
                     &probe,
                     file.size,
-                    UploadDecision::Overwrite,
+                    if resume_interrupted {
+                        UploadDecision::Resume
+                    } else {
+                        UploadDecision::Overwrite
+                    },
                     cancel,
                     &mut sink,
                 )
                 .await
             };
             sink.file_finished(&name);
+            sink.file_completed();
             match result {
                 Ok(()) => DirUploadResult::Uploaded,
                 Err(err) => DirUploadResult::Failed(format!("{name}：{err}")),
@@ -2392,6 +2494,7 @@ async fn upload_dir_inner(
     local: &Path,
     remote: &str,
     on_existing: ExistingPolicy,
+    resume_interrupted: bool,
     cancel: &AtomicBool,
     events: &flume::Sender<SftpEvent>,
 ) -> Result<TransferOutcome> {
@@ -2402,6 +2505,7 @@ async fn upload_dir_inner(
         total: 0,
     });
     let progress = Arc::new(Mutex::new(ConcurrentBatchProgress::default()));
+    let ignore_rules = local_tree::IgnoreRules::new(local);
     let mut pending = vec![PathBuf::new()];
     let mut pending_symlinks = Vec::new();
     let mut uploaded = 0usize;
@@ -2417,6 +2521,7 @@ async fn upload_dir_inner(
         let directories = stream::iter(current.into_iter().map(|relative| {
             let progress = progress.clone();
             let file_slots = file_slots.clone();
+            let ignore_rules = ignore_rules.clone();
             async move {
                 let result = upload_local_directory(
                     sftp,
@@ -2426,10 +2531,12 @@ async fn upload_dir_inner(
                     relative.clone(),
                     remote,
                     on_existing,
+                    resume_interrupted,
                     cancel,
                     events,
                     progress,
                     file_slots,
+                    ignore_rules,
                 )
                 .await;
                 (relative, result)
@@ -2651,6 +2758,13 @@ async fn download_dir_inner(
         resumed_from: 0,
         total,
     });
+    let total_files = tree.files.len();
+    let mut processed_files = 0usize;
+    let _ = events.send(SftpEvent::TransferFileProgress {
+        id,
+        completed: processed_files,
+        total: total_files,
+    });
 
     // 每一级都拒绝符号链接，恶意服务器文件名或本地预置链接都不能把下载写出根目录。
     ensure_safe_download_root(local).await?;
@@ -2677,6 +2791,12 @@ async fn download_dir_inner(
             return Ok(TransferOutcome::Cancelled);
         }
         if broken_dirs.iter().any(|dir| file.relative.starts_with(dir)) {
+            processed_files += 1;
+            let _ = events.send(SftpEvent::TransferFileProgress {
+                id,
+                completed: processed_files,
+                total: total_files,
+            });
             continue;
         }
 
@@ -2684,6 +2804,12 @@ async fn download_dir_inner(
         let parent = file.relative.parent().unwrap_or_else(|| Path::new(""));
         if let Err(err) = ensure_safe_download_subdir(local, parent).await {
             failures.push(format!("{name}：本地父目录不安全：{err}"));
+            processed_files += 1;
+            let _ = events.send(SftpEvent::TransferFileProgress {
+                id,
+                completed: processed_files,
+                total: total_files,
+            });
             continue;
         }
         let target = local.join(&file.relative);
@@ -2698,6 +2824,12 @@ async fn download_dir_inner(
                 total,
                 speed: 0.,
             });
+            processed_files += 1;
+            let _ = events.send(SftpEvent::TransferFileProgress {
+                id,
+                completed: processed_files,
+                total: total_files,
+            });
             continue;
         }
 
@@ -2706,6 +2838,12 @@ async fn download_dir_inner(
             Ok(plan) => plan,
             Err(err) => {
                 failures.push(format!("{name}：{err}"));
+                processed_files += 1;
+                let _ = events.send(SftpEvent::TransferFileProgress {
+                    id,
+                    completed: processed_files,
+                    total: total_files,
+                });
                 continue;
             }
         };
@@ -2723,6 +2861,12 @@ async fn download_dir_inner(
 
         // 成功或半途失败，都以「最后一次上报的位置」为准：进度绝不倒退。
         done = sink.last.max(done);
+        processed_files += 1;
+        let _ = events.send(SftpEvent::TransferFileProgress {
+            id,
+            completed: processed_files,
+            total: total_files,
+        });
     }
 
     let _ = events.send(SftpEvent::TransferProgress {
@@ -2864,10 +3008,8 @@ mod tests {
     #[tokio::test]
     async fn local_replace_fallback_preserves_then_cleans_the_original() {
         let nonce = NEXT_EDIT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "macscp-local-replace-{}-{nonce}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("blip-local-replace-{}-{nonce}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建测试目录");
         let target = dir.join("target.txt");
@@ -2889,7 +3031,7 @@ mod tests {
                     .expect("读目录项")
                     .file_name()
                     .to_string_lossy()
-                    .contains(".macscp-backup-")),
+                    .contains(".blip-backup-")),
             "发布成功后不应残留备份"
         );
 
@@ -2901,7 +3043,7 @@ mod tests {
         let first = edit_temp_path("/srv/app/config.toml");
         let second = edit_temp_path("/srv/app/config.toml");
         assert_ne!(first, second);
-        assert!(first.starts_with("/srv/app/config.toml.macscp-editpart-"));
+        assert!(first.starts_with("/srv/app/config.toml.blip-editpart-"));
         assert!(!first.contains("/../"));
     }
 
@@ -2933,7 +3075,7 @@ mod tests {
     async fn download_marker_does_not_follow_a_symlink() {
         let nonce = NEXT_EDIT_TEMP.fetch_add(1, Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("macscp-marker-link-{}-{nonce}", std::process::id()));
+            std::env::temp_dir().join(format!("blip-marker-link-{}-{nonce}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建测试目录");
         let actual = dir.join("actual.json");

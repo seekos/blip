@@ -663,10 +663,7 @@ fn service_fullname(device_id: Uuid) -> String {
 }
 
 fn device_id_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("macscp")
-        .join("device_id")
+    crate::session::store::config_dir().join("device_id")
 }
 
 fn load_or_create_device_id() -> Result<Uuid, String> {

@@ -55,7 +55,7 @@ wY2Mci/5DVHF4JVqTOjQAAAAEG1hY3NjcC10ZXN0LW9ubHkBAgMEBQ==
 ";
 
 /// [`CLIENT_KEY`] 对应的公钥（带注释的 OpenSSH 单行格式）。
-pub const CLIENT_KEY_PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICaEpv0wklfEupBq0hro0QrkwY2Mci/5DVHF4JVqTOjQ macscp-test-only";
+pub const CLIENT_KEY_PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICaEpv0wklfEupBq0hro0QrkwY2Mci/5DVHF4JVqTOjQ blip-test-only";
 
 /// 同一把私钥的口令保护版本（口令见 [`CLIENT_KEY_PASSPHRASE`]）。
 ///
@@ -1187,7 +1187,7 @@ mod tests {
 
     /// 把一段私钥写进临时文件，返回路径。
     fn write_key(tag: &str, contents: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("macscp-key-{}-{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blip-key-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("建临时密钥目录");
         let path = dir.join("id_ed25519");
         std::fs::write(&path, contents).expect("写临时私钥");
@@ -1288,7 +1288,7 @@ mod tests {
     #[tokio::test]
     async fn missing_key_file_is_reported() {
         let addr = spawn().await;
-        let path = std::env::temp_dir().join("macscp-definitely-missing-key");
+        let path = std::env::temp_dir().join("blip-definitely-missing-key");
 
         let err = connect_test(&config_with_key(addr, path, None))
             .await
@@ -1345,7 +1345,7 @@ mod tests {
             .expect("事件通道不应关闭")
     }
 
-    /// 真实 worker 首次连接必须先让 UI 确认指纹；测试选择“仅本次信任”。
+    /// 真实 worker 首次连接时让 UI 确认指纹；若本机 known_hosts 已有同端点则直接连接。
     async fn connect_worker(worker: &SftpWorker, config: SessionConfig) {
         worker.send(SftpCommand::Connect(config));
         match next_event(worker).await {
@@ -1353,10 +1353,20 @@ mod tests {
                 assert!(prompt.fingerprint.starts_with("SHA256:"));
                 assert!(!prompt.algorithm.is_empty());
                 assert!(prompt.changed_line.is_none());
+                worker.send(SftpCommand::ResolveHostKey(HostKeyDecision::TrustOnce));
             }
-            other => panic!("期望 HostKeyPrompt，实际 {other:?}"),
+            SftpEvent::Connected {
+                home,
+                upload_sources,
+                upload_concurrency,
+            } => {
+                assert_eq!(home, HOME);
+                assert_eq!(upload_sources.len(), 1);
+                assert_eq!(upload_concurrency, 8);
+                return;
+            }
+            other => panic!("期望 HostKeyPrompt 或 Connected，实际 {other:?}"),
         }
-        worker.send(SftpCommand::ResolveHostKey(HostKeyDecision::TrustOnce));
         match next_event(worker).await {
             SftpEvent::Connected {
                 home,
@@ -1426,10 +1436,157 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn interrupted_upload_resumes_after_automatic_reconnect() {
+        let _guard = vfs_lock().lock_owned().await;
+        vfs_reset().await;
+        set_write_delay(Duration::from_millis(25));
+
+        const REMOTE: &str = "/home/tester/reconnect-upload.bin";
+        let payload = (0..2 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let local = temp_dir("reconnect-upload").join("reconnect-upload.bin");
+        std::fs::write(&local, &payload).expect("写本地上传文件");
+
+        let server = spawn_controlled(None).await;
+        let addr = server.addr;
+        let worker = SftpWorker::spawn();
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
+        worker.send(SftpCommand::Upload {
+            id: 100,
+            local,
+            remote: REMOTE.to_string(),
+            total: payload.len() as u64,
+            resume: true,
+        });
+
+        loop {
+            if matches!(
+                next_event(&worker).await,
+                SftpEvent::TransferProgress {
+                    id: 100,
+                    transferred,
+                    ..
+                } if transferred > 0
+            ) {
+                break;
+            }
+        }
+
+        server.shutdown().await;
+        set_write_delay(Duration::ZERO);
+        let partial = vfs_read(&format!("{REMOTE}.filepart"))
+            .await
+            .expect("中断后应保留远端半成品");
+        assert!(!partial.is_empty());
+        assert!(partial.len() < payload.len());
+
+        loop {
+            match next_event(&worker).await {
+                SftpEvent::Reconnecting => break,
+                SftpEvent::TransferCompleted { outcome, .. } => {
+                    panic!("自动重连前上传不应结束：{outcome:?}")
+                }
+                _ => {}
+            }
+        }
+
+        let _restarted = spawn_controlled(Some(addr)).await;
+        let mut resumed_from = 0;
+        let outcome = loop {
+            match next_event(&worker).await {
+                SftpEvent::TransferStarted {
+                    id: 100,
+                    resumed_from: offset,
+                    ..
+                } => resumed_from = resumed_from.max(offset),
+                SftpEvent::TransferCompleted { id: 100, outcome } => break outcome,
+                _ => {}
+            }
+        };
+
+        assert!(resumed_from > 0, "重连后应从远端半成品继续");
+        assert_eq!(outcome, TransferOutcome::Completed);
+        assert_eq!(vfs_read(REMOTE).await.as_deref(), Some(payload.as_slice()));
+        assert!(!vfs_exists(&format!("{REMOTE}.filepart")).await);
+    }
+
+    #[tokio::test]
+    async fn interrupted_folder_upload_resumes_after_automatic_reconnect() {
+        let _guard = vfs_lock().lock_owned().await;
+        vfs_reset().await;
+        set_write_delay(Duration::from_millis(25));
+
+        const REMOTE_DIR: &str = "/home/tester/reconnect-folder";
+        const REMOTE_FILE: &str = "/home/tester/reconnect-folder/payload.bin";
+        let payload = (0..2 * 1024 * 1024)
+            .map(|index| (index % 239) as u8)
+            .collect::<Vec<_>>();
+        let local = temp_dir("reconnect-folder");
+        std::fs::write(local.join("payload.bin"), &payload).expect("写目录上传文件");
+
+        let server = spawn_controlled(None).await;
+        let addr = server.addr;
+        let worker = SftpWorker::spawn();
+        connect_worker(&worker, config_for(addr, PASSWORD)).await;
+        worker.send(SftpCommand::UploadDir {
+            id: 101,
+            local,
+            remote: REMOTE_DIR.to_string(),
+            on_existing: ExistingPolicy::Overwrite,
+        });
+
+        loop {
+            if matches!(
+                next_event(&worker).await,
+                SftpEvent::TransferProgress {
+                    id: 101,
+                    transferred,
+                    ..
+                } if transferred > 0
+            ) {
+                break;
+            }
+        }
+
+        server.shutdown().await;
+        set_write_delay(Duration::ZERO);
+        let partial = vfs_read(&format!("{REMOTE_FILE}.filepart"))
+            .await
+            .expect("目录上传中断后应保留远端半成品");
+        assert!(!partial.is_empty());
+        assert!(partial.len() < payload.len());
+
+        loop {
+            match next_event(&worker).await {
+                SftpEvent::Reconnecting => break,
+                SftpEvent::TransferCompleted { outcome, .. } => {
+                    panic!("自动重连前目录上传不应结束：{outcome:?}")
+                }
+                _ => {}
+            }
+        }
+
+        let _restarted = spawn_controlled(Some(addr)).await;
+        let outcome = loop {
+            if let SftpEvent::TransferCompleted { id: 101, outcome } = next_event(&worker).await {
+                break outcome;
+            }
+        };
+
+        assert_eq!(outcome, TransferOutcome::Completed);
+        assert_eq!(
+            vfs_read(REMOTE_FILE).await.as_deref(),
+            Some(payload.as_slice())
+        );
+        assert!(!vfs_exists(&format!("{REMOTE_FILE}.filepart")).await);
+    }
+
     /// 右键编辑的完整链路：读取 UTF-8、保存、保留权限，且不遗留临时文件。
     #[tokio::test]
     async fn worker_round_trip_read_and_write_text() {
-        const PATH: &str = "/home/tester/macscp-worker-edit.txt";
+        const PATH: &str = "/home/tester/blip-worker-edit.txt";
         let _guard = vfs_lock().lock_owned().await;
         vfs_reset().await;
         vfs_write(PATH, b"before\n").await;
@@ -1626,7 +1783,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("macscp-test-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blip-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("创建临时目录");
         dir
@@ -2762,6 +2919,7 @@ mod tests {
                     outcome = o;
                 }
                 SftpEvent::TransferActiveFiles { id: got, .. } => assert_eq!(got, id),
+                SftpEvent::TransferFileProgress { id: got, .. } => assert_eq!(got, id),
                 other => panic!("整目录上传不该发这个事件：{other:?}"),
             }
         }
@@ -3040,6 +3198,7 @@ mod tests {
 
         let mut started_total = None;
         let mut discovered_total = 0;
+        let mut file_progress = (0, 0);
         loop {
             match next_event(&worker).await {
                 SftpEvent::TransferStarted { id, total, .. } => {
@@ -3051,6 +3210,14 @@ mod tests {
                     discovered_total = discovered_total.max(total);
                 }
                 SftpEvent::TransferActiveFiles { id, .. } => assert_eq!(id, 21),
+                SftpEvent::TransferFileProgress {
+                    id,
+                    completed,
+                    total,
+                } => {
+                    assert_eq!(id, 21);
+                    file_progress = (completed, total);
+                }
                 SftpEvent::TransferCompleted { id, outcome } => {
                     assert_eq!(id, 21);
                     assert_eq!(outcome, TransferOutcome::Completed);
@@ -3062,6 +3229,7 @@ mod tests {
 
         assert_eq!(started_total, Some(0), "目录上传应立即进入运行状态");
         assert_eq!(discovered_total, expected_total, "扫描时动态补齐总量");
+        assert_eq!(file_progress, (files.len(), files.len()));
         assert!(
             vfs_exists("/home/tester/worker-dist/sub/deep/c.bin").await,
             "整棵树都该传上去"
@@ -3144,6 +3312,7 @@ mod tests {
                     assert_eq!(got, id);
                     outcome = o;
                 }
+                SftpEvent::TransferFileProgress { id: got, .. } => assert_eq!(got, id),
                 other => panic!("整目录下载不该发这个事件：{other:?}"),
             }
         }
@@ -3410,6 +3579,7 @@ mod tests {
         });
 
         let mut started_total = 0;
+        let mut file_progress = (0, 0);
         loop {
             match next_event(&worker).await {
                 SftpEvent::TransferStarted { id, total, .. } => {
@@ -3417,6 +3587,14 @@ mod tests {
                     started_total = total;
                 }
                 SftpEvent::TransferProgress { id, .. } => assert_eq!(id, 41),
+                SftpEvent::TransferFileProgress {
+                    id,
+                    completed,
+                    total,
+                } => {
+                    assert_eq!(id, 41);
+                    file_progress = (completed, total);
+                }
                 SftpEvent::TransferCompleted { id, outcome } => {
                     assert_eq!(id, 41);
                     assert_eq!(outcome, TransferOutcome::Completed);
@@ -3427,6 +3605,7 @@ mod tests {
         }
 
         assert_eq!(started_total, expected_total);
+        assert_eq!(file_progress, (files.len(), files.len()));
         assert!(local.join("sub/deep/c.bin").is_file(), "整棵树都该下到本地");
 
         let _ = std::fs::remove_dir_all(&dir);

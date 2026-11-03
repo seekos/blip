@@ -54,6 +54,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 libc = "0.2"
 rand = "0.10"
 gethostname = "1"
+ignore = "0.4.33"
 mdns-sd = "0.21"
 netdev = { version = "0.47", default-features = false }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -78,6 +79,9 @@ objc2-foundation = { version = "0.3", features = [
     "NSURL",
 ] }
 security-framework = { version = "3.7", features = ["OSX_10_15"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 # Linux 窗口图标：Wayland 用 app_id，X11 还需要把 PNG 解码后交给 GPUI。
 [target.'cfg(target_os = "linux")'.dependencies]

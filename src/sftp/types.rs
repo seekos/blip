@@ -146,7 +146,7 @@ pub struct UploadConflict {
     pub existing_size: Option<u64>,
     /// 远端 `<remote>.filepart` 的大小；`None` 表示没有半成品。
     pub filepart_size: Option<u64>,
-    /// 半成品是否带有 macscp 写入的内容身份凭据。
+    /// 半成品是否带有 Blip 写入的内容身份凭据。
     pub checkpoint_present: bool,
 }
 
@@ -439,6 +439,12 @@ pub enum SftpEvent {
         total: u64,
         /// worker 侧测出来的实时速率，字节/秒；`f64::NAN` 表示「暂时算不出来」。
         speed: f64,
+    },
+    /// 整目录任务已处理/已发现的文件数。上传扫描期间 `total` 会逐步增长。
+    TransferFileProgress {
+        id: TransferId,
+        completed: usize,
+        total: usize,
     },
     /// 整目录并发上传时，当前实际占用传输槽的文件。
     ///

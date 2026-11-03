@@ -89,18 +89,31 @@ fn prepare_profile_persistence(config: &SessionConfig) -> ProfilePersistence {
     };
     ProfilePersistence {
         profile: SavedProfile {
+            name: None,
             host: config.host.clone(),
             port: config.port,
             username: config.username.clone(),
             auth,
+            pinned: false,
+            last_connected: Some(store::unix_timestamp()),
         },
         password,
+    }
+}
+
+fn profile_password_config(profile: &SavedProfile) -> SessionConfig {
+    SessionConfig {
+        host: profile.host.clone(),
+        port: profile.port,
+        username: profile.username.clone(),
+        auth: AuthMethod::Password(String::new()),
     }
 }
 
 impl ScpApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let profiles = store::load_profiles();
+        let profiles_warning = store::take_profiles_warning();
         let settings = store::load_settings();
         let server_password = match settings.lan_sftp_password_mode {
             LanSftpPasswordMode::Default => Ok(None),
@@ -248,7 +261,7 @@ impl ScpApp {
 
                         // 连接成功才落盘凭证，避免把错误密码写进钥匙串。
                         if state == SessionState::Connected && !was_connected {
-                            app.persist_profile(cx);
+                            app.persist_connection(cx);
                         } else if state == SessionState::Disconnected {
                             // 认证失败、超时或主动断开后，绝不能把这份配置用于下一次成功事件。
                             app.pending_config = None;
@@ -295,6 +308,9 @@ impl ScpApp {
         app.prefill_last_profile(window, cx);
         app.sync_window_title(window, cx);
         app.check_for_updates(cx);
+        if let Some(message) = profiles_warning {
+            window.push_notification(Notification::error(message), cx);
+        }
         app
     }
 
@@ -564,36 +580,65 @@ impl ScpApp {
     // 凭证
     // -----------------------------------------------------------------------
 
-    /// 把当前连接写进系统凭据库 + profiles.json。
-    ///
-    /// 用户关掉「记住」时**什么都不落盘**：系统凭据库里的旧密码顺手清掉，
-    /// profiles.json 也不写 —— 否则演示模式（remember = false）会往
-    /// 配置里塞一堆 `tester@127.0.0.1:<随机端口>`，下次启动还会被
-    /// `prefill` 填回表单。
-    fn persist_profile(&mut self, cx: &mut Context<Self>) {
+    /// 连接成功后只持久化“记住密码”偏好，并刷新已有收藏的最近使用时间。
+    /// 新收藏只能由工具栏的“收藏当前连接”显式创建。
+    fn persist_connection(&mut self, cx: &mut Context<Self>) {
         let Some(config) = self.pending_config.clone() else {
-            log::warn!("连接成功但缺少实际连接配置，跳过收藏持久化");
+            log::warn!("连接成功但缺少实际连接配置，跳过连接持久化");
             return;
         };
-        let snapshot = self.toolbar.read(cx).snapshot(cx);
+        let remember = self.toolbar.read(cx).snapshot(cx).remember;
         let prepared = prepare_profile_persistence(&config);
+        let mut previous_profile = None;
 
-        if !snapshot.remember {
-            if matches!(config.auth, AuthMethod::Password(_)) {
-                store::forget_password(&config);
+        if let Some(existing) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.host == config.host && profile.username == config.username)
+            .cloned()
+        {
+            let mut updated = prepared.profile.clone();
+            updated.name = existing.name.clone();
+            updated.pinned = existing.pinned;
+            let mut profiles = self.profiles.clone();
+            let result = store::upsert_profile(&mut profiles, updated);
+            match store::save_profiles(&profiles) {
+                Ok(()) => {
+                    previous_profile = result.previous;
+                    self.profiles = profiles.clone();
+                    self.toolbar
+                        .update(cx, |toolbar, cx| toolbar.set_profiles(profiles, cx));
+                }
+                Err(err) => {
+                    log::warn!("刷新收藏最近连接时间失败：{err}");
+                    self.toolbar.update(cx, |toolbar, cx| {
+                        toolbar
+                            .set_error(Some(format!("连接成功，但更新收藏失败：{err}").into()), cx)
+                    });
+                }
             }
-            return;
         }
 
-        if let Some(password) = prepared.password {
+        if let Some(password) = prepared.password
+            && remember
+        {
             let password_config = config.clone();
+            let old_password_config = previous_profile
+                .as_ref()
+                .filter(|profile| matches!(profile.auth, SavedAuth::Password))
+                .map(profile_password_config)
+                .filter(|old| old.keyring_account() != password_config.keyring_account());
             // 写系统凭据库可能触发授权弹窗，放到后台线程；失败时回到前台
             // 把原因显示在工具栏上 —— 只写日志等于没告诉用户。
             let this = cx.entity().downgrade();
             cx.spawn(async move |_app, cx| {
-                let task = cx
-                    .background_executor()
-                    .spawn(async move { store::store_password(&password_config, &password) });
+                let task = cx.background_executor().spawn(async move {
+                    store::store_password(&password_config, &password)?;
+                    if let Some(old) = old_password_config {
+                        store::forget_password(&old);
+                    }
+                    Ok::<_, String>(())
+                });
 
                 if let Err(err) = task.await {
                     log::warn!("保存密码失败：{err}");
@@ -606,44 +651,59 @@ impl ScpApp {
                 }
             })
             .detach();
-        }
-
-        let profile = prepared.profile;
-        store::upsert_profile(&mut self.profiles, profile);
-        let profiles = self.profiles.clone();
-        self.toolbar
-            .update(cx, |toolbar, cx| toolbar.set_profiles(profiles, cx));
-        if let Err(err) = store::save_profiles(&self.profiles) {
-            log::warn!("保存连接配置失败：{err}");
+        } else if matches!(config.auth, AuthMethod::Password(_)) {
+            store::forget_password(&config);
+            if let Some(previous) = previous_profile
+                && matches!(previous.auth, SavedAuth::Password)
+            {
+                let old = profile_password_config(&previous);
+                if old.keyring_account() != config.keyring_account() {
+                    store::forget_password(&old);
+                }
+            }
+        } else if let Some(previous) = previous_profile
+            && matches!(previous.auth, SavedAuth::Password)
+        {
+            store::forget_password(&profile_password_config(&previous));
         }
     }
 
     fn persist_installed_key(&mut self, private_key: &std::path::Path, cx: &mut Context<Self>) {
-        let Some(config) = self.pending_config.as_ref() else {
+        let Some(config) = self.pending_config.as_mut() else {
             self.toolbar.update(cx, |toolbar, cx| {
                 toolbar.set_error(Some("公钥已部署，但无法更新本地连接配置".into()), cx)
             });
             return;
         };
-        if !self.toolbar.read(cx).snapshot(cx).remember {
+        config.auth = AuthMethod::PrivateKey {
+            path: private_key.to_path_buf(),
+            passphrase: None,
+        };
+        let Some(existing) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.host == config.host && profile.username == config.username)
+            .cloned()
+        else {
             return;
-        }
+        };
 
+        let mut profiles = self.profiles.clone();
         store::upsert_profile(
-            &mut self.profiles,
+            &mut profiles,
             SavedProfile {
+                name: existing.name.clone(),
                 host: config.host.clone(),
                 port: config.port,
                 username: config.username.clone(),
                 auth: SavedAuth::Key {
                     path: private_key.to_string_lossy().to_string(),
                 },
+                pinned: existing.pinned,
+                last_connected: Some(store::unix_timestamp()),
             },
         );
-        let profiles = self.profiles.clone();
-        self.toolbar
-            .update(cx, |toolbar, cx| toolbar.set_profiles(profiles, cx));
-        if let Err(err) = store::save_profiles(&self.profiles) {
+        if let Err(err) = store::save_profiles(&profiles) {
             log::warn!("保存密钥连接配置失败：{err}");
             self.toolbar.update(cx, |toolbar, cx| {
                 toolbar.set_error(
@@ -653,12 +713,26 @@ impl ScpApp {
                     cx,
                 )
             });
+            return;
         }
+        if matches!(existing.auth, SavedAuth::Password) {
+            store::forget_password(&profile_password_config(&existing));
+        }
+        self.profiles = profiles.clone();
+        self.toolbar
+            .update(cx, |toolbar, cx| toolbar.set_profiles(profiles, cx));
     }
 
     /// 启动时把最近一次成功的连接填回表单。
     fn prefill_last_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(profile) = self.profiles.first().cloned() else {
+        let Some(profile) = self
+            .profiles
+            .iter()
+            .filter(|profile| profile.last_connected.is_some())
+            .max_by_key(|profile| profile.last_connected)
+            .or_else(|| self.profiles.first())
+            .cloned()
+        else {
             return;
         };
         self.toolbar

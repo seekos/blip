@@ -6,7 +6,7 @@
 //! 工具栏自己持有输入状态，只把「用户想干什么」以 [`ToolbarEvent`] 抛给根实体，
 //! 不直接碰 worker、也不碰文件面板 —— 这样连接表单和网络层可以各自演进。
 
-use std::path::PathBuf;
+use std::{cell::Cell, path::PathBuf, rc::Rc};
 
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
@@ -19,6 +19,7 @@ use gpui_kit::component::{
     input::{Input, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
+    radio::{Radio, RadioGroup},
     v_flex,
 };
 use gpui_kit::prelude::*;
@@ -65,6 +66,15 @@ pub struct ConnectionSnapshot {
     pub host: String,
     pub username: String,
     pub remember: bool,
+}
+
+fn profile_config(profile: &SavedProfile) -> SessionConfig {
+    SessionConfig {
+        host: profile.host.clone(),
+        port: profile.port,
+        username: profile.username.clone(),
+        auth: AuthMethod::Password(String::new()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -317,7 +327,6 @@ impl Toolbar {
         let port = profile.port.to_string();
         let username = profile.username.clone();
         self.use_key = matches!(profile.auth, SavedAuth::Key { .. });
-        self.remember = true;
         self.error = None;
 
         self.host
@@ -390,32 +399,360 @@ impl Toolbar {
         }
     }
 
-    fn remove_profile(
+    fn commit_profile(
         &mut self,
-        profile: &SavedProfile,
+        profile: SavedProfile,
+        migrate_previous_password: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let mut profiles = self.profiles.clone();
-        let Some(removed) = store::remove_profile(&mut profiles, &profile.username, &profile.host)
-        else {
-            return Ok(());
-        };
+        let current = profile.clone();
+        let result = store::upsert_profile(&mut profiles, profile);
         store::save_profiles(&profiles)?;
 
-        if matches!(removed.auth, SavedAuth::Password) {
-            let config = SessionConfig {
-                host: removed.host,
-                port: removed.port,
-                username: removed.username,
-                auth: AuthMethod::Password(String::new()),
-            };
-            store::forget_password(&config);
+        if migrate_previous_password && let Some(previous) = &result.previous {
+            match (&previous.auth, &current.auth) {
+                (SavedAuth::Password, SavedAuth::Password) => {
+                    if let Err(message) = store::migrate_profile_password(previous, &current) {
+                        window.push_notification(
+                            Notification::error(format!("收藏已保存，但密码迁移失败：{message}")),
+                            cx,
+                        );
+                    }
+                }
+                (SavedAuth::Password, SavedAuth::Key { .. }) => {
+                    store::forget_password(&profile_config(previous));
+                }
+                _ => {}
+            }
+        }
+        if let Some(evicted) = result.evicted {
+            if matches!(evicted.auth, SavedAuth::Password) {
+                store::forget_password(&profile_config(&evicted));
+            }
+            window.push_notification(
+                Notification::info(format!(
+                    "收藏已达 50 条，已移除最久未使用的“{}”",
+                    evicted.title()
+                )),
+                cx,
+            );
         }
 
         self.profiles = profiles.clone();
         cx.notify();
         cx.emit(ToolbarEvent::ProfilesChanged(profiles));
         Ok(())
+    }
+
+    fn favorite_current(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.state != SessionState::Connected {
+            return Err("请先连接服务器".to_string());
+        }
+        let host = self.host.read(cx).value().trim().to_string();
+        let port = self
+            .port
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u16>()
+            .unwrap_or(DEFAULT_SSH_PORT);
+        let username = self.username.read(cx).value().trim().to_string();
+        let existing = self
+            .profiles
+            .iter()
+            .find(|profile| profile.host == host && profile.username == username);
+        let (name, pinned) = existing
+            .map(|profile| (profile.name.clone(), profile.pinned))
+            .unwrap_or((None, false));
+        let auth = if self.use_key {
+            SavedAuth::Key {
+                path: self
+                    .key_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            }
+        } else {
+            SavedAuth::Password
+        };
+        self.commit_profile(
+            SavedProfile {
+                name,
+                host,
+                port,
+                username,
+                auth,
+                pinned,
+                last_connected: Some(store::unix_timestamp()),
+            },
+            false,
+            window,
+            cx,
+        )?;
+        window.push_notification(Notification::success("当前连接已收藏"), cx);
+        Ok(())
+    }
+
+    fn set_profile_pinned(
+        &mut self,
+        mut profile: SavedProfile,
+        pinned: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        profile.pinned = pinned;
+        self.commit_profile(profile, true, window, cx)
+    }
+
+    fn confirm_remove_profile(
+        &mut self,
+        profile: SavedProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let toolbar = cx.entity().downgrade();
+        let title = profile.title();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let profile = profile.clone();
+            let toolbar = toolbar.clone();
+            dialog
+                .title("删除收藏")
+                .w(px(440.))
+                .overlay_closable(false)
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(SharedString::from(format!("确定删除“{title}”吗？")))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(_cx.theme().muted_foreground)
+                                .child("同时删除系统凭据库中的密码。此操作不可撤销。"),
+                        ),
+                )
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("remove-profile-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("remove-profile-confirm")
+                                .danger()
+                                .label("删除收藏和密码")
+                                .on_click(move |_, window, cx| {
+                                    let result = toolbar.update(cx, |toolbar, cx| {
+                                        let mut profiles = toolbar.profiles.clone();
+                                        let Some(removed) = store::remove_profile(
+                                            &mut profiles,
+                                            &profile.username,
+                                            &profile.host,
+                                        ) else {
+                                            return Ok(());
+                                        };
+                                        store::save_profiles(&profiles)?;
+                                        if matches!(removed.auth, SavedAuth::Password) {
+                                            store::forget_password(&profile_config(&removed));
+                                        }
+                                        toolbar.profiles = profiles.clone();
+                                        cx.notify();
+                                        cx.emit(ToolbarEvent::ProfilesChanged(profiles));
+                                        Ok::<_, String>(())
+                                    });
+                                    match result {
+                                        Ok(Ok(())) => {
+                                            window.push_notification(
+                                                Notification::success("收藏及其密码已删除"),
+                                                cx,
+                                            );
+                                            window.close_dialog(cx);
+                                        }
+                                        Ok(Err(message)) => window
+                                            .push_notification(Notification::error(message), cx),
+                                        Err(error) => window.push_notification(
+                                            Notification::error(format!("删除收藏失败：{error}")),
+                                            cx,
+                                        ),
+                                    }
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn open_profile_editor(
+        &mut self,
+        profile: SavedProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = cx.new(|cx| {
+            InputState::new(window, cx).default_value(profile.name.clone().unwrap_or_default())
+        });
+        let port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(profile.port.to_string())
+                .placeholder("1–65535")
+        });
+        let use_key = cx.new(|_| matches!(profile.auth, SavedAuth::Key { .. }));
+        let error = cx.new(|_| Option::<SharedString>::None);
+        let toolbar = cx.entity().downgrade();
+        let focus_on_mount = Rc::new(Cell::new(true));
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let name = name.clone();
+            let port = port.clone();
+            let use_key = use_key.clone();
+            let error = error.clone();
+            let profile = profile.clone();
+            let toolbar = toolbar.clone();
+            let focus_on_mount = focus_on_mount.clone();
+            let selected_auth = usize::from(*use_key.read(cx));
+            let auth_use_key = use_key.clone();
+            let auth_error = error.clone();
+            let save_use_key = use_key.clone();
+            let save_error = error.clone();
+
+            if focus_on_mount.replace(false) {
+                let name = name.clone();
+                window.defer(cx, move |window, cx| {
+                    name.focus_handle(cx).focus(window, cx);
+                });
+            }
+
+            dialog
+                .title("编辑收藏")
+                .w(px(480.))
+                .close_button(false)
+                .overlay_closable(false)
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(SharedString::from(profile.endpoint_label())),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().child("名称（可选）"))
+                                .child(Input::new(&name).w_full()),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().child("端口"))
+                                .child(Input::new(&port).w_full()),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().child("认证方式"))
+                                .child(
+                                    RadioGroup::horizontal("profile-auth")
+                                        .selected_index(Some(selected_auth))
+                                        .on_click(move |index, _, cx| {
+                                            auth_use_key.update(cx, |use_key, cx| {
+                                                *use_key = *index == 1;
+                                                cx.notify();
+                                            });
+                                            auth_error.update(cx, |error, cx| {
+                                                *error = None;
+                                                cx.notify();
+                                            });
+                                        })
+                                        .child(Radio::new("profile-auth-password").label("密码"))
+                                        .child(Radio::new("profile-auth-key").label("私钥")),
+                                ),
+                        )
+                        .when_some(error.read(cx).clone(), |this, message| {
+                            this.child(div().text_xs().text_color(cx.theme().danger).child(message))
+                        }),
+                )
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("profile-edit-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("profile-edit-save")
+                                .primary()
+                                .label("保存")
+                                .on_click(move |_, window, cx| {
+                                    let port_value = port.read(cx).value().trim().parse::<u16>();
+                                    let Ok(port_value) = port_value else {
+                                        save_error.update(cx, |error, cx| {
+                                            *error = Some("端口必须是 1–65535 之间的整数".into());
+                                            cx.notify();
+                                        });
+                                        return;
+                                    };
+                                    if port_value == 0 {
+                                        save_error.update(cx, |error, cx| {
+                                            *error = Some("端口必须是 1–65535 之间的整数".into());
+                                            cx.notify();
+                                        });
+                                        return;
+                                    }
+                                    let mut edited = profile.clone();
+                                    edited.name = match name.read(cx).value().trim() {
+                                        "" => None,
+                                        value => Some(value.to_string()),
+                                    };
+                                    edited.port = port_value;
+                                    edited.auth = if *save_use_key.read(cx) {
+                                        match &profile.auth {
+                                            SavedAuth::Key { path } => {
+                                                SavedAuth::Key { path: path.clone() }
+                                            }
+                                            SavedAuth::Password => SavedAuth::Key {
+                                                path: String::new(),
+                                            },
+                                        }
+                                    } else {
+                                        SavedAuth::Password
+                                    };
+                                    match toolbar.update(cx, |toolbar, cx| {
+                                        toolbar.commit_profile(edited, true, window, cx)
+                                    }) {
+                                        Ok(Ok(())) => {
+                                            window.push_notification(
+                                                Notification::success("收藏已保存"),
+                                                cx,
+                                            );
+                                            window.close_dialog(cx);
+                                        }
+                                        Ok(Err(message)) => save_error.update(cx, |error, cx| {
+                                            *error = Some(message.into());
+                                            cx.notify();
+                                        }),
+                                        Err(update_error) => save_error.update(cx, |error, cx| {
+                                            *error = Some(
+                                                format!("保存收藏失败：{update_error}").into(),
+                                            );
+                                            cx.notify();
+                                        }),
+                                    }
+                                }),
+                        ),
+                )
+        });
     }
 
     /// 直接把一组凭证填进表单（演示模式用），不读也不写系统凭据库。
@@ -543,7 +880,8 @@ impl Toolbar {
         let connecting = self.state == SessionState::Connecting;
         let form_locked = connected || connecting;
         let use_key = self.use_key;
-        let profiles = self.profiles.clone();
+        let mut profiles = self.profiles.clone();
+        store::sort_profiles_for_display(&mut profiles);
         let discovered_devices = self.discovered_devices.clone();
         let discovered_count = discovered_devices.len();
         let toolbar = cx.entity().downgrade();
@@ -645,7 +983,8 @@ impl Toolbar {
                     .dropdown_menu(move |menu, _window, _cx| {
                         if profiles.is_empty() {
                             return menu.min_w(px(180.)).item(
-                                PopupMenuItem::new("暂无收藏，连接成功后会自动添加").disabled(true),
+                                PopupMenuItem::new("暂无收藏，连接后可点旁边按钮收藏")
+                                    .disabled(true),
                             );
                         }
 
@@ -654,22 +993,24 @@ impl Toolbar {
                             |menu, (index, profile)| {
                                 let profile = profile.clone();
                                 let item_toolbar = toolbar.clone();
-                                let delete_profile = profile.clone();
-                                let delete_toolbar = toolbar.clone();
+                                let action_profile = profile.clone();
+                                let action_toolbar = toolbar.clone();
                                 let icon = match profile.auth {
                                     SavedAuth::Password => IconName::Lock,
                                     SavedAuth::Key { .. } => IconName::KeyRound,
                                 };
-                                let label = format!(
-                                    "{}@{}:{}",
-                                    profile.username, profile.host, profile.port
-                                );
-                                let delete_label = format!("删除收藏 {label}");
+                                let title = profile.title();
+                                let endpoint = profile.endpoint_label();
+                                let pinned = profile.pinned;
 
                                 menu.item(
-                                    PopupMenuItem::element(move |_, _| {
-                                        let delete_profile = delete_profile.clone();
-                                        let delete_toolbar = delete_toolbar.clone();
+                                    PopupMenuItem::element(move |_, _cx| {
+                                        let pin_profile = action_profile.clone();
+                                        let pin_toolbar = action_toolbar.clone();
+                                        let edit_profile = action_profile.clone();
+                                        let edit_toolbar = action_toolbar.clone();
+                                        let delete_profile = action_profile.clone();
+                                        let delete_toolbar = action_toolbar.clone();
                                         h_flex()
                                             .group("favorite-row")
                                             .flex_1()
@@ -677,45 +1018,151 @@ impl Toolbar {
                                             .justify_between()
                                             .gap_2()
                                             .child(
-                                                div()
+                                                v_flex()
                                                     .flex_1()
                                                     .min_w_0()
-                                                    .whitespace_nowrap()
-                                                    .text_ellipsis()
-                                                    .child(SharedString::from(label.clone())),
+                                                    .gap_0p5()
+                                                    .child(
+                                                        div()
+                                                            .whitespace_nowrap()
+                                                            .text_ellipsis()
+                                                            .child(SharedString::from(
+                                                                title.clone(),
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(
+                                                                _cx.theme().muted_foreground,
+                                                            )
+                                                            .whitespace_nowrap()
+                                                            .text_ellipsis()
+                                                            .child(SharedString::from(
+                                                                endpoint.clone(),
+                                                            )),
+                                                    ),
                                             )
                                             .child(
-                                                Button::new(format!("delete-favorite-{index}"))
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .icon(IconName::X)
-                                                    .invisible()
-                                                    .group_hover("favorite-row", |this| {
-                                                        this.visible()
-                                                    })
-                                                    .focus(|this| this.visible())
-                                                    .accessibility_label(delete_label.clone())
-                                                    .tooltip("删除收藏")
-                                                    .on_click(move |_, window, cx| {
-                                                        cx.stop_propagation();
-                                                        let result = delete_toolbar.update(
-                                                            cx,
-                                                            |toolbar, cx| {
-                                                                toolbar.remove_profile(
-                                                                    &delete_profile,
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        );
-                                                        if let Ok(Err(message)) = result {
-                                                            window.push_notification(
-                                                                Notification::error(message),
+                                                h_flex()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        Button::new(format!(
+                                                            "pin-favorite-{index}"
+                                                        ))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .icon(if pinned {
+                                                            IconName::PinOff
+                                                        } else {
+                                                            IconName::Pin
+                                                        })
+                                                        .when(!pinned, |this| {
+                                                            this.invisible().group_hover(
+                                                                "favorite-row",
+                                                                |this| this.visible(),
+                                                            )
+                                                        })
+                                                        .focus(|this| this.visible())
+                                                        .accessibility_label(if pinned {
+                                                            "取消置顶收藏"
+                                                        } else {
+                                                            "置顶收藏"
+                                                        })
+                                                        .tooltip(if pinned {
+                                                            "取消置顶"
+                                                        } else {
+                                                            "置顶"
+                                                        })
+                                                        .on_click(move |_, window, cx| {
+                                                            cx.stop_propagation();
+                                                            window.dispatch_action(
+                                                                Box::new(Cancel),
                                                                 cx,
                                                             );
-                                                        }
-                                                        window
-                                                            .dispatch_action(Box::new(Cancel), cx);
-                                                    }),
+                                                            let result = pin_toolbar.update(
+                                                                cx,
+                                                                |toolbar, cx| {
+                                                                    toolbar.set_profile_pinned(
+                                                                        pin_profile.clone(),
+                                                                        !pinned,
+                                                                        window,
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            );
+                                                            if let Ok(Err(message)) = result {
+                                                                window.push_notification(
+                                                                    Notification::error(message),
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        Button::new(format!(
+                                                            "edit-favorite-{index}"
+                                                        ))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .icon(IconName::Pencil)
+                                                        .invisible()
+                                                        .group_hover("favorite-row", |this| {
+                                                            this.visible()
+                                                        })
+                                                        .focus(|this| this.visible())
+                                                        .accessibility_label("编辑收藏")
+                                                        .tooltip("编辑收藏")
+                                                        .on_click(move |_, window, cx| {
+                                                            cx.stop_propagation();
+                                                            window.dispatch_action(
+                                                                Box::new(Cancel),
+                                                                cx,
+                                                            );
+                                                            let _ = edit_toolbar.update(
+                                                                cx,
+                                                                |toolbar, cx| {
+                                                                    toolbar.open_profile_editor(
+                                                                        edit_profile.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            );
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        Button::new(format!(
+                                                            "delete-favorite-{index}"
+                                                        ))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .icon(IconName::Trash)
+                                                        .invisible()
+                                                        .group_hover("favorite-row", |this| {
+                                                            this.visible()
+                                                        })
+                                                        .focus(|this| this.visible())
+                                                        .accessibility_label("删除收藏")
+                                                        .tooltip("删除收藏")
+                                                        .on_click(move |_, window, cx| {
+                                                            cx.stop_propagation();
+                                                            window.dispatch_action(
+                                                                Box::new(Cancel),
+                                                                cx,
+                                                            );
+                                                            let _ = delete_toolbar.update(
+                                                                cx,
+                                                                |toolbar, cx| {
+                                                                    toolbar.confirm_remove_profile(
+                                                                        delete_profile.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            );
+                                                        }),
+                                                    ),
                                             )
                                     })
                                     .icon(icon)
@@ -731,6 +1178,24 @@ impl Toolbar {
                             },
                         )
                     }),
+            )
+            .child(
+                Button::new("favorite-current")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::BookmarkPlus)
+                    .accessibility_label("收藏当前连接")
+                    .tooltip(if connected {
+                        "收藏当前连接（不保存密码）"
+                    } else {
+                        "连接后可收藏"
+                    })
+                    .disabled(!connected)
+                    .on_click(cx.listener(|toolbar, _, window, cx| {
+                        if let Err(message) = toolbar.favorite_current(window, cx) {
+                            window.push_notification(Notification::error(message), cx);
+                        }
+                    })),
             )
             .child(
                 Button::new("discovered-devices")
@@ -869,17 +1334,16 @@ impl Toolbar {
                                 IconName::LockOpen
                             })
                             .accessibility_label(if self.remember {
-                                "关闭连接信息记忆"
+                                "关闭密码记忆"
                             } else {
-                                "记住连接信息"
+                                "记住密码"
                             })
                             .tooltip(match (use_key, self.remember) {
-                                (true, true) => "记住这台主机（私钥路径会保存，口令不会）",
-                                (true, false) => "不保存连接信息",
+                                (true, _) => "私钥口令不会保存；连接可用收藏按钮单独保存",
                                 (false, true) => PASSWORD_STORE_TOOLTIP,
                                 (false, false) => "不保存密码",
                             })
-                            .disabled(form_locked)
+                            .disabled(form_locked || use_key)
                             .on_click(cx.listener(|toolbar, _, _, cx| {
                                 toolbar.remember = !toolbar.remember;
                                 cx.notify();

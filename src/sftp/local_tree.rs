@@ -14,7 +14,77 @@
 //! * **空目录也记下来**。远端该建的目录一个都不能少，否则 `rsync` 之类
 //!   依赖目录结构的工具会莫名其妙地失败。
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+/// 上传根目录内逐层生效的 `.gitignore` 规则；匹配器按目录懒加载并共享缓存。
+#[derive(Clone)]
+pub struct IgnoreRules {
+    root: PathBuf,
+    matchers: Arc<Mutex<HashMap<PathBuf, Option<Gitignore>>>>,
+}
+
+impl IgnoreRules {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            matchers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn is_ignored(&self, relative: &Path, is_dir: bool) -> bool {
+        let candidate = self.root.join(relative);
+        let mut directories = vec![PathBuf::new()];
+        let mut current = PathBuf::new();
+        if let Some(parent) = relative.parent() {
+            for component in parent.components() {
+                current.push(component.as_os_str());
+                directories.push(current.clone());
+            }
+        }
+
+        let mut ignored = false;
+        let mut matchers = self
+            .matchers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for directory in directories {
+            let matcher = matchers.entry(directory.clone()).or_insert_with(|| {
+                let base = self.root.join(&directory);
+                let path = base.join(".gitignore");
+                if !path.is_file() {
+                    return None;
+                }
+                let mut builder = GitignoreBuilder::new(&base);
+                if let Some(err) = builder.add(&path) {
+                    log::warn!("读取 .gitignore {} 时忽略了无效规则：{err}", path.display());
+                }
+                match builder.build() {
+                    Ok(matcher) => Some(matcher),
+                    Err(err) => {
+                        log::warn!("无法应用 .gitignore {}：{err}", path.display());
+                        None
+                    }
+                }
+            });
+            let Some(matcher) = matcher else {
+                continue;
+            };
+            let matched = matcher.matched(&candidate, is_dir);
+            if matched.is_ignore() {
+                ignored = true;
+            } else if matched.is_whitelist() {
+                ignored = false;
+            }
+        }
+        ignored
+    }
+}
 
 /// 一个待上传的文件。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,11 +137,12 @@ pub struct LocalDirectory {
 #[cfg(test)]
 pub fn scan(root: &Path) -> Result<LocalTree, String> {
     let mut tree = LocalTree::default();
+    let ignore_rules = IgnoreRules::new(root);
     // 显式栈而不是递归：几十层深的 node_modules 不该把栈打穿。
     let mut pending: Vec<PathBuf> = vec![PathBuf::new()];
 
     while let Some(relative) = pending.pop() {
-        let directory = match scan_directory(root, &relative) {
+        let directory = match scan_directory(root, &relative, &ignore_rules) {
             Ok(directory) => directory,
             Err(err) => {
                 if relative.as_os_str().is_empty() {
@@ -99,7 +170,11 @@ pub fn scan(root: &Path) -> Result<LocalTree, String> {
 }
 
 /// 扫描 `root/relative` 的直接子项，不递归。
-pub fn scan_directory(root: &Path, relative: &Path) -> Result<LocalDirectory, String> {
+pub fn scan_directory(
+    root: &Path,
+    relative: &Path,
+    ignore_rules: &IgnoreRules,
+) -> Result<LocalDirectory, String> {
     let dir = if relative.as_os_str().is_empty() {
         root.to_path_buf()
     } else {
@@ -136,6 +211,9 @@ pub fn scan_directory(root: &Path, relative: &Path) -> Result<LocalDirectory, St
             directory.skipped += 1;
             continue;
         };
+        if ignore_rules.is_ignored(&child_relative, file_type.is_dir()) {
+            continue;
+        }
 
         if file_type.is_symlink() {
             match std::fs::read_link(&path) {
@@ -207,7 +285,7 @@ mod tests {
 
     /// 每个用例一个独立的临时目录，避免并行时互相踩。
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("macscp-tree-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blip-tree-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时目录");
         dir
@@ -320,6 +398,38 @@ mod tests {
             .collect();
         assert!(names.contains(&".env".to_string()), "隐藏文件不能被过滤");
         assert!(names.contains(&"app.rs".to_string()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_applies_root_and_nested_gitignore_rules() {
+        let root = scratch("gitignore");
+        write(
+            &root.join(".gitignore"),
+            b"target/\n*.tmp\n*.log\n!keep.tmp\n",
+        );
+        write(&root.join("target/generated.bin"), b"generated");
+        write(&root.join("drop.tmp"), b"drop");
+        write(&root.join("keep.tmp"), b"keep");
+        write(&root.join("sub/.gitignore"), b"!keep.log\n");
+        write(&root.join("sub/drop.log"), b"drop");
+        write(&root.join("sub/keep.log"), b"keep");
+
+        let tree = scan(&root).expect("扫描应成功");
+        let names: Vec<String> = tree
+            .files
+            .iter()
+            .map(|file| relative_to_posix(&file.relative))
+            .collect();
+
+        assert!(!names.iter().any(|name| name.starts_with("target/")));
+        assert!(!names.contains(&"drop.tmp".to_string()));
+        assert!(!names.contains(&"sub/drop.log".to_string()));
+        assert!(names.contains(&"keep.tmp".to_string()));
+        assert!(names.contains(&"sub/keep.log".to_string()));
+        assert!(names.contains(&".gitignore".to_string()));
+        assert!(names.contains(&"sub/.gitignore".to_string()));
 
         let _ = std::fs::remove_dir_all(&root);
     }

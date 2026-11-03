@@ -485,20 +485,20 @@ impl Workspace {
                 };
                 self.toast(window, cx, Notification::success(message));
 
-                // 演示模式：`MACSCP_DEMO_UPLOAD=1` 时自动上传一个与远端同名的文件，
+                // 演示模式：`BLIP_DEMO_UPLOAD=1` 时自动上传一个与远端同名的文件，
                 // 用来手工验证「上传冲突」弹窗 —— 那个弹窗平时点不出来。
                 #[cfg(feature = "demo-server")]
-                if std::env::var_os("MACSCP_DEMO_UPLOAD").is_some() {
+                if std::env::var_os("BLIP_DEMO_UPLOAD").is_some() {
                     let path = std::env::temp_dir().join("notes.md");
                     if std::fs::write(&path, b"# demo upload\n").is_ok() {
                         self.upload_paths(vec![path], window, cx);
                     }
                 }
 
-                // `MACSCP_DEMO_FOLDER=1` 时自动传一棵小目录树：不用点右键也能
+                // `BLIP_DEMO_FOLDER=1` 时自动传一棵小目录树：不用点右键也能
                 // 看到「整目录上传」在队列里只有一行、远端多出一棵完整的树。
                 #[cfg(feature = "demo-server")]
-                if std::env::var_os("MACSCP_DEMO_FOLDER").is_some() {
+                if std::env::var_os("BLIP_DEMO_FOLDER").is_some() {
                     match demo_tree() {
                         Some(root) => self.start_folder_transfer(
                             FolderDirection::Upload,
@@ -510,11 +510,11 @@ impl Workspace {
                     }
                 }
 
-                // `MACSCP_DEMO_DOWNLOAD_FOLDER=1`：直接弹出「整目录下载」确认框。
-                // 远端那棵树由演示服务器预置（配 `MACSCP_DEMO_PKG=1`），
+                // `BLIP_DEMO_DOWNLOAD_FOLDER=1`：直接弹出「整目录下载」确认框。
+                // 远端那棵树由演示服务器预置（配 `BLIP_DEMO_PKG=1`），
                 // 点「覆盖同名文件」就能看到整棵树落到本地。
                 #[cfg(feature = "demo-server")]
-                if std::env::var_os("MACSCP_DEMO_DOWNLOAD_FOLDER").is_some() {
+                if std::env::var_os("BLIP_DEMO_DOWNLOAD_FOLDER").is_some() {
                     self.demo_local_dir(cx);
                     self.confirm_folder_transfer(
                         FolderDirection::Download,
@@ -524,10 +524,10 @@ impl Workspace {
                     );
                 }
 
-                // `MACSCP_DEMO_DOWNLOAD_GO=1`：跳过确认框直接开传，用来截「队列里
+                // `BLIP_DEMO_DOWNLOAD_GO=1`：跳过确认框直接开传，用来截「队列里
                 // 只有一行、本地多出一棵完整的树」—— 那种状态没法靠点鼠标复现。
                 #[cfg(feature = "demo-server")]
-                if std::env::var_os("MACSCP_DEMO_DOWNLOAD_GO").is_some() {
+                if std::env::var_os("BLIP_DEMO_DOWNLOAD_GO").is_some() {
                     self.demo_local_dir(cx);
                     self.start_folder_transfer(
                         FolderDirection::Download,
@@ -612,6 +612,16 @@ impl Workspace {
             } => {
                 self.transfers.update(cx, |queue, cx| {
                     queue.progress(id, transferred, total, speed, cx)
+                });
+            }
+
+            SftpEvent::TransferFileProgress {
+                id,
+                completed,
+                total,
+            } => {
+                self.transfers.update(cx, |queue, cx| {
+                    queue.file_progress(id, completed, total, cx)
                 });
             }
 
@@ -1178,11 +1188,11 @@ impl Workspace {
     /// 演示下载前把本地面板切到临时目录。
     ///
     /// 本地面板默认停在 `$HOME` —— 演示时整棵 `demo-pkg/` 会落进去，那是在
-    /// 用户的真实家目录里写东西。切到 `$TMPDIR/macscp-demo-download` 后
+    /// 用户的真实家目录里写东西。切到 `$TMPDIR/blip-demo-download` 后
     /// 随便点、随便覆盖，退出后系统自己会清。
     #[cfg(feature = "demo-server")]
     fn demo_local_dir(&mut self, cx: &mut Context<Self>) {
-        let dir = std::env::temp_dir().join("macscp-demo-download");
+        let dir = std::env::temp_dir().join("blip-demo-download");
         if let Err(err) = std::fs::create_dir_all(&dir) {
             log::warn!("演示下载目录创建失败：{err}");
             return;
@@ -1230,7 +1240,7 @@ impl Workspace {
             let overwrite = (weak.clone(), targets.clone());
             let theme = theme.clone();
 
-            // 默认 448px 装不下 `…/T/macscp-demo-download/demo-pkg` 这种长路径，
+            // 默认 448px 装不下 `…/T/blip-demo-download/demo-pkg` 这种长路径，
             // 会折成三四段；加宽一点，路径基本能一行放下。
             dialog
                 .title(title)
@@ -2431,7 +2441,7 @@ fn external_edit_cache_path(id: u64, name: &str) -> Result<PathBuf, String> {
         .unwrap_or_else(|| std::ffi::OsStr::new("remote-file"));
     let dir = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("macscp")
+        .join("blip")
         .join("external-edits")
         .join(format!("{}-{id}", std::process::id()));
     std::fs::create_dir_all(&dir)
@@ -2548,10 +2558,10 @@ impl Render for Workspace {
 
 /// 演示模式用的本地目录树：`dist/{a.txt, sub/b.txt, sub/deep/c.bin, empty/}`。
 ///
-/// 只给 `MACSCP_DEMO_FOLDER` 用，返回 None 表示准备失败（不 panic）。
+/// 只给 `BLIP_DEMO_FOLDER` 用，返回 None 表示准备失败（不 panic）。
 #[cfg(feature = "demo-server")]
 fn demo_tree() -> Option<PathBuf> {
-    let root = std::env::temp_dir().join("macscp-demo-dist");
+    let root = std::env::temp_dir().join("blip-demo-dist");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("sub/deep")).ok()?;
     std::fs::create_dir_all(root.join("empty")).ok()?;
@@ -2690,7 +2700,7 @@ mod tests {
 
     #[test]
     fn split_dropped_separates_files_and_directories() {
-        let root = std::env::temp_dir().join(format!("macscp-drop-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("blip-drop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sub")).expect("建临时目录");
         let file = root.join("a.txt");

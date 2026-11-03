@@ -52,6 +52,8 @@ pub struct TransferItem {
     streaming_total: bool,
     /// 整目录并发上传时，当前真正写入远端的文件（最多为并发数）。
     active_files: Vec<String>,
+    completed_files: usize,
+    total_files: usize,
 }
 
 impl TransferItem {
@@ -147,6 +149,8 @@ impl TransferQueue {
             resumed_from: 0,
             streaming_total: false,
             active_files: Vec::new(),
+            completed_files: 0,
+            total_files: 0,
         });
         self.active += 1;
         self.update_idle_sleep_prevention(cx);
@@ -176,6 +180,20 @@ impl TransferQueue {
     pub fn active_files(&mut self, id: TransferId, files: Vec<String>, cx: &mut Context<Self>) {
         if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
             item.active_files = files;
+            cx.notify();
+        }
+    }
+
+    pub fn file_progress(
+        &mut self,
+        id: TransferId,
+        completed: usize,
+        total: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+            item.completed_files = completed;
+            item.total_files = total;
             cx.notify();
         }
     }
@@ -382,6 +400,12 @@ impl TransferQueue {
         };
         if let Some(active_summary) = active_summary {
             status_text = format!("{active_summary} · {status_text}");
+        }
+        if item.total_files > 0 {
+            status_text = format!(
+                "{}/{} 个文件 · {status_text}",
+                item.completed_files, item.total_files
+            );
         }
         let status_tooltip = if item.active_files.is_empty() {
             status_text.clone()

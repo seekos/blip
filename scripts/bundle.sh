@@ -113,7 +113,7 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>
     <string>blip</string>
     <key>CFBundleIdentifier</key>
-    <string>com.macscp.app</string>
+    <string>com.amov.Blip</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

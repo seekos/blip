@@ -3,7 +3,7 @@
 //! 结构是经典的 actor 模型：
 //!
 //! ```text
-//!   GPUI 主线程                       专用线程 macscp-sftp
+//!   GPUI 主线程                       专用线程 blip-sftp
 //!  ┌──────────┐   SftpCommand    ┌────────────────────────────────┐
 //!  │ ScpApp   │ ───────────────▶ │ tokio Runtime (multi_thread)   │
 //!  │          │ ◀─────────────── │  ├─ 命令循环（串行）            │
@@ -24,7 +24,7 @@ use std::thread;
 use std::time::Duration;
 
 use log::{debug, error, info, warn};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use super::path_lock::{PathLocks, local_key, remote_key};
 use super::session::{
@@ -83,6 +83,98 @@ struct ReconnectTarget {
     host_key_policy: HostKeyPolicy,
 }
 
+#[derive(Clone)]
+struct UploadSessionSnapshot {
+    generation: u64,
+    sftp: Arc<russh_sftp::client::SftpSession>,
+    transfer_pool: TransferPool,
+}
+
+#[derive(Default)]
+struct UploadSessionState {
+    generation: u64,
+    current: Option<UploadSessionSnapshot>,
+}
+
+#[derive(Clone, Default)]
+struct UploadSessions {
+    state: Arc<Mutex<UploadSessionState>>,
+    changed: Arc<Notify>,
+    reconnect_requested: Arc<AtomicBool>,
+}
+
+impl UploadSessions {
+    fn publish(&self, active: &ActiveSession) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.generation = state.generation.wrapping_add(1);
+        state.current = Some(UploadSessionSnapshot {
+            generation: state.generation,
+            sftp: active.sftp.clone(),
+            transfer_pool: active.transfer_pool.clone(),
+        });
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn clear(&self) {
+        self.reconnect_requested.store(false, Ordering::Relaxed);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.generation = state.generation.wrapping_add(1);
+        state.current = None;
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn current(&self) -> Option<UploadSessionSnapshot> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current
+            .clone()
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current
+            .as_ref()
+            .is_some_and(|current| current.generation == generation)
+    }
+
+    async fn wait_after(
+        &self,
+        generation: u64,
+        cancel: &AtomicBool,
+    ) -> Option<UploadSessionSnapshot> {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(current) = self.current()
+                && current.generation != generation
+            {
+                return Some(current);
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(200), self.changed.notified()).await;
+        }
+    }
+
+    fn request_reconnect(&self) {
+        self.reconnect_requested.store(true, Ordering::Relaxed);
+    }
+
+    fn take_reconnect_request(&self) -> bool {
+        self.reconnect_requested.swap(false, Ordering::Relaxed)
+    }
+}
+
 /// 单条指令的最长等待时间。超时后按失败处理，避免界面无限转圈。
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
@@ -106,7 +198,7 @@ impl SftpWorker {
         // 线程起不来时还要用这个 sender 报错，所以先克隆一份。
         let failure_tx = event_tx.clone();
         let spawned = thread::Builder::new()
-            .name("macscp-sftp".to_string())
+            .name("blip-sftp".to_string())
             .spawn(move || worker_main(command_rx, event_tx));
 
         let thread = match spawned {
@@ -160,7 +252,7 @@ fn worker_main(commands: flume::Receiver<SftpCommand>, events: flume::Sender<Sft
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         // 多条 SSH 连接会并行做加密和网络 I/O，四条 runtime 线程避免互相饿死。
         .worker_threads(4)
-        .thread_name("macscp-tokio")
+        .thread_name("blip-tokio")
         .enable_all()
         .build()
     {
@@ -192,77 +284,78 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
     let mut connection_cancel = Arc::new(AtomicBool::new(false));
     let mut pending_host: Option<PendingHostTrust> = None;
     let mut transfer_pool_status: Option<TransferPoolStatus> = None;
+    let upload_sessions = UploadSessions::default();
     // 「对后续冲突执行相同操作」的选择，本次连接内有效。
     let mut upload_policy: Option<UploadDecision> = None;
 
     loop {
-        let command = match tokio::time::timeout(CONNECTION_HEALTH_INTERVAL, commands.recv_async())
-            .await
-        {
-            Ok(Ok(command)) => command,
-            Ok(Err(_)) => break,
-            Err(_) => {
-                if session
-                    .as_ref()
-                    .is_some_and(|active| active.handle.is_closed())
-                {
-                    info!("SFTP 连接已中断，开始自动重连");
-                    connection_cancel.store(true, Ordering::Relaxed);
-                    cancel_all(&cancels);
-                    cancel_pending_uploads(&pending, &cancels, &events);
-                    session = None;
-                    transfer_pool_status = None;
-                    pending_host = None;
-                    upload_policy = None;
-                    next_reconnect = tokio::time::Instant::now();
-                    let _ = events.send(SftpEvent::Reconnecting);
-                }
+        let command =
+            match tokio::time::timeout(CONNECTION_HEALTH_INTERVAL, commands.recv_async()).await {
+                Ok(Ok(command)) => command,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    let upload_requested_reconnect = upload_sessions.take_reconnect_request();
+                    if session.as_ref().is_some_and(|active| {
+                        active.handle.is_closed() || upload_requested_reconnect
+                    }) {
+                        info!("SFTP 连接已中断，开始自动重连");
+                        connection_cancel.store(true, Ordering::Relaxed);
+                        upload_sessions.clear();
+                        session = None;
+                        transfer_pool_status = None;
+                        pending_host = None;
+                        upload_policy = None;
+                        next_reconnect = tokio::time::Instant::now();
+                        let _ = events.send(SftpEvent::Reconnecting);
+                    }
 
-                if session.is_none()
-                    && pending_host.is_none()
-                    && tokio::time::Instant::now() >= next_reconnect
-                    && let Some(target) = reconnect_target.clone()
-                {
-                    match session::connect(&target.config, target.host_key_policy.clone()).await {
-                        Ok(active) => {
-                            let home = active.home.clone();
-                            let pool_status = active.transfer_pool.status();
-                            info!("已自动重连 {}，登录目录 {home}", target.config.endpoint());
-                            connection_cancel = Arc::new(AtomicBool::new(false));
-                            session = Some(active);
-                            transfer_pool_status = Some(pool_status.clone());
-                            let _ = events.send(SftpEvent::Connected {
-                                home,
-                                upload_sources: pool_status.sources,
-                                upload_concurrency: pool_status.max_concurrency,
-                            });
-                        }
-                        Err(ConnectError::HostKey(challenge)) => {
-                            let prompt = HostKeyPrompt {
-                                endpoint: challenge.endpoint.clone(),
-                                algorithm: challenge.algorithm.clone(),
-                                fingerprint: challenge.fingerprint.clone(),
-                                changed_line: challenge.changed_line,
-                            };
-                            reconnect_target = None;
-                            pending_host = Some(PendingHostTrust {
-                                config: target.config,
-                                challenge: *challenge,
-                            });
-                            let _ = events.send(SftpEvent::HostKeyPrompt(prompt));
-                        }
-                        Err(err) => {
-                            warn!("自动重连失败：{err:#}");
-                            next_reconnect = tokio::time::Instant::now() + RECONNECT_DELAY;
+                    if session.is_none()
+                        && pending_host.is_none()
+                        && tokio::time::Instant::now() >= next_reconnect
+                        && let Some(target) = reconnect_target.clone()
+                    {
+                        match session::connect(&target.config, target.host_key_policy.clone()).await
+                        {
+                            Ok(active) => {
+                                let home = active.home.clone();
+                                let pool_status = active.transfer_pool.status();
+                                info!("已自动重连 {}，登录目录 {home}", target.config.endpoint());
+                                connection_cancel = Arc::new(AtomicBool::new(false));
+                                upload_sessions.publish(&active);
+                                session = Some(active);
+                                transfer_pool_status = Some(pool_status.clone());
+                                let _ = events.send(SftpEvent::Connected {
+                                    home,
+                                    upload_sources: pool_status.sources,
+                                    upload_concurrency: pool_status.max_concurrency,
+                                });
+                            }
+                            Err(ConnectError::HostKey(challenge)) => {
+                                let prompt = HostKeyPrompt {
+                                    endpoint: challenge.endpoint.clone(),
+                                    algorithm: challenge.algorithm.clone(),
+                                    fingerprint: challenge.fingerprint.clone(),
+                                    changed_line: challenge.changed_line,
+                                };
+                                reconnect_target = None;
+                                pending_host = Some(PendingHostTrust {
+                                    config: target.config,
+                                    challenge: *challenge,
+                                });
+                                let _ = events.send(SftpEvent::HostKeyPrompt(prompt));
+                            }
+                            Err(err) => {
+                                warn!("自动重连失败：{err:#}");
+                                next_reconnect = tokio::time::Instant::now() + RECONNECT_DELAY;
+                            }
                         }
                     }
+                    if let Some(active) = session.as_ref() {
+                        publish_transfer_pool_status(active, &mut transfer_pool_status, &events);
+                    }
+                    continue;
                 }
-                if let Some(active) = session.as_ref() {
-                    publish_transfer_pool_status(active, &mut transfer_pool_status, &events);
-                }
-                continue;
-            }
-        };
+            };
 
         match command {
             // ---------------------------------------------------------------
@@ -275,6 +368,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 connection_cancel = Arc::new(AtomicBool::new(false));
                 cancel_all(&cancels);
                 cancel_pending_uploads(&pending, &cancels, &events);
+                upload_sessions.clear();
                 session = None;
                 transfer_pool_status = None;
                 reconnect_target = None;
@@ -286,6 +380,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                         let home = active.home.clone();
                         let pool_status = active.transfer_pool.status();
                         info!("已连接 {}，登录目录 {home}", config.endpoint());
+                        upload_sessions.publish(&active);
                         session = Some(active);
                         transfer_pool_status = Some(pool_status.clone());
                         reconnect_target = Some(ReconnectTarget {
@@ -323,6 +418,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 connection_cancel.store(true, Ordering::Relaxed);
                 cancel_all(&cancels);
                 cancel_pending_uploads(&pending, &cancels, &events);
+                upload_sessions.clear();
                 session = None;
                 transfer_pool_status = None;
                 reconnect_target = None;
@@ -363,6 +459,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                         let pool_status = active.transfer_pool.status();
                         info!("已确认主机密钥，登录目录 {home}");
                         connection_cancel = Arc::new(AtomicBool::new(false));
+                        upload_sessions.publish(&active);
                         session = Some(active);
                         transfer_pool_status = Some(pool_status.clone());
                         reconnect_target = Some(ReconnectTarget {
@@ -502,10 +599,19 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let path_key = local_key(&local);
                 tokio::spawn(async move {
                     let _path_guard = locks.acquire([path_key]).await;
-                    let _slot = slots
-                        .acquire_owned()
-                        .await
-                        .expect("传输并发控制器不应被关闭");
+                    let _slot = match slots.acquire_owned().await {
+                        Ok(slot) => slot,
+                        Err(_) => {
+                            let _ = events.send(SftpEvent::TransferCompleted {
+                                id,
+                                outcome: TransferOutcome::Failed(
+                                    "传输并发控制器已关闭".to_string(),
+                                ),
+                            });
+                            unregister_cancel(&registry, id);
+                            return;
+                        }
+                    };
                     transfer::run_download(sftp, id, remote, local, total, resume, cancel, events)
                         .await;
                     unregister_cancel(&registry, id);
@@ -635,11 +741,11 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                         cancel,
                     },
                     decision,
-                    active.transfer_pool.clone(),
                     &cancels,
                     &events,
                     &path_locks,
                     &upload_slots,
+                    upload_sessions.clone(),
                 );
             }
 
@@ -649,7 +755,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 remote,
                 total,
             } => {
-                let Some(active) = session.as_ref() else {
+                let Some(_active) = session.as_ref() else {
                     let _ = events.send(SftpEvent::TransferCompleted {
                         id,
                         outcome: TransferOutcome::Failed("尚未连接到服务器".to_string()),
@@ -669,11 +775,11 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                         cancel,
                     },
                     UploadDecision::Overwrite,
-                    active.transfer_pool.clone(),
                     &cancels,
                     &events,
                     &path_locks,
                     &upload_slots,
+                    upload_sessions.clone(),
                 );
             }
 
@@ -707,10 +813,19 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let path_key = local_key(&local);
                 tokio::spawn(async move {
                     let _path_guard = locks.acquire([path_key]).await;
-                    let _slot = slots
-                        .acquire_owned()
-                        .await
-                        .expect("传输并发控制器不应被关闭");
+                    let _slot = match slots.acquire_owned().await {
+                        Ok(slot) => slot,
+                        Err(_) => {
+                            let _ = events.send(SftpEvent::TransferCompleted {
+                                id,
+                                outcome: TransferOutcome::Failed(
+                                    "传输并发控制器已关闭".to_string(),
+                                ),
+                            });
+                            unregister_cancel(&registry, id);
+                            return;
+                        }
+                    };
                     transfer::run_download_dir(
                         sftp,
                         id,
@@ -731,7 +846,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 remote,
                 on_existing,
             } => {
-                let Some(active) = session.as_ref() else {
+                let Some(_active) = session.as_ref() else {
                     let _ = events.send(SftpEvent::TransferCompleted {
                         id,
                         outcome: TransferOutcome::Failed("尚未连接到服务器".to_string()),
@@ -748,27 +863,59 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
                 register_cancel(&cancels, id, cancel.clone());
 
-                let sftp = active.sftp.clone();
-                let transfer_pool = active.transfer_pool.clone();
                 let registry = cancels.clone();
                 let events = events.clone();
                 let locks = path_locks.clone();
                 let slots = upload_slots.clone();
+                let sessions = upload_sessions.clone();
                 let path_key = remote_key(&remote);
                 tokio::spawn(async move {
                     let _path_guard = locks.acquire([path_key]).await;
-                    transfer::run_upload_dir_pooled(
-                        sftp,
-                        transfer_pool,
-                        slots,
-                        id,
-                        local,
-                        remote,
-                        on_existing,
-                        cancel,
-                        events,
-                    )
-                    .await;
+                    let Some(mut snapshot) = sessions.current() else {
+                        let _ = events.send(SftpEvent::TransferCompleted {
+                            id,
+                            outcome: TransferOutcome::Failed("尚未连接到服务器".to_string()),
+                        });
+                        unregister_cancel(&registry, id);
+                        return;
+                    };
+                    let mut resume_interrupted = false;
+                    let outcome = loop {
+                        let outcome = transfer::upload_dir_attempt(
+                            snapshot.sftp.clone(),
+                            snapshot.transfer_pool.clone(),
+                            slots.clone(),
+                            id,
+                            local.clone(),
+                            remote.clone(),
+                            on_existing,
+                            resume_interrupted,
+                            cancel.clone(),
+                            events.clone(),
+                        )
+                        .await;
+                        if cancel.load(Ordering::Relaxed)
+                            || matches!(
+                                &outcome,
+                                TransferOutcome::Completed
+                                    | TransferOutcome::Skipped
+                                    | TransferOutcome::Cancelled
+                            )
+                            || (sessions.is_current(snapshot.generation)
+                                && snapshot.transfer_pool.has_healthy_lane())
+                        {
+                            break outcome;
+                        }
+
+                        info!("目录上传 {remote} 等待重连后从断点继续");
+                        let Some(current) = sessions.wait_after(snapshot.generation, &cancel).await
+                        else {
+                            break TransferOutcome::Cancelled;
+                        };
+                        snapshot = current;
+                        resume_interrupted = true;
+                    };
+                    let _ = events.send(SftpEvent::TransferCompleted { id, outcome });
                     unregister_cancel(&registry, id);
                 });
             }
@@ -812,7 +959,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                     continue;
                 }
 
-                let Some(active) = session.as_ref() else {
+                let Some(_active) = session.as_ref() else {
                     for (task_id, _) in waiting {
                         unregister_cancel(&cancels, task_id);
                         let _ = events.send(SftpEvent::TransferCompleted {
@@ -837,11 +984,11 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                             task_id,
                             job,
                             decision,
-                            active.transfer_pool.clone(),
                             &cancels,
                             &events,
                             &path_locks,
                             &upload_slots,
+                            upload_sessions.clone(),
                         );
                     } else {
                         debug!("上传 {task_id} 被用户跳过");
@@ -1090,6 +1237,7 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 connection_cancel.store(true, Ordering::Relaxed);
                 cancel_all(&cancels);
                 cancel_pending_uploads(&pending, &cancels, &events);
+                upload_sessions.clear();
                 break;
             }
         }
@@ -1151,11 +1299,11 @@ fn spawn_upload(
     id: TransferId,
     job: PendingUpload,
     decision: UploadDecision,
-    transfer_pool: TransferPool,
     cancels: &CancelRegistry,
     events: &flume::Sender<SftpEvent>,
     path_locks: &Arc<PathLocks>,
     upload_slots: &TransferSlots,
+    upload_sessions: UploadSessions,
 ) {
     // 关掉续传时，「断点续传」等价于「从头覆盖」。
     let decision = if job.resume || decision != UploadDecision::Resume {
@@ -1172,16 +1320,80 @@ fn spawn_upload(
     let path_key = remote_key(&job.remote);
     tokio::spawn(async move {
         let _path_guard = locks.acquire([path_key]).await;
-        let _slot = slots
-            .acquire_owned()
-            .await
-            .expect("传输并发控制器不应被关闭");
-        let lane = transfer_pool.acquire().await;
-        let sftp = lane.sftp();
-        transfer::run_upload(
-            sftp, id, job.local, job.remote, job.total, decision, cancel, events,
-        )
-        .await;
+        let _slot = match slots.acquire_owned().await {
+            Ok(slot) => slot,
+            Err(_) => {
+                let _ = events.send(SftpEvent::TransferCompleted {
+                    id,
+                    outcome: TransferOutcome::Failed("传输并发控制器已关闭".to_string()),
+                });
+                unregister_cancel(&registry, id);
+                return;
+            }
+        };
+        let Some(mut snapshot) = upload_sessions.current() else {
+            let _ = events.send(SftpEvent::TransferCompleted {
+                id,
+                outcome: TransferOutcome::Failed("尚未连接到服务器".to_string()),
+            });
+            unregister_cancel(&registry, id);
+            return;
+        };
+        let mut next_decision = decision;
+        let mut forced_reconnect = false;
+        let outcome = loop {
+            let lane = snapshot.transfer_pool.acquire().await;
+            let sftp = lane.sftp();
+            let result = transfer::upload_attempt(
+                &sftp,
+                id,
+                &job.local,
+                &job.remote,
+                job.total,
+                next_decision,
+                &cancel,
+                &events,
+            )
+            .await;
+            let lane_healthy = lane.is_healthy();
+            drop(lane);
+
+            match result {
+                Ok(()) => break TransferOutcome::Completed,
+                Err(_) if cancel.load(Ordering::Relaxed) => {
+                    break TransferOutcome::Cancelled;
+                }
+                Err(error) if !upload_sessions.is_current(snapshot.generation) || !lane_healthy => {
+                    info!("上传 {} 因 {error:#} 等待重连后从断点继续", job.remote);
+                    let Some(current) = upload_sessions
+                        .wait_after(snapshot.generation, &cancel)
+                        .await
+                    else {
+                        break TransferOutcome::Cancelled;
+                    };
+                    snapshot = current;
+                    next_decision = UploadDecision::Resume;
+                }
+                Err(error) if transfer::is_retryable_upload_error(&error) && !forced_reconnect => {
+                    warn!(
+                        "上传 {} 的 SFTP 通道已失效，申请自动重连：{error:#}",
+                        job.remote
+                    );
+                    forced_reconnect = true;
+                    upload_sessions.request_reconnect();
+                    let Some(current) = upload_sessions
+                        .wait_after(snapshot.generation, &cancel)
+                        .await
+                    else {
+                        break TransferOutcome::Cancelled;
+                    };
+                    snapshot = current;
+                    next_decision = UploadDecision::Resume;
+                }
+                Err(error) => break TransferOutcome::Failed(error.to_string()),
+            }
+        };
+        let _ = events.send(SftpEvent::TransferCompleted { id, outcome });
         unregister_cancel(&registry, id);
     });
 }

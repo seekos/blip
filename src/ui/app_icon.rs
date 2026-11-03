@@ -1,7 +1,7 @@
 //! 让裸二进制也带上自己的应用图标。
 //!
 //! `.app` bundle 由 `Info.plist` 的 `CFBundleIconFile` 指定图标，Finder / Dock
-//! 会自动去读。但 `cargo run` 跑的是 `target/debug/macscp` 这个裸 Unix 可执行
+//! 会自动去读。但 `cargo run` 跑的是 `target/debug/blip` 这个裸 Unix 可执行
 //! 文件 —— 没有 bundle、没有 Info.plist，Dock 里就是那张通用的可执行文件图标。
 //!
 //! 这里把 `assets/icon/AppIcon.icns` 用 `include_bytes!` 编进二进制，启动后

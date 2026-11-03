@@ -164,13 +164,13 @@ pub fn start(
     let info_root = server_root.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_name("macscp-lan-sftp-rt")
+        .thread_name("blip-lan-sftp-rt")
         .enable_all()
         .build()
         .map_err(|err| format!("创建局域网 SFTP runtime 失败：{err}"))?;
 
     std::thread::Builder::new()
-        .name("macscp-lan-sftp".to_string())
+        .name("blip-lan-sftp".to_string())
         .spawn(move || {
             runtime.block_on(async move {
                 let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -260,9 +260,7 @@ fn selected_password(manual_password: Option<String>) -> Result<String, String> 
 }
 
 fn load_or_create_host_key() -> Result<PrivateKey, String> {
-    let directory = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("macscp");
+    let directory = crate::session::store::config_dir();
     let path = directory.join("lan_sftp_host_key");
     if let Ok(contents) = std::fs::read_to_string(&path) {
         return PrivateKey::from_openssh(&contents)
@@ -882,7 +880,7 @@ mod tests {
 
     fn temp_root(tag: &str) -> PathBuf {
         let root =
-            std::env::temp_dir().join(format!("macscp-lan-server-{}-{tag}", std::process::id()));
+            std::env::temp_dir().join(format!("blip-lan-server-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("创建临时目录");
         root.canonicalize().expect("规范化临时目录")
@@ -926,7 +924,7 @@ mod tests {
     #[test]
     fn paths_cannot_escape_the_shared_root() {
         let root = temp_root("sandbox");
-        let outside = root.with_file_name("macscp-lan-server-outside");
+        let outside = root.with_file_name("blip-lan-server-outside");
         let _ = std::fs::remove_file(root.join("escape"));
         std::os::unix::fs::symlink(&outside, root.join("escape")).expect("创建悬空符号链接");
         let sftp = LocalSftp::new(Arc::new(RwLock::new(root)), test_activity());

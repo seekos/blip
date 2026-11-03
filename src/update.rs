@@ -4,7 +4,7 @@ use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt as _, Redirect
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/seekos/macscp/releases/latest";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/seekos/blip/releases/latest";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AvailableUpdate {

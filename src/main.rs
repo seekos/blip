@@ -4,7 +4,7 @@
 //!
 //! 线程模型：
 //! * 主线程 = GPUI（渲染、输入、实体状态）；
-//! * `macscp-sftp` 线程 = 独立 Tokio runtime（SSH/SFTP I/O）；
+//! * `blip-sftp` 线程 = 独立 Tokio runtime（SSH/SFTP I/O）；
 //! * 两者只通过 `flume` channel 通信，见 `sftp::worker`。
 
 mod app;
@@ -57,7 +57,7 @@ fn main() {
                 ..Default::default()
             };
 
-            gpui_kit::open_window(options, cx, |window, cx| {
+            if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
                     #[cfg_attr(not(feature = "demo-server"), allow(unused_mut))]
                     let mut app = app::ScpApp::new(window, cx);
@@ -65,8 +65,11 @@ fn main() {
                     app.apply_demo_login(window, cx);
                     app
                 })
-            })
-            .expect("failed to open the main window");
+            }) {
+                log::error!("无法打开 Blip 主窗口：{err:#}");
+                cx.quit();
+                return;
+            }
 
             cx.activate(true);
         });
