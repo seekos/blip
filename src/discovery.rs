@@ -14,7 +14,6 @@ use mdns_sd::{DaemonEvent, ResolvedService, ServiceDaemon, ServiceEvent, Service
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const DISCOVERY_PORT: u16 = 1985;
 // shortcut: 固定 loopback 端口若被其它程序占用会阻止选主，发生冲突时改为文件锁 + 动态端口。
 const COORDINATOR_PORT: u16 = 41985;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
@@ -23,13 +22,49 @@ const SERVICE_TYPE: &str = "_blip-sftp._tcp.local.";
 const IPC_PROTOCOL: &str = "blip-discovery-v1";
 const MAX_PACKET_SIZE: usize = 2048;
 const MAX_IPC_MESSAGE_SIZE: usize = 256 * 1024;
+pub const DISCOVERY_USERNAME_MAX_CHARS: usize = 48;
+
+fn valid_username(username: &str) -> bool {
+    !username.is_empty()
+        && username.trim() == username
+        && username.chars().count() <= DISCOVERY_USERNAME_MAX_CHARS
+}
+
+fn normalize_username(username: Option<&str>) -> Option<String> {
+    username
+        .map(str::trim)
+        .filter(|username| valid_username(username))
+        .map(str::to_owned)
+}
+
+fn current_username(username: &RwLock<Option<String>>) -> Option<String> {
+    username
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredDevice {
     pub id: String,
     pub hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     pub address: Ipv4Addr,
     pub port: u16,
+}
+
+impl DiscoveredDevice {
+    pub fn display_name(&self) -> &str {
+        self.username.as_deref().unwrap_or(&self.hostname)
+    }
+
+    pub fn display_label(&self) -> String {
+        match &self.username {
+            Some(username) => format!("{username}~{}:{}", self.address, self.port),
+            None => format!("{} · {}:{}", self.hostname, self.address, self.port),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -42,6 +77,8 @@ struct SharedSnapshot {
 struct DiscoveryPacket {
     device_id: Uuid,
     hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
     tcp_port: u16,
     timestamp: u64,
 }
@@ -126,9 +163,9 @@ impl DeviceRegistry {
             .map(|state| state.device.clone())
             .collect::<Vec<_>>();
         devices.sort_by(|left, right| {
-            left.hostname
+            left.display_name()
                 .to_lowercase()
-                .cmp(&right.hostname.to_lowercase())
+                .cmp(&right.display_name().to_lowercase())
                 .then_with(|| left.address.cmp(&right.address))
         });
         devices
@@ -139,6 +176,8 @@ impl DeviceRegistry {
 pub struct DiscoveryService {
     events: flume::Receiver<Vec<DiscoveredDevice>>,
     port: Arc<AtomicU16>,
+    discovery_port: Arc<AtomicU16>,
+    username: Arc<RwLock<Option<String>>>,
 }
 
 impl DiscoveryService {
@@ -151,22 +190,65 @@ impl DiscoveryService {
         self.port.store(port.unwrap_or(0), Ordering::Relaxed);
         Ok(())
     }
+
+    pub fn set_discovery_port(&self, port: u16) -> Result<(), String> {
+        if port == 0 {
+            return Err("发现端口必须是 1–65535 之间的整数".to_string());
+        }
+        let current = self.discovery_port.load(Ordering::Relaxed);
+        if current != port {
+            UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port))
+                .map_err(|err| format!("无法监听 UDP 发现端口 {port}：{err}"))?;
+            self.discovery_port.store(port, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    pub fn set_username(&self, username: Option<&str>) -> Result<(), String> {
+        *self
+            .username
+            .write()
+            .map_err(|_| "设备发现用户名状态已损坏".to_string())? = normalize_username(username);
+        Ok(())
+    }
 }
 
-pub fn start(server_port: Option<u16>) -> Result<DiscoveryService, String> {
+pub fn start(
+    server_port: Option<u16>,
+    discovery_username: Option<&str>,
+    discovery_port: u16,
+) -> Result<DiscoveryService, String> {
+    if discovery_port == 0 {
+        return Err("发现端口必须是 1–65535 之间的整数".to_string());
+    }
     let device_id = load_or_create_device_id()?;
     let hostname = local_hostname();
     let port = Arc::new(AtomicU16::new(server_port.unwrap_or(0)));
+    let discovery_port = Arc::new(AtomicU16::new(discovery_port));
+    let username = Arc::new(RwLock::new(normalize_username(discovery_username)));
     let (events_tx, events_rx) = flume::unbounded();
     let coordinator_port = port.clone();
+    let coordinator_discovery_port = discovery_port.clone();
+    let coordinator_username = username.clone();
     std::thread::Builder::new()
         .name("blip-discovery-coordinator".to_string())
-        .spawn(move || discovery_coordinator(device_id, hostname, coordinator_port, events_tx))
+        .spawn(move || {
+            discovery_coordinator(
+                device_id,
+                hostname,
+                coordinator_port,
+                coordinator_discovery_port,
+                coordinator_username,
+                events_tx,
+            )
+        })
         .map_err(|err| format!("无法启动设备发现协调线程：{err}"))?;
 
     Ok(DiscoveryService {
         events: events_rx,
         port,
+        discovery_port,
+        username,
     })
 }
 
@@ -174,13 +256,23 @@ fn discovery_coordinator(
     device_id: Uuid,
     hostname: String,
     port: Arc<AtomicU16>,
+    discovery_port: Arc<AtomicU16>,
+    username: Arc<RwLock<Option<String>>>,
     events: flume::Sender<Vec<DiscoveredDevice>>,
 ) {
     loop {
         match TcpListener::bind((Ipv4Addr::LOCALHOST, COORDINATOR_PORT)) {
             Ok(listener) => {
                 log::info!("本进程已接管局域网设备发现");
-                run_discovery_owner(listener, device_id, hostname, port, events);
+                run_discovery_owner(
+                    listener,
+                    device_id,
+                    hostname,
+                    port,
+                    discovery_port,
+                    username,
+                    events,
+                );
                 return;
             }
             Err(err) if err.kind() == ErrorKind::AddrInUse => {
@@ -204,20 +296,28 @@ fn run_discovery_owner(
     device_id: Uuid,
     hostname: String,
     port: Arc<AtomicU16>,
+    discovery_port: Arc<AtomicU16>,
+    username: Arc<RwLock<Option<String>>>,
     events: flume::Sender<Vec<DiscoveredDevice>>,
 ) {
     let shared = Arc::new(RwLock::new(Vec::new()));
     let (updates_tx, updates_rx) = flume::unbounded();
     start_registry(updates_rx, events, shared.clone());
-    start_udp_listener(device_id, updates_tx.clone());
-    start_udp_sender(device_id, hostname.clone(), port.clone());
+    start_udp_listener(device_id, updates_tx.clone(), discovery_port.clone());
+    start_udp_sender(
+        device_id,
+        hostname.clone(),
+        username.clone(),
+        port.clone(),
+        discovery_port,
+    );
 
     let mdns = start_mdns(device_id, updates_tx).map_err(|err| {
         log::warn!("mDNS 设备发现不可用，将继续使用 UDP 定向广播：{err}");
         err
     });
     if let Ok(mdns) = &mdns {
-        start_mdns_publisher(mdns.clone(), device_id, hostname, port);
+        start_mdns_publisher(mdns.clone(), device_id, hostname, username, port);
     }
 
     if let Err(err) = listener.set_nonblocking(true) {
@@ -280,6 +380,7 @@ fn valid_shared_devices(devices: &[DiscoveredDevice]) -> bool {
             Uuid::parse_str(&device.id).is_ok()
                 && !device.hostname.trim().is_empty()
                 && device.hostname.len() <= 255
+                && device.username.as_deref().is_none_or(valid_username)
                 && !device.address.is_unspecified()
                 && !device.address.is_loopback()
                 && device.port != 0
@@ -370,19 +471,49 @@ fn start_registry(
     }
 }
 
-fn start_udp_listener(device_id: Uuid, updates: flume::Sender<DiscoveryUpdate>) {
+fn start_udp_listener(
+    device_id: Uuid,
+    updates: flume::Sender<DiscoveryUpdate>,
+    discovery_port: Arc<AtomicU16>,
+) {
     if let Err(err) = std::thread::Builder::new()
         .name("blip-discovery-udp-listener".to_string())
         .spawn(move || {
-            let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT)) {
-                Ok(socket) => socket,
-                Err(err) => {
-                    log::error!("无法监听 UDP 设备发现端口 {DISCOVERY_PORT}：{err}");
-                    return;
-                }
-            };
+            let mut socket = None;
+            let mut listening_port = 0;
+            let mut failed_port = None;
             let mut buffer = [0_u8; MAX_PACKET_SIZE];
             loop {
+                let requested_port = discovery_port.load(Ordering::Relaxed);
+                if requested_port != listening_port {
+                    match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, requested_port)) {
+                        Ok(next_socket) => {
+                            if let Err(err) =
+                                next_socket.set_read_timeout(Some(Duration::from_millis(500)))
+                            {
+                                log::error!("无法设置 UDP 设备发现读取超时：{err}");
+                                return;
+                            }
+                            socket = Some(next_socket);
+                            listening_port = requested_port;
+                            failed_port = None;
+                            log::info!("UDP 设备发现已监听端口 {listening_port}");
+                        }
+                        Err(err) => {
+                            if failed_port != Some(requested_port) {
+                                log::error!("无法监听 UDP 设备发现端口 {requested_port}：{err}");
+                                failed_port = Some(requested_port);
+                            }
+                            if socket.is_none() {
+                                std::thread::sleep(Duration::from_secs(1));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let Some(socket) = socket.as_ref() else {
+                    continue;
+                };
                 match socket.recv_from(&mut buffer) {
                     Ok((length, source)) => {
                         if let Some(update) = parse_udp_packet(&buffer[..length], source, device_id)
@@ -391,7 +522,11 @@ fn start_udp_listener(device_id: Uuid, updates: flume::Sender<DiscoveryUpdate>) 
                             break;
                         }
                     }
-                    Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                        ) => {}
                     Err(err) => {
                         log::error!("UDP 设备发现接收失败：{err}");
                         break;
@@ -404,16 +539,24 @@ fn start_udp_listener(device_id: Uuid, updates: flume::Sender<DiscoveryUpdate>) 
     }
 }
 
-fn start_udp_sender(device_id: Uuid, hostname: String, port: Arc<AtomicU16>) {
+fn start_udp_sender(
+    device_id: Uuid,
+    hostname: String,
+    username: Arc<RwLock<Option<String>>>,
+    port: Arc<AtomicU16>,
+    discovery_port: Arc<AtomicU16>,
+) {
     if let Err(err) = std::thread::Builder::new()
         .name("blip-discovery-udp-sender".to_string())
         .spawn(move || {
             loop {
                 let tcp_port = port.load(Ordering::Relaxed);
+                let udp_port = discovery_port.load(Ordering::Relaxed);
                 if tcp_port != 0 {
                     let packet = DiscoveryPacket {
                         device_id,
                         hostname: hostname.clone(),
+                        username: current_username(&username),
                         tcp_port,
                         timestamp: unix_timestamp_ms(),
                     };
@@ -422,8 +565,8 @@ fn start_udp_sender(device_id: Uuid, hostname: String, port: Arc<AtomicU16>) {
                             match UdpSocket::bind((target.source, 0)) {
                                 Ok(socket) => {
                                     if socket.set_broadcast(true).is_ok()
-                                        && let Err(err) = socket
-                                            .send_to(&payload, (target.broadcast, DISCOVERY_PORT))
+                                        && let Err(err) =
+                                            socket.send_to(&payload, (target.broadcast, udp_port))
                                     {
                                         log::debug!(
                                             "从 {} 向 {} 发送发现心跳失败：{err}",
@@ -504,28 +647,37 @@ fn start_mdns_publisher(
     mdns: ServiceDaemon,
     device_id: Uuid,
     hostname: String,
+    username: Arc<RwLock<Option<String>>>,
     port: Arc<AtomicU16>,
 ) {
     if let Err(err) = std::thread::Builder::new()
         .name("blip-discovery-mdns-publisher".to_string())
         .spawn(move || {
-            let mut published_port = 0;
+            let mut published = None;
             loop {
                 let current_port = port.load(Ordering::Relaxed);
-                if current_port != published_port {
-                    let result = if current_port == 0 {
-                        mdns.unregister(&service_fullname(device_id))
-                            .map(|_| ())
-                            .map_err(|err| err.to_string())
-                    } else {
-                        mdns_service(device_id, &hostname, current_port).and_then(|service| {
+                let desired =
+                    (current_port != 0).then(|| (current_port, current_username(&username)));
+                if desired != published {
+                    let result = if let Some((current_port, current_username)) = &desired {
+                        mdns_service(
+                            device_id,
+                            &hostname,
+                            current_username.as_deref(),
+                            *current_port,
+                        )
+                        .and_then(|service| {
                             mdns.register(service)
                                 .map_err(|err| format!("注册 mDNS 服务失败：{err}"))
                         })
+                    } else {
+                        mdns.unregister(&service_fullname(device_id))
+                            .map(|_| ())
+                            .map_err(|err| err.to_string())
                     };
                     match result {
-                        Ok(()) => published_port = current_port,
-                        Err(err) => log::warn!("更新 mDNS 服务端口失败：{err}"),
+                        Ok(()) => published = desired,
+                        Err(err) => log::warn!("更新 mDNS 服务失败：{err}"),
                     }
                 }
                 std::thread::sleep(Duration::from_millis(500));
@@ -545,6 +697,7 @@ fn mdns_update(service: &ResolvedService, own_id: Uuid) -> Option<(String, Disco
     if hostname.is_empty() || hostname.len() > 255 {
         return None;
     }
+    let username = normalize_username(service.get_property_val_str("username"));
     let address = service.get_addresses_v4().into_iter().next()?;
     let id = id.to_string();
     Some((
@@ -553,6 +706,7 @@ fn mdns_update(service: &ResolvedService, own_id: Uuid) -> Option<(String, Disco
             device: DiscoveredDevice {
                 id,
                 hostname: hostname.to_string(),
+                username,
                 address,
                 port: service.get_port(),
             },
@@ -561,16 +715,24 @@ fn mdns_update(service: &ResolvedService, own_id: Uuid) -> Option<(String, Disco
     ))
 }
 
-fn mdns_service(device_id: Uuid, hostname: &str, port: u16) -> Result<ServiceInfo, String> {
+fn mdns_service(
+    device_id: Uuid,
+    hostname: &str,
+    username: Option<&str>,
+    port: u16,
+) -> Result<ServiceInfo, String> {
     let instance = service_instance(device_id);
     let host = format!("{instance}.local.");
     let id = device_id.to_string();
-    let properties = [
-        ("id", id.as_str()),
-        ("hostname", hostname),
-        ("version", "1"),
-    ];
-    ServiceInfo::new(SERVICE_TYPE, &instance, &host, (), port, &properties[..])
+    let mut properties = HashMap::from([
+        ("id".to_string(), id),
+        ("hostname".to_string(), hostname.to_string()),
+        ("version".to_string(), "1".to_string()),
+    ]);
+    if let Some(username) = normalize_username(username) {
+        properties.insert("username".to_string(), username);
+    }
+    ServiceInfo::new(SERVICE_TYPE, &instance, &host, (), port, properties)
         .map(ServiceInfo::enable_addr_auto)
         .map_err(|err| format!("创建 mDNS 服务信息失败：{err}"))
 }
@@ -588,10 +750,12 @@ fn parse_udp_packet(payload: &[u8], source: SocketAddr, own_id: Uuid) -> Option<
     {
         return None;
     }
+    let username = normalize_username(packet.username.as_deref());
     Some(DiscoveryUpdate::Seen {
         device: DiscoveredDevice {
             id: packet.device_id.to_string(),
             hostname: packet.hostname,
+            username,
             address: source,
             port: packet.tcp_port,
         },
@@ -715,6 +879,7 @@ mod tests {
         DiscoveredDevice {
             id: id.to_string(),
             hostname: "office-mac".to_string(),
+            username: None,
             address,
             port: 2022,
         }
@@ -740,6 +905,7 @@ mod tests {
         let packet = DiscoveryPacket {
             device_id: peer_id,
             hostname: "peer".to_string(),
+            username: Some("alice".to_string()),
             tcp_port: 2022,
             timestamp: 123,
         };
@@ -751,6 +917,7 @@ mod tests {
         };
         assert_eq!(device.id, peer_id.to_string());
         assert_eq!(device.address, Ipv4Addr::new(192, 168, 1, 8));
+        assert_eq!(device.username.as_deref(), Some("alice"));
 
         let own_payload = serde_json::to_vec(&DiscoveryPacket {
             device_id: own_id,
@@ -765,14 +932,40 @@ mod tests {
         let packet = DiscoveryPacket {
             device_id: Uuid::nil(),
             hostname: "peer".to_string(),
+            username: Some("alice".to_string()),
             tcp_port: 2022,
             timestamp: 123,
         };
         let value = serde_json::to_value(packet).unwrap();
         assert_eq!(value["device_id"], Uuid::nil().to_string());
         assert_eq!(value["hostname"], "peer");
+        assert_eq!(value["username"], "alice");
         assert_eq!(value["tcp_port"], 2022);
         assert_eq!(value["timestamp"], 123);
+    }
+
+    #[test]
+    fn discovery_label_prefers_username_and_keeps_hostname_as_fallback() {
+        let mut peer = device(Uuid::new_v4(), Ipv4Addr::new(192, 168, 1, 8));
+        assert_eq!(peer.display_label(), "office-mac · 192.168.1.8:2022");
+
+        peer.username = Some("alice".to_string());
+        assert_eq!(peer.display_label(), "alice~192.168.1.8:2022");
+    }
+
+    #[test]
+    fn udp_packet_without_username_remains_compatible() {
+        let peer_id = Uuid::new_v4();
+        let payload = format!(
+            r#"{{"device_id":"{peer_id}","hostname":"peer","tcp_port":2022,"timestamp":123}}"#
+        );
+        let source = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 8), 51000));
+        let Some(DiscoveryUpdate::Seen { device, .. }) =
+            parse_udp_packet(payload.as_bytes(), source, Uuid::new_v4())
+        else {
+            panic!("应解析出设备");
+        };
+        assert_eq!(device.username, None);
     }
 
     #[test]

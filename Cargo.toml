@@ -14,6 +14,8 @@ demo-server = []
 [dependencies]
 # UI: GPUI Kit re-exports gpui, base, component library and the icon set.
 gpui-kit = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 
 # Networking: a dedicated multi-threaded Tokio runtime lives on its own thread.
 tokio = { version = "1", features = [
@@ -38,10 +40,12 @@ russh-sftp = "3.0"
 flume = { version = "0.12", features = ["async"] }
 futures = "0.3"
 
-# Cross-platform system credential storage and recycle bin support.
-keyring = "4"
+# Cross-platform encrypted configuration and recycle bin support.
+age = "0.11.1"
+base64 = "0.22"
 dirs = "6"
 trash = "5.2.9"
+toml = "0.9"
 
 # Utilities.
 anyhow = "1"
@@ -64,28 +68,31 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # 版本必须与 gpui 依赖树里的对齐（objc2 0.6 / objc2-app-kit 0.3），
 # 否则会同时链进两套 objc2，编译时间和二进制体积都会翻倍。
 [target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store = { version = "1", features = ["protected"] }
 block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSButton",
+    "NSControl",
     "NSImage",
     "NSOpenPanel",
     "NSView",
+    "NSWindow",
 ] }
 objc2-foundation = { version = "0.3", features = [
     "NSData",
     "NSURL",
 ] }
-security-framework = { version = "3.7", features = ["OSX_10_15"] }
+raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
-
-# Linux 窗口图标：Wayland 用 app_id，X11 还需要把 PNG 解码后交给 GPUI。
-[target.'cfg(target_os = "linux")'.dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
@@ -98,3 +105,6 @@ winresource = "0.1"
 # rejected by future Rust versions. This source-identical patch only makes its
 # Objective-C runtime class an inhabited opaque FFI type.
 block = { path = "vendor/block" }
+# age 0.11 still uses i18n-embed-fl 0.9.4, whose proc-macro-error2 dependency is
+# unmaintained and rejected by future Rust. This local copy uses its maintained fork.
+i18n-embed-fl = { path = "vendor/i18n-embed-fl" }

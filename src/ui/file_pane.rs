@@ -25,7 +25,7 @@ use gpui_kit::component::{
     menu::PopupMenu,
     menu::PopupMenuItem,
     scroll::ScrollableMask,
-    table::{Column, DataTable, TableDelegate, TableEvent, TableState},
+    table::{Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState},
     v_flex,
 };
 use gpui_kit::prelude::*;
@@ -166,6 +166,7 @@ impl FilePane {
                     selection_anchor: None,
                     row_bounds: row_bounds.clone(),
                     column_widths: column_widths.clone(),
+                    sort: None,
                 },
                 window,
                 cx,
@@ -1164,6 +1165,8 @@ pub struct FileTable {
     row_bounds: Rc<RefCell<BTreeMap<usize, Bounds<Pixels>>>>,
     /// 表格 `refresh()` 会重新读取 delegate 的列定义；这里保存用户拖拽后的宽度。
     column_widths: Rc<RefCell<Vec<Pixels>>>,
+    /// 当前表头排序；`None` 保留数据源提供的默认顺序。
+    sort: Option<(usize, ColumnSort)>,
 }
 
 impl FileTable {
@@ -1189,9 +1192,12 @@ impl FileTable {
         self.apply_visibility();
     }
 
-    /// 按 `show_hidden` 重算可见列表，顺序沿用 `sort_entries` 的结果。
+    /// 按 `show_hidden` 重算可见列表，并应用当前表头排序。
     fn apply_visibility(&mut self) {
         self.entries = filter_entries(&self.all_entries, self.show_hidden);
+        if let Some((col_ix, sort)) = self.sort {
+            sort_entries_for_column(&mut self.entries, col_ix, sort);
+        }
     }
 
     /// 打开 / 关闭隐藏文件，并立刻重算可见列表。
@@ -1227,6 +1233,28 @@ impl FileTable {
             .filter_map(|row| self.entry_at(*row))
             .filter(|entry| !is_parent_row(entry))
             .collect()
+    }
+
+    fn column_sort(&self, col_ix: usize) -> ColumnSort {
+        self.sort
+            .filter(|(sorted_col, _)| *sorted_col == col_ix)
+            .map(|(_, sort)| sort)
+            .unwrap_or_default()
+    }
+
+    fn next_column_sort(&self, col_ix: usize) -> ColumnSort {
+        match self.column_sort(col_ix) {
+            ColumnSort::Default => ColumnSort::Descending,
+            ColumnSort::Descending => ColumnSort::Ascending,
+            ColumnSort::Ascending => ColumnSort::Default,
+        }
+    }
+
+    fn set_sort(&mut self, col_ix: usize, sort: ColumnSort) {
+        let selected_paths = self.selected_paths();
+        self.sort = (sort != ColumnSort::Default).then_some((col_ix, sort));
+        self.apply_visibility();
+        self.restore_selection(&selected_paths);
     }
 
     /// 右键菜单项。`entry` 由调用方克隆进来，点击时闭包自己再克隆一份。
@@ -1470,6 +1498,30 @@ fn filter_entries(entries: &[FileEntry], show_hidden: bool) -> Vec<FileEntry> {
         .collect()
 }
 
+/// 文件夹始终在前；升降序只作用于同类条目，并用名称升序稳定处理相同值。
+fn sort_entries_for_column(entries: &mut [FileEntry], col_ix: usize, sort: ColumnSort) {
+    if sort == ColumnSort::Default {
+        sort_entries(entries);
+        return;
+    }
+
+    entries.sort_by(|a, b| {
+        b.is_dir().cmp(&a.is_dir()).then_with(|| {
+            let value_order = match col_ix {
+                0 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                1 => a.size.cmp(&b.size),
+                2 => a.mode.cmp(&b.mode),
+                _ => a.modified.cmp(&b.modified),
+            };
+            let value_order = match sort {
+                ColumnSort::Descending => value_order.reverse(),
+                ColumnSort::Ascending | ColumnSort::Default => value_order,
+            };
+            value_order.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        })
+    });
+}
+
 /// 行号 → 条目。有 `..` 行时数据整体后移一位。
 fn row_entry(
     parent: Option<&FileEntry>,
@@ -1502,16 +1554,55 @@ impl TableDelegate for FileTable {
             .copied()
             .unwrap_or_else(|| default_column_widths()[col_ix.min(FILE_TABLE_COLUMNS - 1)]);
         match col_ix {
-            0 => Column::new("name", "名称").width(width).min_width(px(120.)),
+            0 => Column::new("name", "名称")
+                .width(width)
+                .min_width(px(120.))
+                .sort(self.column_sort(col_ix)),
             1 => Column::new("size", "大小")
                 .width(width)
                 .text_right()
-                .resizable(false),
-            2 => Column::new("mode", "权限").width(width).resizable(false),
+                .resizable(false)
+                .sort(self.column_sort(col_ix)),
+            2 => Column::new("mode", "权限")
+                .width(width)
+                .resizable(false)
+                .sort(self.column_sort(col_ix)),
             _ => Column::new("modified", "修改时间")
                 .width(width)
-                .resizable(false),
+                .resizable(false)
+                .sort(self.column_sort(col_ix)),
         }
+    }
+
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let name = self.column(col_ix, cx).name;
+        div()
+            .id(("file-sort-header", col_ix))
+            .h_full()
+            .flex_1()
+            .flex()
+            .items_center()
+            .on_click(cx.listener(move |state, _, _, cx| {
+                let sort = state.delegate().next_column_sort(col_ix);
+                state.delegate_mut().set_sort(col_ix, sort);
+                state.refresh(cx);
+            }))
+            .child(name)
+    }
+
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        sort: ColumnSort,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        self.set_sort(col_ix, sort);
     }
 
     fn loading(&self, _: &App) -> bool {
@@ -1845,6 +1936,117 @@ mod tests {
             selected_rows_for_paths(&entries, true, &selected),
             BTreeSet::from([2])
         );
+    }
+
+    #[test]
+    fn table_columns_sort_both_directions_with_directories_first() {
+        let mut alpha = entry("alpha.txt", EntryKind::File);
+        alpha.size = 10;
+        alpha.mode = Some(0o644);
+        alpha.modified = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(10));
+        let mut beta = entry("beta.txt", EntryKind::File);
+        beta.size = 20;
+        beta.mode = Some(0o600);
+        beta.modified = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(20));
+        let directory = entry("folder", EntryKind::Directory);
+
+        for (column, ascending, descending) in [
+            (
+                0,
+                ["folder", "alpha.txt", "beta.txt"],
+                ["folder", "beta.txt", "alpha.txt"],
+            ),
+            (
+                1,
+                ["folder", "alpha.txt", "beta.txt"],
+                ["folder", "beta.txt", "alpha.txt"],
+            ),
+            (
+                2,
+                ["folder", "beta.txt", "alpha.txt"],
+                ["folder", "alpha.txt", "beta.txt"],
+            ),
+            (
+                3,
+                ["folder", "alpha.txt", "beta.txt"],
+                ["folder", "beta.txt", "alpha.txt"],
+            ),
+        ] {
+            let mut entries = vec![beta.clone(), directory.clone(), alpha.clone()];
+            sort_entries_for_column(&mut entries, column, ColumnSort::Ascending);
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
+                ascending
+            );
+
+            sort_entries_for_column(&mut entries, column, ColumnSort::Descending);
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
+                descending
+            );
+        }
+    }
+
+    #[::gpui::test]
+    fn clicking_size_header_cycles_file_order(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let mut small = entry("small.txt", EntryKind::File);
+            small.size = 10;
+            let mut large = entry("large.txt", EntryKind::File);
+            large.size = 20;
+            let mut pane = FilePane::new(PaneSide::Remote, "/home".to_string(), window, cx);
+            pane.set_entries(
+                "/home".to_string(),
+                vec![small, large, entry("folder", EntryKind::Directory)],
+                cx,
+            );
+            pane
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let size_sort = pane.read_with(cx, |pane, cx| {
+            let surface = pane.selection_surface.get().expect("表格区域已布局");
+            let body_top = pane
+                .row_bounds
+                .borrow()
+                .values()
+                .map(Bounds::top)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("至少有上级目录行");
+            let table = pane.table.read(cx);
+            let name_width = table.col_width(0).expect("名称列宽度");
+            let size_width = table.col_width(1).expect("大小列宽度");
+            point(
+                surface.left() + name_width + size_width / 2.,
+                (surface.top() + body_top) / 2.,
+            )
+        });
+
+        for expected in [
+            ["folder", "large.txt", "small.txt"],
+            ["folder", "small.txt", "large.txt"],
+        ] {
+            cx.simulate_click(size_sort, Modifiers::default());
+            pane.read_with(cx, |pane, cx| {
+                assert_eq!(
+                    pane.table
+                        .read(cx)
+                        .delegate()
+                        .entries
+                        .iter()
+                        .map(|entry| entry.name.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            });
+        }
     }
 
     #[test]

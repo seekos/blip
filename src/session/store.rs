@@ -1,38 +1,43 @@
-//! 会话持久化：密码进系统凭据库，连接配置进系统配置目录下的 JSON。
+//! 会话持久化：收藏、设置与凭据统一写入主密码保护的 `~/.ssh/blip.toml`。
 
 use std::{
+    collections::BTreeMap,
     fs::OpenOptions,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(target_os = "macos")]
-use apple_native_keyring_store::protected::{AccessPolicy, Cred as ProtectedCredential};
+use age::secrecy::{ExposeSecret as _, SecretString};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::sftp::types::{AuthMethod, SessionConfig};
 
-/// 系统凭据库里的 service 名，所有条目共享。
-const KEYRING_SERVICE: &str = "com.amov.Blip.credentials";
-const LEGACY_KEYRING_SERVICE: &str = "com.macscp.credentials";
+const CONFIG_FILE: &str = "blip.toml";
+const LOCAL_UNLOCK_KEY_FILE: &str = ".blip-unlock-key";
 const CONFIG_DIR_NAME: &str = "blip";
 const LEGACY_CONFIG_DIR_NAME: &str = "macscp";
 const LAN_SFTP_PASSWORD_ACCOUNT: &str = "lan-sftp-server-password";
-#[cfg(target_os = "macos")]
-const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;
 const PROFILES_FILE: &str = "profiles.json";
 const SETTINGS_FILE: &str = "settings.json";
 const DIRECTORIES_FILE: &str = "directories.json";
+const CONFIG_SCHEMA_VERSION: u32 = 1;
 const PROFILES_SCHEMA_VERSION: u32 = 1;
-const PROFILE_LIMIT: usize = 50;
+// 本机解锁密钥是随机生成的 256 位密钥，不需要像人类密码一样用高成本 scrypt
+// 抵抗字典攻击。主密码保护的配置正文仍使用 age 的自适应工作因子。
+const LOCAL_UNLOCK_WORK_FACTOR: u8 = 2;
+pub(crate) const PROFILE_LIMIT: usize = 50;
+pub const DEFAULT_DISCOVERY_PORT: u16 = 1985;
+pub const DEFAULT_LAN_SFTP_USERNAME: &str = "zy";
 
-static PROFILES_SAVE_BLOCKED: AtomicBool = AtomicBool::new(false);
-static PROFILES_WARNING: Mutex<Option<String>> = Mutex::new(None);
+static UNLOCKED_CONFIG: OnceLock<Mutex<Option<UnlockedConfig>>> = OnceLock::new();
+static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// 最近成功打开的目录。本地目录全局共享，远端目录按 `user@host`
@@ -124,8 +129,14 @@ pub struct AppSettings {
     pub remote_open_behavior: RemoteOpenBehavior,
     /// 自定义编辑器应用或可执行文件路径；系统默认和内置模式下忽略。
     pub editor_path: Option<PathBuf>,
+    /// 局域网发现列表中代替计算机名的可选用户名。
+    pub discovery_username: Option<String>,
+    /// UDP 局域网发现监听与广播端口。
+    pub discovery_port: u16,
     /// 内置局域网 SFTP 的共享根目录；`None` 表示当前用户主目录。
     pub lan_sftp_root: Option<PathBuf>,
+    /// 内置局域网 SFTP 的登录用户名。
+    pub lan_sftp_username: String,
     pub lan_sftp_password_mode: LanSftpPasswordMode,
 }
 
@@ -140,13 +151,19 @@ fn preferred_settings(notepad: Option<PathBuf>) -> AppSettings {
         Some(editor_path) => AppSettings {
             remote_open_behavior: RemoteOpenBehavior::CustomEditor,
             editor_path: Some(editor_path),
+            discovery_username: None,
+            discovery_port: DEFAULT_DISCOVERY_PORT,
             lan_sftp_root: None,
+            lan_sftp_username: DEFAULT_LAN_SFTP_USERNAME.to_string(),
             lan_sftp_password_mode: LanSftpPasswordMode::Default,
         },
         None => AppSettings {
             remote_open_behavior: RemoteOpenBehavior::SystemDefault,
             editor_path: None,
+            discovery_username: None,
+            discovery_port: DEFAULT_DISCOVERY_PORT,
             lan_sftp_root: None,
+            lan_sftp_username: DEFAULT_LAN_SFTP_USERNAME.to_string(),
             lan_sftp_password_mode: LanSftpPasswordMode::Default,
         },
     }
@@ -229,22 +246,61 @@ impl SavedProfile {
     }
 
     pub fn title(&self) -> String {
-        self.name
+        let endpoint = self.endpoint_label();
+        if let Some(name) = self
+            .name
             .as_deref()
-            .filter(|name| !name.trim().is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{}@{}", self.username, self.host))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            format!("{endpoint}-{name}")
+        } else {
+            endpoint
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SavedAuth {
-    /// 密码存在系统凭据库里，这里只是一个标记。
+    /// 密码存在加密配置的凭据表里，这里只是一个标记。
     Password,
     Key {
         path: String,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct ConfigDocument {
+    version: u32,
+    settings: AppSettings,
+    profiles: Vec<SavedProfile>,
+    credentials: BTreeMap<String, String>,
+}
+
+impl Default for ConfigDocument {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_SCHEMA_VERSION,
+            settings: AppSettings::default(),
+            profiles: Vec::new(),
+            credentials: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EncryptedConfigFile {
+    version: u32,
+    ciphertext: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_unlock: Option<String>,
+}
+
+struct UnlockedConfig {
+    passphrase: SecretString,
+    document: ConfigDocument,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -257,6 +313,393 @@ struct ProfilesDocument {
 pub struct ProfileUpsert {
     pub previous: Option<SavedProfile>,
     pub evicted: Option<SavedProfile>,
+}
+
+fn unlocked_config() -> &'static Mutex<Option<UnlockedConfig>> {
+    UNLOCKED_CONFIG.get_or_init(|| Mutex::new(None))
+}
+
+fn encrypted_config_path() -> Result<PathBuf, String> {
+    dirs::home_dir()
+        .map(|home| home.join(".ssh").join(CONFIG_FILE))
+        .ok_or_else(|| "无法确定用户主目录，不能定位 ~/.ssh/blip.toml".to_string())
+}
+
+fn local_unlock_key_path() -> Result<PathBuf, String> {
+    dirs::home_dir()
+        .map(|home| home.join(".ssh").join(LOCAL_UNLOCK_KEY_FILE))
+        .ok_or_else(|| "无法确定用户主目录，不能定位本机解锁密钥".to_string())
+}
+
+pub fn is_config_initialized() -> bool {
+    encrypted_config_path().is_ok_and(|path| path.is_file())
+}
+
+pub fn initialize_config(password: &str) -> Result<(), String> {
+    if password.is_empty() {
+        return Err("主密码不能为空".to_string());
+    }
+    let path = encrypted_config_path()?;
+    if path.exists() {
+        return Err(format!("配置文件已存在：{}", path.display()));
+    }
+
+    let passphrase = SecretString::from(password.to_owned());
+    let document = ConfigDocument {
+        profiles: load_legacy_profiles(),
+        settings: load_legacy_settings(),
+        ..ConfigDocument::default()
+    };
+    write_encrypted_config(&path, &passphrase, &document)?;
+    *unlocked_config()
+        .lock()
+        .map_err(|_| "配置状态已损坏，请重启 Blip".to_string())? = Some(UnlockedConfig {
+        passphrase,
+        document,
+    });
+    Ok(())
+}
+
+pub fn try_auto_unlock_config() -> Result<bool, String> {
+    let path = encrypted_config_path()?;
+    let Some(outer) = read_encrypted_config(&path)? else {
+        return Ok(false);
+    };
+    let Some(local_unlock) = outer.local_unlock else {
+        return Ok(false);
+    };
+    let Some(local_key) = load_local_unlock_key()? else {
+        return Ok(false);
+    };
+    let passphrase = match decrypt_master_password(&local_unlock, local_key) {
+        Ok(passphrase) => passphrase,
+        Err(message) => {
+            return Err(format!("本机自动解锁失效：{message}"));
+        }
+    };
+    let document = decrypt_document(&outer.ciphertext, passphrase.clone())?;
+    *unlocked_config()
+        .lock()
+        .map_err(|_| "配置状态已损坏，请重启 Blip".to_string())? = Some(UnlockedConfig {
+        passphrase,
+        document,
+    });
+    Ok(true)
+}
+
+pub fn unlock_config(password: &str) -> Result<(), String> {
+    let path = encrypted_config_path()?;
+    let outer = read_encrypted_config(&path)?
+        .ok_or_else(|| format!("配置文件不存在：{}", path.display()))?;
+
+    let passphrase = SecretString::from(password.to_owned());
+    let document = decrypt_document(&outer.ciphertext, passphrase.clone())?;
+    // 旧配置首次手动解锁后补上本机自动解锁材料，以后启动不再询问。
+    write_encrypted_config(&path, &passphrase, &document)?;
+    *unlocked_config()
+        .lock()
+        .map_err(|_| "配置状态已损坏，请重启 Blip".to_string())? = Some(UnlockedConfig {
+        passphrase,
+        document,
+    });
+    Ok(())
+}
+
+fn read_encrypted_config(path: &Path) -> Result<Option<EncryptedConfigFile>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("读取配置文件 {} 失败：{err}", path.display())),
+    };
+    let outer: EncryptedConfigFile =
+        toml::from_str(&raw).map_err(|err| format!("配置文件格式损坏：{err}"))?;
+    if outer.version != CONFIG_SCHEMA_VERSION {
+        return Err(format!(
+            "不支持的配置版本 {}（当前支持 {}）",
+            outer.version, CONFIG_SCHEMA_VERSION
+        ));
+    }
+    Ok(Some(outer))
+}
+
+fn encrypt_document(document: &ConfigDocument, passphrase: SecretString) -> Result<String, String> {
+    let plaintext =
+        toml::to_string_pretty(document).map_err(|err| format!("序列化配置失败：{err}"))?;
+    let recipient = age::scrypt::Recipient::new(passphrase);
+    let ciphertext = age::encrypt(&recipient, plaintext.as_bytes())
+        .map_err(|err| format!("加密配置失败：{err}"))?;
+    Ok(BASE64.encode(ciphertext))
+}
+
+fn decrypt_document(ciphertext: &str, passphrase: SecretString) -> Result<ConfigDocument, String> {
+    let ciphertext = BASE64
+        .decode(ciphertext.trim())
+        .map_err(|err| format!("配置密文的 Base64 无效：{err}"))?;
+    let identity = age::scrypt::Identity::new(passphrase);
+    let plaintext = age::decrypt(&identity, &ciphertext)
+        .map_err(|_| "主密码错误，或配置密文已经损坏".to_string())?;
+    let plaintext =
+        String::from_utf8(plaintext).map_err(|_| "解密后的配置不是有效 UTF-8".to_string())?;
+    let mut document: ConfigDocument =
+        toml::from_str(&plaintext).map_err(|err| format!("解密后的配置格式损坏：{err}"))?;
+    if document.version != CONFIG_SCHEMA_VERSION {
+        return Err(format!(
+            "不支持的配置内容版本 {}（当前支持 {}）",
+            document.version, CONFIG_SCHEMA_VERSION
+        ));
+    }
+    document.profiles = normalize_profiles(document.profiles);
+    Ok(document)
+}
+
+fn encrypt_master_password(
+    passphrase: &SecretString,
+    local_key: SecretString,
+) -> Result<String, String> {
+    let mut recipient = age::scrypt::Recipient::new(local_key);
+    recipient.set_work_factor(LOCAL_UNLOCK_WORK_FACTOR);
+    let ciphertext = age::encrypt(&recipient, passphrase.expose_secret().as_bytes())
+        .map_err(|err| format!("创建本机自动解锁数据失败：{err}"))?;
+    Ok(BASE64.encode(ciphertext))
+}
+
+fn decrypt_master_password(
+    ciphertext: &str,
+    local_key: SecretString,
+) -> Result<SecretString, String> {
+    let ciphertext = BASE64
+        .decode(ciphertext.trim())
+        .map_err(|err| format!("本机自动解锁数据的 Base64 无效：{err}"))?;
+    let identity = age::scrypt::Identity::new(local_key);
+    let plaintext =
+        age::decrypt(&identity, &ciphertext).map_err(|_| "本机解锁密钥与配置不匹配".to_string())?;
+    String::from_utf8(plaintext)
+        .map(SecretString::from)
+        .map_err(|_| "本机自动解锁数据不是有效 UTF-8".to_string())
+}
+
+fn ensure_secure_ssh_directory(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "配置文件路径缺少父目录".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|err| format!("创建 ~/.ssh 目录失败：{err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|err| format!("设置 ~/.ssh 目录权限失败：{err}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn machine_fingerprint() -> Result<String, String> {
+    let output = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .map_err(|err| format!("读取 Mac 机器标识失败：{err}"))?;
+    if !output.status.success() {
+        return Err("读取 Mac 机器标识失败".to_string());
+    }
+    let output = String::from_utf8_lossy(&output.stdout);
+    output
+        .lines()
+        .find(|line| line.contains("\"IOPlatformUUID\""))
+        .and_then(|line| line.split('"').nth(3))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Mac 机器标识为空".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn machine_fingerprint() -> Result<String, String> {
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(value) = std::fs::read_to_string(path) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    Err("无法读取 Linux machine-id".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn machine_fingerprint() -> Result<String, String> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt as _};
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    let subkey = wide(r"SOFTWARE\Microsoft\Cryptography");
+    let value = wide("MachineGuid");
+    let mut byte_len = 0_u32;
+    // SAFETY: 两个 UTF-16 字符串均以 NUL 结尾；首次调用只查询缓冲区长度。
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut byte_len,
+        )
+    };
+    if result != 0 || byte_len < 2 {
+        return Err(format!("读取 Windows MachineGuid 失败：{result}"));
+    }
+    let mut buffer = vec![0_u16; byte_len.div_ceil(2) as usize];
+    // SAFETY: 缓冲区按上次返回的字节数分配，指针在调用期间有效。
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut byte_len,
+        )
+    };
+    if result != 0 {
+        return Err(format!("读取 Windows MachineGuid 失败：{result}"));
+    }
+    let length = (byte_len as usize / 2).min(buffer.len());
+    let value = String::from_utf16_lossy(&buffer[..length])
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        Err("Windows MachineGuid 为空".to_string())
+    } else {
+        Ok(value)
+    }
+}
+
+fn bind_local_unlock_key(raw_key: &str, machine: &str, user_home: &str) -> SecretString {
+    let mut digest = Sha256::new();
+    digest.update(b"blip-local-unlock-v1\0");
+    digest.update(machine.as_bytes());
+    digest.update(b"\0");
+    digest.update(user_home.as_bytes());
+    digest.update(b"\0");
+    digest.update(raw_key.as_bytes());
+    SecretString::from(BASE64.encode(digest.finalize()))
+}
+
+fn bound_local_unlock_key(raw_key: &str) -> Result<SecretString, String> {
+    let machine = machine_fingerprint()?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| "无法确定当前用户主目录".to_string())?
+        .to_string_lossy()
+        .to_string();
+    Ok(bind_local_unlock_key(raw_key, &machine, &home))
+}
+
+fn load_local_unlock_key() -> Result<Option<SecretString>, String> {
+    let path = local_unlock_key_path()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("读取本机解锁密钥失败：{err}")),
+    };
+    let encoded = raw.trim();
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|err| format!("本机解锁密钥格式损坏：{err}"))?;
+    if bytes.len() != 32 {
+        return Err("本机解锁密钥长度无效".to_string());
+    }
+    bound_local_unlock_key(encoded).map(Some)
+}
+
+fn load_or_create_local_unlock_key() -> Result<SecretString, String> {
+    match load_local_unlock_key() {
+        Ok(Some(key)) => return Ok(key),
+        Ok(None) => {}
+        Err(message) => {
+            // 主密码已经在内存中时，本机解锁密钥只是可重建的缓存。
+            log::warn!("{message}；将重新生成本机解锁密钥");
+        }
+    }
+    let path = local_unlock_key_path()?;
+    ensure_secure_ssh_directory(&path)?;
+    let mut bytes = [0_u8; 32];
+    rand::fill(&mut bytes);
+    let encoded = BASE64.encode(bytes);
+    write_atomic(&path, encoded.as_bytes())
+        .map_err(|err| format!("写入本机解锁密钥失败：{err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("设置本机解锁密钥权限失败：{err}"))?;
+    }
+    bound_local_unlock_key(&encoded)
+}
+
+fn write_encrypted_config(
+    path: &Path,
+    passphrase: &SecretString,
+    document: &ConfigDocument,
+) -> Result<(), String> {
+    ensure_secure_ssh_directory(path)?;
+    let local_unlock = encrypt_master_password(passphrase, load_or_create_local_unlock_key()?)?;
+    let outer = EncryptedConfigFile {
+        version: CONFIG_SCHEMA_VERSION,
+        ciphertext: encrypt_document(document, passphrase.clone())?,
+        local_unlock: Some(local_unlock),
+    };
+    let raw =
+        toml::to_string_pretty(&outer).map_err(|err| format!("序列化加密配置外层失败：{err}"))?;
+    write_atomic(path, raw.as_bytes()).map_err(|err| format!("写入加密配置失败：{err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("设置配置文件权限失败：{err}"))?;
+    }
+    Ok(())
+}
+
+fn update_config(update: impl FnOnce(&mut ConfigDocument)) -> Result<(), String> {
+    // 加密和 fsync 可能持续一秒以上。单独串行化写入，并且不要在这期间占着
+    // 内存配置锁；这样前台读取密码或设置不会跟着后台保存一起卡住。
+    let _write = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| "配置写入状态已损坏，请重启 Blip".to_string())?;
+    let path = encrypted_config_path()?;
+    let (passphrase, mut document) = {
+        let unlocked = unlocked_config()
+            .lock()
+            .map_err(|_| "配置状态已损坏，请重启 Blip".to_string())?;
+        let unlocked = unlocked
+            .as_ref()
+            .ok_or_else(|| "配置尚未解锁".to_string())?;
+        (unlocked.passphrase.clone(), unlocked.document.clone())
+    };
+    update(&mut document);
+    write_encrypted_config(&path, &passphrase, &document)?;
+    unlocked_config()
+        .lock()
+        .map_err(|_| "配置状态已损坏，请重启 Blip".to_string())?
+        .as_mut()
+        .ok_or_else(|| "配置尚未解锁".to_string())?
+        .document = document;
+    Ok(())
+}
+
+fn read_config<T>(read: impl FnOnce(&ConfigDocument) -> T) -> Result<T, String> {
+    let unlocked = unlocked_config()
+        .lock()
+        .map_err(|_| "配置状态已损坏，请重启 Blip".to_string())?;
+    unlocked
+        .as_ref()
+        .map(|unlocked| read(&unlocked.document))
+        .ok_or_else(|| "配置尚未解锁".to_string())
 }
 
 pub(crate) fn config_dir() -> PathBuf {
@@ -323,14 +766,6 @@ fn read_config_file(name: &str) -> Option<(PathBuf, String)> {
         }
         Err(_) => None,
     }
-}
-
-fn profiles_path() -> PathBuf {
-    config_dir().join(PROFILES_FILE)
-}
-
-fn settings_path() -> PathBuf {
-    config_dir().join(SETTINGS_FILE)
 }
 
 fn directories_path() -> PathBuf {
@@ -410,38 +845,29 @@ fn load_profiles_from(path: &Path, raw: &str) -> Result<Vec<SavedProfile>, Strin
         .map_err(|err| preserve_corrupt_profiles(path, &err))
 }
 
-pub fn load_profiles() -> Vec<SavedProfile> {
+fn load_legacy_profiles() -> Vec<SavedProfile> {
     let Some((path, raw)) = read_config_file(PROFILES_FILE) else {
         return Vec::new();
     };
     match load_profiles_from(&path, &raw) {
         Ok(profiles) => profiles,
         Err(message) => {
-            PROFILES_SAVE_BLOCKED.store(true, Ordering::SeqCst);
-            if let Ok(mut warning) = PROFILES_WARNING.lock() {
-                *warning = Some(message.clone());
-            }
             log::warn!("{message}");
             Vec::new()
         }
     }
 }
 
-pub fn take_profiles_warning() -> Option<String> {
-    PROFILES_WARNING
-        .lock()
-        .ok()
-        .and_then(|mut warning| warning.take())
+pub fn load_profiles() -> Vec<SavedProfile> {
+    read_config(|document| document.profiles.clone()).unwrap_or_default()
 }
 
 pub fn save_profiles(profiles: &[SavedProfile]) -> Result<(), String> {
-    save_profiles_to(
-        &profiles_path(),
-        profiles,
-        PROFILES_SAVE_BLOCKED.load(Ordering::SeqCst),
-    )
+    let profiles = normalize_profiles(profiles.to_vec());
+    update_config(move |document| document.profiles = profiles)
 }
 
+#[cfg(test)]
 fn save_profiles_to(
     path: &Path,
     profiles: &[SavedProfile],
@@ -458,7 +884,7 @@ fn save_profiles_to(
     write_atomic(path, &json).map_err(|err| format!("写入连接配置失败：{err}"))
 }
 
-pub fn load_settings() -> AppSettings {
+fn load_legacy_settings() -> AppSettings {
     let Some((path, raw)) = read_config_file(SETTINGS_FILE) else {
         return AppSettings::default();
     };
@@ -471,12 +897,24 @@ pub fn load_settings() -> AppSettings {
     }
 }
 
-pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir).map_err(|err| format!("创建配置目录失败：{err}"))?;
-    let json =
-        serde_json::to_vec_pretty(settings).map_err(|err| format!("序列化设置失败：{err}"))?;
-    write_atomic(&settings_path(), &json).map_err(|err| format!("写入设置失败：{err}"))
+pub fn load_settings() -> AppSettings {
+    read_config(|document| document.settings.clone()).unwrap_or_default()
+}
+
+pub fn save_settings_with_lan_password(
+    settings: &AppSettings,
+    manual_password: Option<&str>,
+) -> Result<(), String> {
+    let settings = settings.clone();
+    let manual_password = manual_password.map(str::to_owned);
+    update_config(move |document| {
+        document.settings = settings;
+        if let Some(password) = manual_password {
+            document
+                .credentials
+                .insert(LAN_SFTP_PASSWORD_ACCOUNT.to_string(), password);
+        }
+    })
 }
 
 pub fn load_directory_history() -> DirectoryHistory {
@@ -554,10 +992,14 @@ fn write_atomic_with(
     std::fs::create_dir_all(parent)?;
     let temporary = temp_path(path);
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -576,210 +1018,196 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_atomic_with(path, bytes, replace_file)
 }
 
-#[cfg(target_os = "macos")]
-fn store_protected_password(service: &str, account: &str, password: &str) -> keyring::Result<()> {
-    let entry = ProtectedCredential::build(
-        service,
-        account,
-        AccessPolicy::RequireUserPresence,
-        None,
-        false,
-    )?;
-    entry.set_password(password)
-}
-
-#[cfg(target_os = "macos")]
-fn load_protected_password(service: &str, account: &str) -> keyring::Result<String> {
-    let entry = ProtectedCredential::build(
-        service,
-        account,
-        AccessPolicy::RequireUserPresence,
-        None,
-        false,
-    )?;
-    entry.get_password()
-}
-
-#[cfg(target_os = "macos")]
-fn delete_protected_password(service: &str, account: &str) -> keyring::Result<()> {
-    let entry = ProtectedCredential::build(
-        service,
-        account,
-        AccessPolicy::RequireUserPresence,
-        None,
-        false,
-    )?;
-    entry.delete_credential()
-}
-
-#[cfg(target_os = "macos")]
-fn is_missing_protected_keychain_entitlement(err: &keyring::Error) -> bool {
-    let source = match err {
-        keyring::Error::PlatformFailure(source) | keyring::Error::NoStorageAccess(source) => source,
-        _ => return false,
-    };
-    source
-        .downcast_ref::<security_framework::base::Error>()
-        .is_some_and(|err| err.code() == ERR_SEC_MISSING_ENTITLEMENT)
-}
-
-fn plain_entry(service: &str, account: &str) -> keyring::Result<keyring::Entry> {
-    keyring::Entry::new(service, account)
-}
-
-fn store_plain_password(service: &str, account: &str, password: &str) -> keyring::Result<()> {
-    plain_entry(service, account)?.set_password(password)
-}
-
-fn load_plain_password(service: &str, account: &str) -> keyring::Result<Option<String>> {
-    match plain_entry(service, account)?.get_password() {
-        Ok(password) => Ok(Some(password)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-fn delete_plain_password(service: &str, account: &str) {
-    if let Ok(entry) = plain_entry(service, account) {
-        let _ = entry.delete_credential();
-    }
-}
-
-pub fn store_lan_sftp_password(password: &str) -> Result<(), String> {
-    store_plain_password(KEYRING_SERVICE, LAN_SFTP_PASSWORD_ACCOUNT, password)
-        .map_err(|err| format!("保存局域网 SFTP 密码失败：{err}"))?;
-    delete_plain_password(LEGACY_KEYRING_SERVICE, LAN_SFTP_PASSWORD_ACCOUNT);
-    Ok(())
-}
-
 pub fn load_lan_sftp_password() -> Result<Option<String>, String> {
-    let current = load_plain_password(KEYRING_SERVICE, LAN_SFTP_PASSWORD_ACCOUNT)
-        .map_err(|err| format!("读取局域网 SFTP 密码失败：{err}"))?;
-    if current.is_some() {
-        return Ok(current);
-    }
-    let legacy = load_plain_password(LEGACY_KEYRING_SERVICE, LAN_SFTP_PASSWORD_ACCOUNT)
-        .map_err(|err| format!("读取旧版局域网 SFTP 密码失败：{err}"))?;
-    if let Some(password) = legacy.as_deref()
-        && let Err(err) = store_lan_sftp_password(password)
-    {
-        log::warn!("旧版局域网 SFTP 密码迁移失败：{err}");
-    }
-    Ok(legacy)
+    load_credential(LAN_SFTP_PASSWORD_ACCOUNT)
 }
 
-/// 把密码写进 Keychain。macOS 上优先写入要求用户在场的受保护条目：系统会先
-/// 尝试 Touch ID，并允许用 Mac 登录密码回退。未签名的开发二进制没有受保护
-/// Keychain 权限，此时保留旧 Keychain 存储，避免 `cargo run` 无法记住密码。
+fn store_credential(account: String, secret: String) -> Result<(), String> {
+    update_config(move |document| {
+        document.credentials.insert(account, secret);
+    })
+}
+
+fn load_credential(account: &str) -> Result<Option<String>, String> {
+    read_config(|document| document.credentials.get(account).cloned())
+}
+
+fn forget_credential(account: String) {
+    if let Err(message) = update_config(move |document| {
+        document.credentials.remove(&account);
+    }) {
+        log::warn!("删除加密配置中的凭据失败：{message}");
+    }
+}
+
+fn password_account(config: &SessionConfig) -> String {
+    format!("password:{}", config.credential_account())
+}
+
 pub fn store_password(config: &SessionConfig, password: &str) -> Result<(), String> {
-    let account = config.keyring_account();
-    #[cfg(target_os = "macos")]
-    {
-        match store_protected_password(KEYRING_SERVICE, &account, password) {
-            Ok(()) => {
-                delete_plain_password(KEYRING_SERVICE, &account);
-                delete_plain_password(LEGACY_KEYRING_SERVICE, &account);
-                let _ = delete_protected_password(LEGACY_KEYRING_SERVICE, &account);
-                return Ok(());
-            }
-            Err(err) if is_missing_protected_keychain_entitlement(&err) => {
-                log::warn!(
-                    "当前构建未获得受保护 Keychain 权限，密码暂存普通 Keychain；\
-                     使用带 provisioning profile 的签名应用后会自动迁移"
-                );
-            }
-            Err(err) => return Err(format!("写入 Touch ID 保护的钥匙串失败：{err}")),
-        }
-    }
-
-    store_plain_password(KEYRING_SERVICE, &account, password)
-        .map_err(|err| format!("写入系统凭据库失败：{err}"))?;
-    delete_plain_password(LEGACY_KEYRING_SERVICE, &account);
-    #[cfg(target_os = "macos")]
-    {
-        let _ = delete_protected_password(LEGACY_KEYRING_SERVICE, &account);
-    }
-    Ok(())
+    store_credential(password_account(config), password.to_string())
 }
 
-/// 从 Keychain 取密码；受保护条目由系统执行 Touch ID 优先、登录密码回退。
-/// 旧版普通 Keychain 条目在首次成功读取后会自动迁移。
 pub fn load_password(config: &SessionConfig) -> Result<Option<String>, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let account = config.keyring_account();
-        match load_protected_password(KEYRING_SERVICE, &account) {
-            Ok(password) => return Ok(Some(password)),
-            Err(keyring::Error::NoEntry) => {}
-            Err(err) if is_missing_protected_keychain_entitlement(&err) => {
-                log::debug!("当前构建无受保护 Keychain 权限，改读普通 Keychain");
-            }
-            Err(err) => return Err(format!("Touch ID 验证或钥匙串读取失败：{err}")),
-        }
-
-        let current_plain = load_plain_password(KEYRING_SERVICE, &account)
-            .map_err(|err| format!("读取系统钥匙串失败：{err}"))?;
-        if let Some(password) = current_plain {
-            match store_protected_password(KEYRING_SERVICE, &account, &password) {
-                Ok(()) => delete_plain_password(KEYRING_SERVICE, &account),
-                Err(err) if is_missing_protected_keychain_entitlement(&err) => {}
-                Err(err) => log::warn!("密码迁移到 Touch ID 钥匙串失败：{err}"),
-            }
-            return Ok(Some(password));
-        }
-
-        let legacy_protected = match load_protected_password(LEGACY_KEYRING_SERVICE, &account) {
-            Ok(password) => Some(password),
-            Err(keyring::Error::NoEntry) => None,
-            Err(err) if is_missing_protected_keychain_entitlement(&err) => None,
-            Err(err) => return Err(format!("读取旧版 Touch ID 钥匙串失败：{err}")),
-        };
-        let legacy = match legacy_protected {
-            Some(password) => Some(password),
-            None => load_plain_password(LEGACY_KEYRING_SERVICE, &account)
-                .map_err(|err| format!("读取旧版钥匙串失败：{err}"))?,
-        };
-        if let Some(password) = legacy {
-            if let Err(err) = store_password(config, &password) {
-                log::warn!("旧版密码迁移到 Blip 凭据项失败：{err}");
-            }
-            return Ok(Some(password));
-        }
-        Ok(None)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let account = config.keyring_account();
-        let current = load_plain_password(KEYRING_SERVICE, &account)
-            .map_err(|err| format!("读取系统凭据库失败：{err}"))?;
-        if current.is_some() {
-            return Ok(current);
-        }
-        let legacy = load_plain_password(LEGACY_KEYRING_SERVICE, &account)
-            .map_err(|err| format!("读取旧版系统凭据库失败：{err}"))?;
-        if let Some(password) = legacy.as_deref()
-            && let Err(err) = store_password(config, password)
-        {
-            log::warn!("旧版密码迁移到 Blip 凭据项失败：{err}");
-        }
-        Ok(legacy)
-    }
+    load_credential(&password_account(config))
 }
 
 pub fn forget_password(config: &SessionConfig) {
-    let account = config.keyring_account();
-    #[cfg(target_os = "macos")]
-    {
-        let _ = delete_protected_password(KEYRING_SERVICE, &account);
-        let _ = delete_protected_password(LEGACY_KEYRING_SERVICE, &account);
+    forget_credential(password_account(config));
+}
+
+fn key_passphrase_account(config: &SessionConfig) -> String {
+    format!("key-passphrase:{}", config.credential_account())
+}
+
+pub fn store_key_passphrase(config: &SessionConfig, passphrase: &str) -> Result<(), String> {
+    store_credential(key_passphrase_account(config), passphrase.to_string())
+}
+
+pub fn load_key_passphrase(config: &SessionConfig) -> Result<Option<String>, String> {
+    load_credential(&key_passphrase_account(config))
+}
+
+pub fn forget_key_passphrase(config: &SessionConfig) {
+    forget_credential(key_passphrase_account(config));
+}
+
+pub fn forget_profile_credential(profile: &SavedProfile) {
+    let config = config_for_profile(profile);
+    match profile.auth {
+        SavedAuth::Password => forget_password(&config),
+        SavedAuth::Key { .. } => forget_key_passphrase(&config),
     }
-    delete_plain_password(KEYRING_SERVICE, &account);
-    delete_plain_password(LEGACY_KEYRING_SERVICE, &account);
+}
+
+pub fn save_profile_removal(
+    profiles: &[SavedProfile],
+    removed: &SavedProfile,
+) -> Result<(), String> {
+    let profiles = normalize_profiles(profiles.to_vec());
+    let removed = removed.clone();
+    update_config(move |document| apply_profile_removal(document, profiles, &removed))
+}
+
+fn apply_profile_removal(
+    document: &mut ConfigDocument,
+    profiles: Vec<SavedProfile>,
+    removed: &SavedProfile,
+) {
+    document.profiles = profiles;
+    remove_profile_credential(document, removed);
+}
+
+fn remove_profile_credential(document: &mut ConfigDocument, profile: &SavedProfile) {
+    let config = config_for_profile(profile);
+    let account = match profile.auth {
+        SavedAuth::Password => password_account(&config),
+        SavedAuth::Key { .. } => key_passphrase_account(&config),
+    };
+    document.credentials.remove(&account);
+}
+
+/// 连接成功后的收藏、密码与旧凭据清理一次性落盘，避免一次连接连续做多轮
+/// 主密码派生，同时保证配置正文始终是一个一致快照。
+pub fn save_connection(
+    profiles: &[SavedProfile],
+    config: &SessionConfig,
+    remember_password: bool,
+    previous: Option<&SavedProfile>,
+    evicted: Option<&SavedProfile>,
+) -> Result<(), String> {
+    let profiles = normalize_profiles(profiles.to_vec());
+    let config = config.clone();
+    let previous = previous.cloned();
+    let evicted = evicted.cloned();
+    update_config(move |document| {
+        apply_connection_update(
+            document,
+            profiles,
+            &config,
+            remember_password,
+            previous.as_ref(),
+            evicted.as_ref(),
+        )
+    })
+}
+
+fn apply_connection_update(
+    document: &mut ConfigDocument,
+    profiles: Vec<SavedProfile>,
+    config: &SessionConfig,
+    remember_password: bool,
+    previous: Option<&SavedProfile>,
+    evicted: Option<&SavedProfile>,
+) {
+    document.profiles = profiles;
+    if let Some(evicted) = evicted {
+        remove_profile_credential(document, evicted);
+    }
+
+    let current_password = password_account(config);
+    let current_key_passphrase = key_passphrase_account(config);
+    match &config.auth {
+        AuthMethod::Password(password) => {
+            document.credentials.remove(&current_key_passphrase);
+            if remember_password {
+                document
+                    .credentials
+                    .insert(current_password.clone(), password.clone());
+            } else {
+                document.credentials.remove(&current_password);
+            }
+
+            if let Some(previous) = previous {
+                let old_config = config_for_profile(previous);
+                match previous.auth {
+                    SavedAuth::Password => {
+                        let old = password_account(&old_config);
+                        if old != current_password {
+                            document.credentials.remove(&old);
+                        }
+                    }
+                    SavedAuth::Key { .. } => {
+                        document
+                            .credentials
+                            .remove(&key_passphrase_account(&old_config));
+                    }
+                }
+            }
+        }
+        AuthMethod::PrivateKey { passphrase, .. } => {
+            document.credentials.remove(&current_password);
+            if remember_password {
+                if let Some(passphrase) = passphrase.as_deref().filter(|value| !value.is_empty()) {
+                    document
+                        .credentials
+                        .insert(current_key_passphrase.clone(), passphrase.to_string());
+                } else {
+                    document.credentials.remove(&current_key_passphrase);
+                }
+            } else {
+                document.credentials.remove(&current_key_passphrase);
+            }
+            if let Some(previous) = previous {
+                let old_config = config_for_profile(previous);
+                match previous.auth {
+                    SavedAuth::Password => {
+                        document.credentials.remove(&password_account(&old_config));
+                    }
+                    SavedAuth::Key { .. } => {
+                        let old = key_passphrase_account(&old_config);
+                        if old != current_key_passphrase {
+                            document.credentials.remove(&old);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn same_profile(left: &SavedProfile, right: &SavedProfile) -> bool {
-    left.host == right.host && left.username == right.username
+    left.host == right.host && left.port == right.port && left.username == right.username
 }
 
 fn oldest_profile_index(profiles: &[SavedProfile], unpinned_only: bool) -> Option<usize> {
@@ -806,20 +1234,43 @@ fn trim_profiles(profiles: &mut Vec<SavedProfile>) -> Option<SavedProfile> {
     Some(profiles.remove(index))
 }
 
-/// 记录/更新一条收藏（按 `user@host` 去重，端口变化视为同一收藏）。
+/// 记录/更新一条收藏（按 `user@host:port` 去重）。
 ///
 /// 已有条目保留原写入位置；新条目写到最前。超过上限时优先淘汰未置顶且最久未连接的条目。
 pub fn upsert_profile(profiles: &mut Vec<SavedProfile>, profile: SavedProfile) -> ProfileUpsert {
-    let (previous, index) = profiles
+    let index = profiles
         .iter()
         .position(|item| same_profile(item, &profile))
-        .map(|index| (Some(profiles.remove(index)), index))
-        .unwrap_or((None, 0));
+        .unwrap_or(0);
+    let previous = profiles
+        .iter()
+        .find(|item| same_profile(item, &profile))
+        .cloned();
+    profiles.retain(|item| !same_profile(item, &profile));
     profiles.insert(index.min(profiles.len()), profile);
     ProfileUpsert {
         previous,
         evicted: trim_profiles(profiles),
     }
+}
+
+/// 编辑收藏时允许修改唯一键，但不能覆盖另一条已有收藏。
+pub fn replace_profile(
+    profiles: &mut Vec<SavedProfile>,
+    previous: &SavedProfile,
+    profile: SavedProfile,
+) -> Result<ProfileUpsert, String> {
+    if same_profile(previous, &profile) {
+        return Ok(upsert_profile(profiles, profile));
+    }
+    if profiles.iter().any(|item| same_profile(item, &profile)) {
+        return Err("该主机、端口和用户名已在收藏中".to_string());
+    }
+    let previous = remove_profile(profiles, &previous.username, &previous.host, previous.port)
+        .ok_or_else(|| "原收藏已不存在，请重新打开设置后再试".to_string())?;
+    let mut result = upsert_profile(profiles, profile);
+    result.previous = Some(previous);
+    Ok(result)
 }
 
 pub fn unix_timestamp() -> i64 {
@@ -866,7 +1317,7 @@ fn migrate_password_with(
     Ok(true)
 }
 
-/// 编辑收藏导致端口变化时，先复制密码到新 account，成功后再删除旧 account。
+/// 编辑收藏导致连接标识变化时，先复制密码到新 account，成功后再删除旧 account。
 pub fn migrate_profile_password(
     previous: &SavedProfile,
     current: &SavedProfile,
@@ -878,23 +1329,45 @@ pub fn migrate_profile_password(
     let old_config = config_for_profile(previous);
     let new_config = config_for_profile(current);
     migrate_password_with(
-        &old_config.keyring_account(),
-        &new_config.keyring_account(),
+        &old_config.credential_account(),
+        &new_config.credential_account(),
         |_| load_password(&old_config),
         |_, password| store_password(&new_config, password),
         |_| forget_password(&old_config),
     )
 }
 
-/// 删除一条收藏（唯一键与写入时一致：user@host）。
+/// 编辑私钥收藏导致连接标识变化时，把密钥口令迁移到新的独立 account。
+pub fn migrate_profile_key_passphrase(
+    previous: &SavedProfile,
+    current: &SavedProfile,
+) -> Result<bool, String> {
+    if !matches!(previous.auth, SavedAuth::Key { .. })
+        || !matches!(current.auth, SavedAuth::Key { .. })
+    {
+        return Ok(false);
+    }
+    let old_config = config_for_profile(previous);
+    let new_config = config_for_profile(current);
+    migrate_password_with(
+        &key_passphrase_account(&old_config),
+        &key_passphrase_account(&new_config),
+        |_| load_key_passphrase(&old_config),
+        |_, passphrase| store_key_passphrase(&new_config, passphrase),
+        |_| forget_key_passphrase(&old_config),
+    )
+}
+
+/// 删除一条收藏（唯一键与写入时一致：user@host:port）。
 pub fn remove_profile(
     profiles: &mut Vec<SavedProfile>,
     username: &str,
     host: &str,
+    port: u16,
 ) -> Option<SavedProfile> {
     let index = profiles
         .iter()
-        .position(|item| item.host == host && item.username == username)?;
+        .position(|item| item.host == host && item.port == port && item.username == username)?;
     Some(profiles.remove(index))
 }
 
@@ -930,87 +1403,145 @@ mod tests {
 
     fn probe_config() -> SessionConfig {
         SessionConfig {
-            host: "blip-keychain-probe.invalid".to_string(),
+            host: "blip-config-probe.invalid".to_string(),
             port: 22,
             username: "tester".to_string(),
             auth: AuthMethod::Password(String::new()),
         }
     }
 
+    #[test]
+    fn favorite_title_keeps_the_login_endpoint_when_named() {
+        let mut favorite = profile("192.168.1.8", 22, "root");
+        assert_eq!(favorite.title(), "root@192.168.1.8:22");
+
+        favorite.name = Some("NAS".to_string());
+        assert_eq!(favorite.title(), "root@192.168.1.8:22-NAS");
+    }
+
     /// account 键必须带上端口，否则同一台机器的 22 和 2222 会互相覆盖。
     #[test]
-    fn keyring_account_is_unique_per_endpoint() {
+    fn credential_account_is_unique_per_endpoint() {
         let mut config = probe_config();
-        let a = config.keyring_account();
+        let a = config.credential_account();
         config.port = 2222;
-        let b = config.keyring_account();
+        let b = config.credential_account();
 
         assert_ne!(a, b);
         assert!(a.contains("tester@"));
         assert!(a.ends_with(":22"));
     }
 
-    /// 只有开发构建缺少 entitlement 时才允许回退普通 Keychain。用户取消
-    /// Touch ID/密码验证必须原样失败，否则一次“取消”就会绕过用户在场保护。
-    #[cfg(target_os = "macos")]
     #[test]
-    fn protected_keychain_fallback_never_bypasses_cancelled_authentication() {
-        let missing_entitlement = keyring::Error::PlatformFailure(Box::new(
-            security_framework::base::Error::from_code(ERR_SEC_MISSING_ENTITLEMENT),
-        ));
-        assert!(is_missing_protected_keychain_entitlement(
-            &missing_entitlement
-        ));
-
-        let user_cancelled = keyring::Error::PlatformFailure(Box::new(
-            security_framework::base::Error::from_code(-128),
-        ));
-        assert!(!is_missing_protected_keychain_entitlement(&user_cancelled));
-        assert!(!is_missing_protected_keychain_entitlement(
-            &keyring::Error::NoEntry
-        ));
-    }
-
-    #[test]
-    fn reconnect_replaces_existing_favorite_in_place() {
+    fn reconnect_replaces_the_same_endpoint_in_place() {
         let mut profiles = vec![
             profile("first", 22, "root"),
             profile("second", 22, "root"),
             profile("second", 22, "admin"),
         ];
 
-        let result = upsert_profile(&mut profiles, profile("second", 2022, "root"));
+        let mut updated = profile("second", 22, "root");
+        updated.last_connected = Some(42);
+        let result = upsert_profile(&mut profiles, updated);
 
         assert_eq!(profiles.len(), 3);
         assert_eq!(profiles[0].host, "first");
-        assert_eq!(profiles[1].port, 2022);
+        assert_eq!(profiles[1].last_connected, Some(42));
         assert_eq!(profiles[2].username, "admin");
         assert_eq!(result.previous.expect("旧收藏").port, 22);
     }
 
     #[test]
-    fn loading_keeps_the_newest_favorite_per_user_and_host() {
+    fn reconnect_removes_all_duplicate_endpoint_rows() {
+        let duplicate = profile("server", 22, "root");
+        let mut profiles = vec![
+            profile("first", 22, "root"),
+            duplicate.clone(),
+            duplicate,
+            profile("last", 22, "root"),
+        ];
+
+        let mut updated = profile("server", 22, "root");
+        updated.last_connected = Some(42);
+        upsert_profile(&mut profiles, updated);
+
+        assert_eq!(profiles.len(), 3);
+        assert_eq!(profiles[1].host, "server");
+        assert_eq!(profiles[1].last_connected, Some(42));
+    }
+
+    #[test]
+    fn different_ports_are_distinct_favorites() {
+        let mut profiles = vec![profile("server", 22, "root")];
+
+        let result = upsert_profile(&mut profiles, profile("server", 2022, "root"));
+
+        assert_eq!(profiles.len(), 2);
+        assert!(result.previous.is_none());
+        assert!(profiles.iter().any(|profile| profile.port == 22));
+        assert!(profiles.iter().any(|profile| profile.port == 2022));
+    }
+
+    #[test]
+    fn editing_identity_replaces_only_the_selected_favorite() {
+        let original = profile("server", 22, "root");
+        let mut profiles = vec![original.clone(), profile("server", 2022, "admin")];
+
+        let result = replace_profile(
+            &mut profiles,
+            &original,
+            profile("renamed.example", 2222, "deploy"),
+        )
+        .unwrap();
+
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles.iter().any(|profile| {
+            profile.host == "renamed.example"
+                && profile.port == 2222
+                && profile.username == "deploy"
+        }));
+        assert_eq!(result.previous.unwrap(), original);
+    }
+
+    #[test]
+    fn editing_cannot_overwrite_another_favorite() {
+        let original = profile("server", 22, "root");
+        let mut profiles = vec![original.clone(), profile("server", 2022, "root")];
+
+        let error =
+            replace_profile(&mut profiles, &original, profile("server", 2022, "root")).unwrap_err();
+
+        assert!(error.contains("已在收藏中"));
+        assert_eq!(profiles.len(), 2);
+    }
+
+    #[test]
+    fn loading_keeps_each_user_host_and_port_combination() {
         let profiles = normalize_profiles(vec![
             profile("server", 2022, "root"),
             profile("server", 22, "root"),
         ]);
 
-        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles.len(), 2);
         assert_eq!(profiles[0].port, 2022);
+        assert_eq!(profiles[1].port, 22);
     }
 
     #[test]
-    fn removing_a_favorite_keeps_other_users_on_the_same_host() {
+    fn removing_a_favorite_keeps_other_ports_and_users_on_the_same_host() {
         let mut profiles = vec![
             profile("server", 22, "root"),
+            profile("server", 2022, "root"),
             profile("server", 22, "admin"),
         ];
 
-        let removed = remove_profile(&mut profiles, "root", "server").unwrap();
+        let removed = remove_profile(&mut profiles, "root", "server", 22).unwrap();
 
         assert_eq!(removed.username, "root");
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].username, "admin");
+        assert_eq!(removed.port, 22);
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles.iter().any(|profile| profile.port == 2022));
+        assert!(profiles.iter().any(|profile| profile.username == "admin"));
     }
 
     #[test]
@@ -1129,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_port_migrates_password_before_deleting_old_account() {
+    fn changing_identity_migrates_password_before_deleting_old_account() {
         let calls = Rc::new(RefCell::new(Vec::new()));
         let load_calls = calls.clone();
         let store_calls = calls.clone();
@@ -1137,7 +1668,7 @@ mod tests {
 
         let migrated = migrate_password_with(
             "root@server:22",
-            "root@server:2022",
+            "deploy@renamed.example:2022",
             move |account| {
                 load_calls.borrow_mut().push(format!("load:{account}"));
                 Ok(Some("secret".to_string()))
@@ -1157,9 +1688,159 @@ mod tests {
             calls.borrow().as_slice(),
             [
                 "load:root@server:22",
-                "store:root@server:2022:secret",
+                "store:deploy@renamed.example:2022:secret",
                 "delete:root@server:22",
             ]
+        );
+    }
+
+    #[test]
+    fn key_passphrase_uses_a_separate_credential_account() {
+        let config = probe_config();
+
+        assert_eq!(
+            config.credential_account(),
+            "tester@blip-config-probe.invalid:22"
+        );
+        assert_eq!(
+            key_passphrase_account(&config),
+            "key-passphrase:tester@blip-config-probe.invalid:22"
+        );
+    }
+
+    #[test]
+    fn profile_removal_updates_profiles_and_credentials_together() {
+        let mut document = ConfigDocument::default();
+        let removed = profile("removed", 22, "root");
+        let kept = profile("kept", 22, "root");
+        document.profiles = vec![removed.clone(), kept.clone()];
+        document
+            .credentials
+            .insert("password:root@removed:22".into(), "removed-secret".into());
+        document
+            .credentials
+            .insert("password:root@kept:22".into(), "kept-secret".into());
+
+        apply_profile_removal(&mut document, vec![kept.clone()], &removed);
+
+        assert_eq!(document.profiles, vec![kept]);
+        assert!(
+            !document
+                .credentials
+                .contains_key("password:root@removed:22")
+        );
+        assert!(document.credentials.contains_key("password:root@kept:22"));
+    }
+
+    #[test]
+    fn connection_update_saves_password_and_cleans_replaced_credentials_once() {
+        let mut document = ConfigDocument::default();
+        let mut previous = profile("server", 22, "root");
+        previous.auth = SavedAuth::Key {
+            path: "/tmp/id".into(),
+        };
+        let evicted = profile("old-server", 22, "admin");
+        document.credentials.insert(
+            "key-passphrase:root@server:22".into(),
+            "old-key-secret".into(),
+        );
+        document.credentials.insert(
+            "password:admin@old-server:22".into(),
+            "evicted-secret".into(),
+        );
+        let config = SessionConfig {
+            host: "server".into(),
+            port: 2022,
+            username: "root".into(),
+            auth: AuthMethod::Password("new-password".into()),
+        };
+        let current = profile("server", 2022, "root");
+
+        apply_connection_update(
+            &mut document,
+            vec![current.clone()],
+            &config,
+            true,
+            Some(&previous),
+            Some(&evicted),
+        );
+
+        assert_eq!(document.profiles, vec![current]);
+        assert_eq!(
+            document.credentials.get("password:root@server:2022"),
+            Some(&"new-password".to_string())
+        );
+        assert!(
+            !document
+                .credentials
+                .contains_key("key-passphrase:root@server:22")
+        );
+        assert!(
+            !document
+                .credentials
+                .contains_key("password:admin@old-server:22")
+        );
+    }
+
+    #[test]
+    fn connection_update_forgets_key_passphrase_when_not_requested() {
+        let mut document = ConfigDocument::default();
+        let mut previous = profile("server", 22, "root");
+        previous.auth = SavedAuth::Key {
+            path: "/tmp/old-key".into(),
+        };
+        document
+            .credentials
+            .insert("key-passphrase:root@server:22".into(), "key-secret".into());
+        let config = SessionConfig {
+            host: "server".into(),
+            port: 2022,
+            username: "root".into(),
+            auth: AuthMethod::PrivateKey {
+                path: "/tmp/new-key".into(),
+                passphrase: None,
+            },
+        };
+
+        apply_connection_update(
+            &mut document,
+            Vec::new(),
+            &config,
+            false,
+            Some(&previous),
+            None,
+        );
+
+        assert!(
+            !document
+                .credentials
+                .contains_key("key-passphrase:root@server:22")
+        );
+        assert!(
+            !document
+                .credentials
+                .contains_key("key-passphrase:root@server:2022")
+        );
+    }
+
+    #[test]
+    fn connection_update_saves_key_passphrase_when_requested() {
+        let mut document = ConfigDocument::default();
+        let config = SessionConfig {
+            host: "server".into(),
+            port: 2022,
+            username: "root".into(),
+            auth: AuthMethod::PrivateKey {
+                path: "/tmp/id".into(),
+                passphrase: Some("key-secret".into()),
+            },
+        };
+
+        apply_connection_update(&mut document, Vec::new(), &config, true, None, None);
+
+        assert_eq!(
+            document.credentials.get("key-passphrase:root@server:2022"),
+            Some(&"key-secret".to_string())
         );
     }
 
@@ -1260,7 +1941,10 @@ mod tests {
         let settings = AppSettings {
             remote_open_behavior: RemoteOpenBehavior::CustomEditor,
             editor_path: Some(PathBuf::from("/Applications/Visual Studio Code.app")),
+            discovery_username: Some("小明".to_string()),
+            discovery_port: 21985,
             lan_sftp_root: Some(PathBuf::from("/Users/tester/Shared")),
+            lan_sftp_username: "phone".to_string(),
             lan_sftp_password_mode: LanSftpPasswordMode::Manual,
         };
         let json = serde_json::to_string(&settings).expect("序列化设置");
@@ -1274,6 +1958,9 @@ mod tests {
             previous_random.lan_sftp_password_mode,
             LanSftpPasswordMode::Default
         );
+        assert_eq!(previous_random.discovery_username, None);
+        assert_eq!(previous_random.discovery_port, DEFAULT_DISCOVERY_PORT);
+        assert_eq!(previous_random.lan_sftp_username, DEFAULT_LAN_SFTP_USERNAME);
 
         let previous_download: AppSettings =
             serde_json::from_str(r#"{"remote_open_behavior":"download"}"#).expect("迁移原下载设置");
@@ -1307,25 +1994,48 @@ mod tests {
         );
     }
 
-    /// 写-读-删一整圈。默认 `#[ignore]`：无人值守环境可能卡在系统凭据库授权弹窗上，
-    /// 需要本机手动跑 `cargo test keychain_round_trip -- --ignored`。
     #[test]
-    #[ignore = "会真的读写系统凭据库，需要人工授权"]
-    fn keychain_round_trip() {
-        let config = probe_config();
-        forget_password(&config);
+    fn encrypted_document_round_trips_and_rejects_the_wrong_password() {
+        let mut document = ConfigDocument::default();
+        document.profiles.push(profile("server", 22, "root"));
+        document
+            .credentials
+            .insert("password:root@server:22".into(), "s3cret-token".into());
+        let password = SecretString::from("correct horse battery staple".to_string());
 
-        store_password(&config, "s3cret-token").expect("写入钥匙串");
-        assert_eq!(
-            load_password(&config).expect("读取钥匙串").as_deref(),
-            Some("s3cret-token")
+        let encrypted = encrypt_document(&document, password.clone()).expect("加密配置");
+        assert!(!encrypted.contains("s3cret-token"));
+        let restored = decrypt_document(&encrypted, password).expect("解密配置");
+
+        assert_eq!(restored.profiles, document.profiles);
+        assert_eq!(restored.credentials, document.credentials);
+        assert!(
+            decrypt_document(&encrypted, SecretString::from("wrong password".to_string())).is_err()
+        );
+    }
+
+    #[test]
+    fn local_unlock_wraps_the_master_password_and_keeps_old_files_compatible() {
+        let password = SecretString::from("master password".to_string());
+        let local_key = SecretString::from(BASE64.encode([7_u8; 32]));
+
+        let wrapped = encrypt_master_password(&password, local_key.clone()).expect("包裹主密码");
+        let restored = decrypt_master_password(&wrapped, local_key).expect("自动解锁主密码");
+
+        assert_eq!(restored.expose_secret(), password.expose_secret());
+        assert!(
+            decrypt_master_password(&wrapped, SecretString::from(BASE64.encode([8_u8; 32])))
+                .is_err()
         );
 
-        forget_password(&config);
-        assert_eq!(
-            load_password(&config).expect("读取已删除凭证"),
-            None,
-            "删除后不应再读到"
-        );
+        let previous: EncryptedConfigFile =
+            toml::from_str("version = 1\nciphertext = 'old'").expect("读取旧配置外层");
+        assert!(previous.local_unlock.is_none());
+
+        let first_machine = bind_local_unlock_key("key", "machine-a", "/home/user");
+        let other_machine = bind_local_unlock_key("key", "machine-b", "/home/user");
+        let other_user = bind_local_unlock_key("key", "machine-a", "/home/other");
+        assert_ne!(first_machine.expose_secret(), other_machine.expose_secret());
+        assert_ne!(first_machine.expose_secret(), other_user.expose_secret());
     }
 }

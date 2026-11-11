@@ -11,7 +11,6 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::actions::Cancel;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
@@ -39,12 +38,7 @@ use crate::sftp::lan_server::DEFAULT_PASSWORD;
 use crate::sftp::types::{AuthMethod, DEFAULT_SSH_PORT, SessionConfig};
 use crate::ui::SessionState;
 
-#[cfg(target_os = "macos")]
-const PASSWORD_STORE_TOOLTIP: &str = "密码会存入 macOS 钥匙串";
-#[cfg(target_os = "windows")]
-const PASSWORD_STORE_TOOLTIP: &str = "密码会存入 Windows 凭据管理器";
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const PASSWORD_STORE_TOOLTIP: &str = "密码会存入系统密钥环";
+const PASSWORD_STORE_TOOLTIP: &str = "密码会存入主密码保护的 ~/.ssh/blip.toml";
 
 #[derive(Clone, Debug)]
 pub enum ToolbarEvent {
@@ -110,7 +104,7 @@ pub struct Toolbar {
     show_hidden_key_files: bool,
     choosing_key: bool,
     deploying_key: bool,
-    /// 加密私钥的口令。只在私钥模式下显示，且**从不落盘**。
+    /// 加密私钥的口令。只在私钥模式下显示；收藏可把它存入加密配置。
     key_passphrase: Entity<InputState>,
     profiles: Vec<SavedProfile>,
     discovered_devices: Vec<DiscoveredDevice>,
@@ -361,6 +355,18 @@ impl Toolbar {
             return;
         }
         self.prefill(profile, window, cx);
+        if matches!(profile.auth, SavedAuth::Key { .. }) {
+            match store::load_key_passphrase(&profile_config(profile)) {
+                Ok(passphrase) => self.key_passphrase.update(cx, |state, cx| {
+                    state.set_value(passphrase.unwrap_or_default(), window, cx)
+                }),
+                Err(message) => {
+                    self.error = Some(format!("读取收藏中的密钥口令失败：{message}").into());
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         self.start_connect(cx);
     }
 
@@ -407,35 +413,68 @@ impl Toolbar {
     pub(crate) fn commit_profile(
         &mut self,
         profile: SavedProfile,
-        migrate_previous_password: bool,
+        previous: Option<&SavedProfile>,
+        preserve_existing_credential: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let mut profiles = self.profiles.clone();
         let current = profile.clone();
-        let result = store::upsert_profile(&mut profiles, profile);
+        let result = match previous {
+            Some(previous) => store::replace_profile(&mut profiles, previous, profile)?,
+            None => store::upsert_profile(&mut profiles, profile),
+        };
         store::save_profiles(&profiles)?;
 
-        if migrate_previous_password && let Some(previous) = &result.previous {
-            match (&previous.auth, &current.auth) {
-                (SavedAuth::Password, SavedAuth::Password) => {
-                    if let Err(message) = store::migrate_profile_password(previous, &current) {
-                        window.push_notification(
-                            Notification::error(format!("收藏已保存，但密码迁移失败：{message}")),
-                            cx,
-                        );
+        if let Some(previous) = &result.previous {
+            let migration = if preserve_existing_credential {
+                match (&previous.auth, &current.auth) {
+                    (SavedAuth::Password, SavedAuth::Password) => {
+                        store::migrate_profile_password(previous, &current)
+                    }
+                    (SavedAuth::Key { .. }, SavedAuth::Key { .. }) => {
+                        store::migrate_profile_key_passphrase(previous, &current)
+                    }
+                    (SavedAuth::Password, SavedAuth::Key { .. }) => {
+                        store::forget_password(&profile_config(previous));
+                        Ok(false)
+                    }
+                    (SavedAuth::Key { .. }, SavedAuth::Password) => {
+                        store::forget_key_passphrase(&profile_config(previous));
+                        Ok(false)
                     }
                 }
-                (SavedAuth::Password, SavedAuth::Key { .. }) => {
-                    store::forget_password(&profile_config(previous));
+            } else {
+                let old_config = profile_config(previous);
+                let new_config = profile_config(&current);
+                match &previous.auth {
+                    SavedAuth::Password
+                        if !matches!(&current.auth, SavedAuth::Password)
+                            || old_config.credential_account()
+                                != new_config.credential_account() =>
+                    {
+                        store::forget_password(&old_config);
+                    }
+                    SavedAuth::Key { .. }
+                        if !matches!(&current.auth, SavedAuth::Key { .. })
+                            || old_config.credential_account()
+                                != new_config.credential_account() =>
+                    {
+                        store::forget_key_passphrase(&old_config);
+                    }
+                    _ => {}
                 }
-                _ => {}
+                Ok(false)
+            };
+            if let Err(message) = migration {
+                window.push_notification(
+                    Notification::error(format!("收藏已保存，但凭据迁移失败：{message}")),
+                    cx,
+                );
             }
         }
         if let Some(evicted) = result.evicted {
-            if matches!(evicted.auth, SavedAuth::Password) {
-                store::forget_password(&profile_config(&evicted));
-            }
+            store::forget_profile_credential(&evicted);
             window.push_notification(
                 Notification::info(format!(
                     "收藏已达 50 条，已移除最久未使用的“{}”",
@@ -451,59 +490,6 @@ impl Toolbar {
         Ok(())
     }
 
-    pub(crate) fn favorite_current(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        if self.state != SessionState::Connected {
-            return Err("请先连接服务器".to_string());
-        }
-        let host = self.host.read(cx).value().trim().to_string();
-        let port = self
-            .port
-            .read(cx)
-            .value()
-            .trim()
-            .parse::<u16>()
-            .unwrap_or(DEFAULT_SSH_PORT);
-        let username = self.username.read(cx).value().trim().to_string();
-        let existing = self
-            .profiles
-            .iter()
-            .find(|profile| profile.host == host && profile.username == username);
-        let (name, pinned) = existing
-            .map(|profile| (profile.name.clone(), profile.pinned))
-            .unwrap_or((None, false));
-        let auth = if self.use_key {
-            SavedAuth::Key {
-                path: self
-                    .key_path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-            }
-        } else {
-            SavedAuth::Password
-        };
-        self.commit_profile(
-            SavedProfile {
-                name,
-                host,
-                port,
-                username,
-                auth,
-                pinned,
-                last_connected: Some(store::unix_timestamp()),
-            },
-            false,
-            window,
-            cx,
-        )?;
-        window.push_notification(Notification::success("当前连接已收藏"), cx);
-        Ok(())
-    }
-
     pub(crate) fn set_profile_pinned(
         &mut self,
         mut profile: SavedProfile,
@@ -512,89 +498,30 @@ impl Toolbar {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         profile.pinned = pinned;
-        self.commit_profile(profile, true, window, cx)
+        self.commit_profile(profile, None, true, window, cx)
     }
 
-    pub(crate) fn confirm_remove_profile(
+    pub(crate) fn remove_profile(
         &mut self,
-        profile: SavedProfile,
-        window: &mut Window,
+        profile: &SavedProfile,
         cx: &mut Context<Self>,
-    ) {
-        let toolbar = cx.entity().downgrade();
-        let title = profile.title();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            let profile = profile.clone();
-            let toolbar = toolbar.clone();
-            dialog
-                .title("删除收藏")
-                .w(px(440.))
-                .overlay_closable(false)
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .child(SharedString::from(format!("确定删除“{title}”吗？")))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(_cx.theme().muted_foreground)
-                                .child("同时删除系统凭据库中的密码。此操作不可撤销。"),
-                        ),
-                )
-                .footer(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("remove-profile-cancel")
-                                .label("取消")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                        )
-                        .child(
-                            Button::new("remove-profile-confirm")
-                                .danger()
-                                .label("删除收藏和密码")
-                                .on_click(move |_, window, cx| {
-                                    let result = toolbar.update(cx, |toolbar, cx| {
-                                        let mut profiles = toolbar.profiles.clone();
-                                        let Some(removed) = store::remove_profile(
-                                            &mut profiles,
-                                            &profile.username,
-                                            &profile.host,
-                                        ) else {
-                                            return Ok(());
-                                        };
-                                        store::save_profiles(&profiles)?;
-                                        if matches!(removed.auth, SavedAuth::Password) {
-                                            store::forget_password(&profile_config(&removed));
-                                        }
-                                        toolbar.profiles = profiles.clone();
-                                        cx.notify();
-                                        cx.emit(ToolbarEvent::ProfilesChanged(profiles));
-                                        Ok::<_, String>(())
-                                    });
-                                    match result {
-                                        Ok(Ok(())) => {
-                                            window.push_notification(
-                                                Notification::success("收藏及其密码已删除"),
-                                                cx,
-                                            );
-                                            window.close_dialog(cx);
-                                        }
-                                        Ok(Err(message)) => window
-                                            .push_notification(Notification::error(message), cx),
-                                        Err(error) => window.push_notification(
-                                            Notification::error(format!("删除收藏失败：{error}")),
-                                            cx,
-                                        ),
-                                    }
-                                }),
-                        ),
-                )
-        });
+    ) -> Result<(), String> {
+        let mut profiles = self.profiles.clone();
+        let removed = store::remove_profile(
+            &mut profiles,
+            &profile.username,
+            &profile.host,
+            profile.port,
+        )
+        .ok_or_else(|| "收藏已不存在，请重新打开设置后再试".to_string())?;
+        store::save_profile_removal(&profiles, &removed)?;
+        self.profiles = profiles.clone();
+        cx.notify();
+        cx.emit(ToolbarEvent::ProfilesChanged(profiles));
+        Ok(())
     }
 
-    /// 直接把一组凭证填进表单（演示模式用），不读也不写系统凭据库。
+    /// 直接把一组凭证填进表单（演示模式用），不读也不写加密配置。
     #[cfg(feature = "demo-server")]
     #[allow(clippy::too_many_arguments)]
     pub fn fill_credentials(
@@ -648,7 +575,7 @@ impl Toolbar {
         }
     }
 
-    /// 校验表单并组装连接配置。密码留空时回落到系统凭据库里的旧密码。
+    /// 校验表单并组装连接配置。密码留空时回落到加密配置里的旧密码。
     pub fn build_config(&self, cx: &App) -> Result<SessionConfig, SharedString> {
         let host = self.host.read(cx).value().trim().to_string();
         if host.is_empty() {
@@ -837,10 +764,7 @@ impl Toolbar {
                             |menu, device| {
                                 let device = device.clone();
                                 let device_toolbar = devices_toolbar.clone();
-                                let label = format!(
-                                    "{} · {}:{}",
-                                    device.hostname, device.address, device.port
-                                );
+                                let label = device.display_label();
                                 menu.item(
                                     PopupMenuItem::new(label)
                                         .icon(IconName::Laptop)
@@ -851,7 +775,6 @@ impl Toolbar {
                                                 toolbar
                                                     .select_discovered_device(&device, window, cx)
                                             });
-                                            window.dispatch_action(Box::new(Cancel), cx);
                                         }),
                                 )
                             },
@@ -951,7 +874,7 @@ impl Toolbar {
                                 "记住密码"
                             })
                             .tooltip(match (use_key, self.remember) {
-                                (true, _) => "私钥口令不会保存；连接可用收藏按钮单独保存",
+                                (true, _) => "私钥口令可在收藏中保存到加密配置",
                                 (false, true) => PASSWORD_STORE_TOOLTIP,
                                 (false, false) => "不保存密码",
                             })
@@ -1008,7 +931,7 @@ impl Render for Toolbar {
         let theme = cx.theme().clone();
         let connection_row = self.render_connection_row(cx);
 
-        // 错误（表单校验 / 凭据库 / 连接被拒）只在真出错时多占一行：
+        // 错误（表单校验 / 加密配置 / 连接被拒）只在真出错时多占一行：
         // 常态下工具栏就是一条连接栏，不再有第二条操作栏。
         let error_row = self.error.clone().map(|error| {
             h_flex()

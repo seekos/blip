@@ -31,11 +31,15 @@ Blip 希望把这些麻烦留在后台：
 也可以保存到标准的 `~/.ssh/known_hosts`。如果服务器密钥发生变化，应用会明确警告并
 默认拒绝连接。
 
-### 密码只进系统凭据库
+### 一份主密码保护的配置
 
-连接配置与密码分开保存：主机、端口和用户名写入应用配置，密码则保存在
-macOS Keychain、Windows Credential Manager 或 Linux Secret Service 中。macOS 正式签名版还会优先使用
-Touch ID，并允许回退到 Mac 登录密码。
+首次启动时，Blip 会要求设置主密码。收藏、应用设置、连接密码和私钥口令统一经 age
+加密后保存在 `~/.ssh/blip.toml`。同时生成 `~/.ssh/.blip-unlock-key`（Unix 权限为 `0600`），
+并绑定本机机器标识和当前用户，用于像 MobaXterm 的“只在新账户或新电脑询问”模式一样自动解锁；主密码不会明文写盘，
+也不会调用 macOS Keychain、Windows Credential Manager 或 Linux Secret Service。
+旧配置升级后只需再输入一次主密码，后续启动会自动解锁。将 `blip.toml` 复制到其他电脑后，
+必须输入原主密码；验证成功后，新电脑会生成自己的本机解锁信息。
+首次创建时会迁移旧版收藏和应用设置；旧版系统凭据库中的密码不会读取，需要连接时重新输入。
 同时支持私钥认证，留空私钥路径即可自动查找常用密钥：
 
 ```text
@@ -57,7 +61,7 @@ Touch ID，并允许回退到 Mac 登录密码。
 Blip 启动时会同时启动一个局域网 SFTP 服务，默认监听 `2022` 端口；如果该端口已被
 占用，会自动改用一个空闲端口。点击窗口底部的 `SFTP · 地址:端口` 即可查看并复制连接命令
 和登录密码；登录用户名固定为 `zy`，默认密码为 `88888888`。也可以在“设置”中切换为
-手动密码；手动密码保存在系统凭据库，不会写入设置文件。
+手动密码；手动密码同样保存在主密码保护的 `~/.ssh/blip.toml` 中。
 
 共享目录默认是当前用户主目录，也可以在“设置”中选择其它文件夹，保存后立即生效。服务只
 允许访问该共享目录以内的文件，退出 Blip 后自动停止。默认密码仅适合可信局域网内的临时传输，
@@ -65,20 +69,23 @@ Blip 启动时会同时启动一个局域网 SFTP 服务，默认监听 `2022` �
 
 ### 自动发现同一局域网里的 Blip
 
-连接栏的雷达按钮会列出在线的 Blip 设备，选择一项即可回填 IP、端口和用户名。每台设备
-首次启动时生成并持久化一个 UUID；设备名称来自系统主机名，不会在广播里携带密码。
+连接栏的雷达按钮会列出在线的 Blip 设备，选择一项即可回填 IP、端口和登录用户名。每台
+设备首次启动时生成并持久化一个 UUID。可在“设置”中填写可选的发现用户名：填写后其他设备
+显示 `用户名~IP:端口`，留空则显示系统主机名与 IP；广播不会携带密码。UDP 发现端口也可在
+“设置”中修改，使用 UDP 发现的设备需要配置为相同端口。
 
 发现同时走两条链路：
 
-- **UDP 定向广播**：监听 `1985/UDP`，每 3 秒重新枚举所有 `Up`、非回环且支持广播的 IPv4 网卡，
+- **UDP 定向广播**：默认监听 `1985/UDP`，每 3 秒重新枚举所有 `Up`、非回环且支持广播的 IPv4 网卡，
   由每个网卡的 IP 和掩码计算定向广播地址，再绑定该网卡源 IP 发送 JSON 心跳；连续 10 秒
   未收到心跳即离线。这样不会因为 Windows 的默认路由或虚拟网卡而把所有广播发到同一路径。
 - **mDNS / DNS-SD**：同时注册并浏览 `_blip-sftp._tcp.local.`，由标准服务记录携带 UUID、
-  主机名和 SFTP 端口。它的代码和协议更标准，在支持 Bonjour/Avahi 的网络里很稳定；但企业
+  主机名、可选发现用户名和 SFTP 端口。它的代码和协议更标准，在支持 Bonjour/Avahi 的网络里很稳定；但企业
   Wi-Fi、访客网络、VPN 或防火墙可能禁用组播，所以不单独依赖它。
 
 两条链路发现的结果按 UUID 合并。若列表一直为空，请允许 Blip 访问本地网络，并放行
-`1985/UDP` 和 mDNS 的 `5353/UDP`；启用客户端隔离的无线网络本身不允许设备互相发现。
+设置中配置的 UDP 发现端口（默认 `1985/UDP`）和 mDNS 的 `5353/UDP`；启用客户端隔离的无线
+网络本身不允许设备互相发现。
 
 Blip 支持同时打开多个传输窗口，但整台电脑只运行一套自动发现：第一个实例负责 UDP/mDNS，
 其它实例通过仅监听 `127.0.0.1` 的本机协调通道共享同一份在线设备列表，各自的连接与传输
@@ -152,16 +159,40 @@ Blip 使用 GPUI Kit 构建界面，SSH/SFTP 操作则运行在独立 Tokio 线�
 
 - 目录上传复制安全的相对符号链接；越界链接和下载侧符号链接仍会跳过。除 `.gitignore` 外，暂不支持自定义排除规则。
 - 本地删除会进入系统回收站；远程删除是永久操作，执行前会用应用内模态框确认。
-- 默认构建的 `.app` 使用 ad-hoc 签名，因此开发运行会回退到普通 Keychain；Touch ID 保护需要
-  带 provisioning profile 的正式签名。对外分发还需要 Developer ID 签名和公证。
+- 本机解锁密钥丢失或更换电脑后，仍必须使用原主密码；Blip 不提供密码找回或系统凭据库回退。
+  对外分发仍需要 Developer ID 签名和公证。
 
 ## 构建与测试
 
 ```bash
-scripts/build.sh                # macOS、Linux、Windows 使用同一入口
+scripts/build.sh                # 默认构建桌面端及当前系统支持的移动端
 scripts/build.sh -v 0.2.0       # 指定本次构建版本；下次构建会沿用
+scripts/build.sh --mobile ios   # 桌面端 + iOS IPA（仅 macOS）
+scripts/build.sh --mobile android # 桌面端 + Android APK（macOS/Linux）
+scripts/build.sh --no-mobile    # 仅构建桌面端
 cargo test --all-features       # 运行完整测试
 ```
+
+移动端打包会使用同一个版本号，并只生成产物、不自动安装或启动。产物统一写入 `dist/`；
+未设置 `BLIP_DEVELOPMENT_TEAM` 时 iOS IPA 不签名。Android 未配置发布 keystore 时会使用本机
+调试证书生成可安装的 `debug-signed.apk`，该包只能用于测试，不能对外发布。iOS 使用 Xcode
+自动签名；先在 Xcode 登录开发者账号并安装证书，然后设置 Team ID：
+
+```bash
+BLIP_DEVELOPMENT_TEAM=XXXXXXXXXX scripts/build.sh release --mobile ios
+```
+
+Android Release 签名信息只从环境变量读取，不会写入生成的 Gradle 工程或仓库：
+
+```bash
+BLIP_ANDROID_KEYSTORE=/absolute/path/release.jks \
+BLIP_ANDROID_KEY_ALIAS=blip \
+BLIP_ANDROID_STORE_PASSWORD='store-password' \
+BLIP_ANDROID_KEY_PASSWORD='key-password' \
+scripts/build.sh release --mobile android
+```
+
+若 key password 与 store password 相同，可省略 `BLIP_ANDROID_KEY_PASSWORD`。
 
 GitHub Actions 会在三个原生构建环境中并行生成发布包：
 

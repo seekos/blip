@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+  <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+  <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+  <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+  <uses-feature android:name="android.hardware.vulkan.level" android:required="false" android:version="0" />
+  <uses-feature android:name="android.hardware.vulkan.version" android:required="false" android:version="0x00401000" />
+  <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+  <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+  <application
+      android:allowBackup="false"
+      android:hardwareAccelerated="true"
+      android:largeHeap="true"
+      android:icon="@mipmap/ic_launcher"
+      android:label="Blip"
+      android:roundIcon="@mipmap/ic_launcher_round"
+      android:supportsRtl="true"
+      android:theme="@style/GpuiTheme">
+    <activity
+        android:name="com.amov.blip.mobile.BlipActivity"
+        android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density"
+        android:exported="true"
+        android:launchMode="singleTask"
+        android:screenOrientation="unspecified"
+        android:theme="@style/GpuiSplashTheme"
+        android:windowSoftInputMode="adjustResize">
+      <meta-data android:name="android.app.lib_name" android:value="${nativeLibraryName}" />
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+    <service
+        android:name="com.amov.blip.mobile.BlipBackgroundService"
+        android:exported="false"
+        android:foregroundServiceType="connectedDevice"
+        android:stopWithTask="false" />
+    <activity
+        android:name="dev.gpui.mobile.GpuiPathPicker"
+        android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density"
+        android:exported="false"
+        android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    <activity
+        android:name="dev.gpui.mobile.GpuiPickerActivity"
+        android:exported="false"
+        android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    <activity
+        android:name="com.amov.blip.mobile.BlipDirectoryPicker"
+        android:exported="false"
+        android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+  </application>
+</manifest>
+

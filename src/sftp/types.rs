@@ -28,8 +28,8 @@ impl SessionConfig {
         format!("{}@{}:{}", self.username, self.host, self.port)
     }
 
-    /// 系统凭据库中的 account 键，保证不同端口的不同主机不会互相覆盖。
-    pub fn keyring_account(&self) -> String {
+    /// 加密配置中的凭据键，保证不同端口的不同主机不会互相覆盖。
+    pub fn credential_account(&self) -> String {
         format!("{}@{}:{}", self.username, self.host, self.port)
     }
 }

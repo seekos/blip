@@ -6,6 +6,7 @@ pub mod file_pane;
 pub mod mock;
 pub mod toolbar;
 pub mod transfer_panel;
+pub mod tray;
 pub mod upload_conflict;
 pub mod workspace;
 

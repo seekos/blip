@@ -2,7 +2,8 @@
 //!
 //! 服务随应用启动，优先监听 `0.0.0.0:2022`；端口被占用时让系统分配空闲端口。
 //! 虚拟根目录默认映射到当前用户主目录，也可在设置中切换；任何越界路径与指向共享
-//! 目录外的符号链接都会被拒绝。登录密码默认为 `88888888`，也可在设置中修改；
+//! 目录外的符号链接都会被拒绝。登录用户名默认为 `zy`、密码默认为 `88888888`，
+//! 两者均可在设置中修改；
 //! 主机密钥会持久化，避免
 //! 客户端反复提示变更。
 
@@ -25,7 +26,6 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 
 const DEFAULT_PORT: u16 = 2022;
-const USERNAME: &str = "zy";
 pub(crate) const DEFAULT_PASSWORD: &str = "88888888";
 const READ_DIR_BATCH: usize = 128;
 
@@ -92,7 +92,7 @@ impl Drop for TransferActivityGuard {
 pub struct ServerInfo {
     pub host: String,
     pub port: u16,
-    pub username: String,
+    username: Arc<RwLock<String>>,
     password: Arc<RwLock<String>>,
     root: Arc<RwLock<PathBuf>>,
 }
@@ -103,7 +103,22 @@ impl ServerInfo {
     }
 
     pub fn command(&self) -> String {
-        format!("sftp -P {} {}@{}", self.port, self.username, self.host)
+        format!("sftp -P {} {}@{}", self.port, self.username(), self.host)
+    }
+
+    pub fn username(&self) -> String {
+        self.username
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn set_username(&self, username: &str) -> Result<(), String> {
+        *self
+            .username
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = selected_username(username)?;
+        Ok(())
     }
 
     pub fn password(&self) -> String {
@@ -142,11 +157,12 @@ impl ServerInfo {
 /// 启动内置服务。返回后监听端口已经占好，不存在 UI 先显示、随后端口被抢走的竞态。
 pub fn start(
     configured_root: Option<PathBuf>,
+    configured_username: &str,
     manual_password: Option<String>,
     transfer_activity: TransferActivity,
 ) -> Result<ServerInfo, String> {
     let root = canonical_root(configured_root)?;
-    let username = USERNAME.to_string();
+    let username = Arc::new(RwLock::new(selected_username(configured_username)?));
     let password = selected_password(manual_password)?;
     let listener = bind_listener(DEFAULT_PORT)?;
     let port = listener
@@ -206,6 +222,17 @@ pub fn start(
         password,
         root: info_root,
     })
+}
+
+fn selected_username(username: &str) -> Result<String, String> {
+    let username = username.trim();
+    if username.is_empty() {
+        return Err("SFTP 登录用户名不能为空".to_string());
+    }
+    if username.chars().any(char::is_whitespace) {
+        return Err("SFTP 登录用户名不能包含空白字符".to_string());
+    }
+    Ok(username.to_string())
 }
 
 fn canonical_root(configured_root: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -301,7 +328,7 @@ fn load_or_create_host_key() -> Result<PrivateKey, String> {
 }
 
 struct Credentials {
-    username: String,
+    username: Arc<RwLock<String>>,
     password: Arc<RwLock<String>>,
 }
 
@@ -311,7 +338,11 @@ impl Credentials {
             .password
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        user == self.username && password == expected.as_bytes()
+        let username = self
+            .username
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        user == username.as_str() && password == expected.as_bytes()
     }
 }
 
@@ -908,7 +939,7 @@ mod tests {
         let info = ServerInfo {
             host: "127.0.0.1".into(),
             port: DEFAULT_PORT,
-            username: USERNAME.into(),
+            username: Arc::new(RwLock::new("zy".into())),
             password: Arc::new(RwLock::new("123456".into())),
             root: Arc::new(RwLock::new(temp_root("manual-password"))),
         };
@@ -918,6 +949,27 @@ mod tests {
         info.set_password(None).expect("恢复默认密码");
         assert_eq!(info.password(), DEFAULT_PASSWORD);
         assert!(selected_password(Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn changing_username_updates_authentication() {
+        let username = Arc::new(RwLock::new("zy".to_string()));
+        let password = Arc::new(RwLock::new("123456".to_string()));
+        let info = ServerInfo {
+            host: "127.0.0.1".into(),
+            port: DEFAULT_PORT,
+            username: username.clone(),
+            password: password.clone(),
+            root: Arc::new(RwLock::new(temp_root("username"))),
+        };
+        let credentials = Credentials { username, password };
+
+        assert!(credentials.accepts("zy", b"123456"));
+        info.set_username(" phone ").expect("更新用户名");
+        assert_eq!(info.username(), "phone");
+        assert!(!credentials.accepts("zy", b"123456"));
+        assert!(credentials.accepts("phone", b"123456"));
+        assert!(info.set_username(" ").is_err());
     }
 
     #[cfg(unix)]
@@ -1057,7 +1109,7 @@ mod tests {
             .expect("监听测试端口");
         let address = listener.local_addr().expect("读取测试端口");
         let credentials = Arc::new(Credentials {
-            username: "lan-user".into(),
+            username: Arc::new(RwLock::new("lan-user".into())),
             password: Arc::new(RwLock::new("123456".into())),
         });
         let mut server = LanServer {

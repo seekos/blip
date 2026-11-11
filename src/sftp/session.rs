@@ -16,7 +16,7 @@ use log::warn;
 use russh::client::{self, Handle};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, decode_secret_key};
 use russh_sftp::{
-    client::{SftpSession, error::Error as SftpClientError},
+    client::{Config as SftpConfig, SftpSession, error::Error as SftpClientError},
     protocol::StatusCode,
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -34,6 +34,8 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 /// 连续无响应的保活次数上限。
 const KEEPALIVE_MAX: usize = 3;
+/// 用满常见服务器的 2 MiB SSH 通道窗口，避免高延迟 Wi-Fi 下被 512 KiB 写队列限速。
+const SFTP_CONCURRENT_WRITES: usize = 64;
 
 /// 一次连接允许采用的主机密钥信任方式。
 #[derive(Clone)]
@@ -88,6 +90,13 @@ fn ssh_client_config() -> client::Config {
         keepalive_interval: Some(KEEPALIVE_INTERVAL),
         keepalive_max: KEEPALIVE_MAX,
         nodelay: true,
+        ..Default::default()
+    }
+}
+
+fn sftp_client_config() -> SftpConfig {
+    SftpConfig {
+        max_concurrent_writes: SFTP_CONCURRENT_WRITES,
         ..Default::default()
     }
 }
@@ -1063,10 +1072,13 @@ async fn connect_with_sources(
         .map_err(|_| anyhow!("启动 SFTP 子系统超时"))?
         .map_err(|err| anyhow!("服务器拒绝 SFTP 子系统：{err}"))?;
 
-    let sftp = timeout(CONNECT_TIMEOUT, SftpSession::new(channel.into_stream()))
-        .await
-        .map_err(|_| anyhow!("SFTP 握手超时"))?
-        .map_err(|err| anyhow!("SFTP 握手失败：{err}"))?;
+    let sftp = timeout(
+        CONNECT_TIMEOUT,
+        SftpSession::new_with_config(channel.into_stream(), sftp_client_config()),
+    )
+    .await
+    .map_err(|_| anyhow!("SFTP 握手超时"))?
+    .map_err(|err| anyhow!("SFTP 握手失败：{err}"))?;
 
     let sftp = Arc::new(sftp);
 
@@ -1650,6 +1662,15 @@ mod tests {
         assert_eq!(select_lane_index(&loads, 0), Some(2));
         assert_eq!(select_lane_index(&loads, 3), Some(3));
         assert_eq!(select_lane_index(&[None, None], 0), None);
+    }
+
+    #[test]
+    fn sftp_upload_pipeline_fills_the_ssh_window_without_larger_packets() {
+        let defaults = SftpConfig::default();
+        let config = sftp_client_config();
+        assert_eq!(config.max_concurrent_writes, 64);
+        assert_eq!(config.max_write_packet_len, defaults.max_write_packet_len);
+        assert_eq!(config.max_packet_len, defaults.max_packet_len);
     }
 
     /// 前两次「主机不可达」、第三次成功 → 整体成功，且确实试了三次。

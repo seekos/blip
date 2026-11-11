@@ -1822,12 +1822,8 @@ async fn upload_file_once(
             remote_temp.size.unwrap_or(0)
         )));
     }
-    let remote_hash = hash_remote_file(sftp, &temp, cancel).await?;
-    if remote_hash != prepared.checkpoint.sha256 {
-        return Err(anyhow!(
-            "远端临时文件内容校验失败，本地源可能在上传期间发生变化；原文件未被替换"
-        ));
-    }
+    // SSH 传输本身已有完整性校验；若再经 SFTP 读回整个临时文件，会让大文件上传
+    // 额外消耗一遍同等大小的下行流量。这里保留远端类型/长度、本地源身份和原子发布检查。
 
     // 1) 继承原文件的权限位 —— 可执行位丢了最难查。
     //    失败只警告、不中断：相比「传完的数据不要了」，丢一个权限位是小事。

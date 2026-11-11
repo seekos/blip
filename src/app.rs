@@ -9,11 +9,12 @@
 //! 重入提醒：GPUI 的 `Entity::update` 是独占租约，在某个实体被更新期间再更新它会
 //! panic。所以工具栏事件里只更新 `workspace`，工作区事件里只更新 `toolbar`。
 
-use std::path::PathBuf;
+use std::{cell::Cell, path::PathBuf, rc::Rc};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _,
+    alert::Alert,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
@@ -55,7 +56,7 @@ pub struct ScpApp {
     lan_idle_sleep_guard: Option<ActivityGuard>,
     lan_idle_sleep_request_pending: bool,
     _discovery: Option<DiscoveryService>,
-    /// 当前这次连接实际使用的配置。密码框可能为空（收藏会从系统凭据库补密码），
+    /// 当前这次连接实际使用的配置。密码框可能为空（收藏会从加密配置补密码），
     /// 成功后必须保存这里的认证信息，不能再从空白表单反推。
     pending_config: Option<SessionConfig>,
     version: String,
@@ -69,14 +70,30 @@ struct SettingsDraft {
     active_tab: SettingsTab,
     profiles: Vec<SavedProfile>,
     selected_profile: Option<SavedProfile>,
+    creating_profile: bool,
     profile_use_key: bool,
     profile_password_visible: bool,
+    profile_key_passphrase_visible: bool,
     profile_error: Option<SharedString>,
+    feedback: Option<SettingsFeedback>,
     remote_open_behavior: RemoteOpenBehavior,
     editor_path: Option<PathBuf>,
     lan_sftp_root: Option<PathBuf>,
     lan_sftp_password_mode: LanSftpPasswordMode,
     password_visible: bool,
+    saving: bool,
+    error: Option<SharedString>,
+}
+
+#[derive(Clone)]
+enum SettingsFeedback {
+    Success(SharedString),
+    Error(SharedString),
+}
+
+struct MasterPasswordDraft {
+    password_visible: bool,
+    saving: bool,
     error: Option<SharedString>,
 }
 
@@ -149,50 +166,127 @@ fn favorite_password_update(
     Ok((!typed.is_empty()).then(|| typed.to_string()))
 }
 
+fn new_favorite_profile(
+    name: &str,
+    host: &str,
+    port: &str,
+    username: &str,
+    use_key: bool,
+    key_path: &str,
+) -> Result<SavedProfile, SharedString> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("请填写主机地址".into());
+    }
+    let port =
+        parse_port(port).ok_or_else(|| SharedString::from("端口号必须是 1–65535 之间的整数"))?;
+    let username = username.trim();
+    if username.is_empty() {
+        return Err("请填写用户名".into());
+    }
+    let name = name.trim();
+    let auth = if use_key {
+        SavedAuth::Key {
+            path: expand_tilde(key_path.trim()).to_string_lossy().to_string(),
+        }
+    } else {
+        SavedAuth::Password
+    };
+    Ok(SavedProfile {
+        name: (!name.is_empty()).then(|| name.to_string()),
+        host: host.to_string(),
+        port,
+        username: username.to_string(),
+        auth,
+        pinned: false,
+        last_connected: None,
+    })
+}
+
+fn parse_port(value: &str) -> Option<u16> {
+    value.trim().parse::<u16>().ok().filter(|port| *port > 0)
+}
+
+fn favorite_tooltip(profile: &SavedProfile) -> String {
+    let name = profile
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("未命名");
+    let auth = match &profile.auth {
+        SavedAuth::Password => "认证：密码".to_string(),
+        SavedAuth::Key { path } if path.trim().is_empty() => {
+            "认证：私钥\n私钥：自动查找".to_string()
+        }
+        SavedAuth::Key { path } => format!("认证：私钥\n私钥：{path}"),
+    };
+    format!(
+        "名称：{name}\n登录名：{}\n主机/IP：{}\n端口：{}\n{auth}\n\n双击连接",
+        profile.username, profile.host, profile.port
+    )
+}
+
 impl ScpApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let profiles = store::load_profiles();
-        let profiles_warning = store::take_profiles_warning();
-        let settings = store::load_settings();
-        let server_password = match settings.lan_sftp_password_mode {
-            LanSftpPasswordMode::Default => Ok(None),
-            LanSftpPasswordMode::Manual => store::load_lan_sftp_password().and_then(|password| {
-                password
-                    .map(Some)
-                    .ok_or_else(|| "手动密码尚未设置，请在设置中填写".to_string())
-            }),
+        let (auto_unlocked, auto_unlock_failed) = match store::try_auto_unlock_config() {
+            Ok(unlocked) => (unlocked, false),
+            Err(message) => {
+                log::warn!("自动解锁配置失败，将改为手动输入主密码：{message}");
+                (false, true)
+            }
+        };
+        let profiles = if auto_unlocked {
+            store::load_profiles()
+        } else {
+            Vec::new()
+        };
+        let settings = if auto_unlocked {
+            store::load_settings()
+        } else {
+            AppSettings::default()
         };
         let (lan_transfer_activity, lan_transfer_events) =
             crate::sftp::lan_server::transfer_activity();
-        let lan_server = server_password
-            .and_then(|password| {
-                crate::sftp::lan_server::start(
-                    settings.lan_sftp_root.clone(),
-                    password,
-                    lan_transfer_activity.clone(),
-                )
-            })
-            .map_err(|message| {
-                log::error!("内置局域网 SFTP 服务启动失败：{message}");
-                SharedString::from(message)
-            });
-        if let Ok(info) = &lan_server {
-            log::info!(
-                "局域网 SFTP 已启动：{}@{}，共享目录 {}",
-                info.username,
-                info.endpoint(),
-                info.root().display()
-            );
-        }
-        let toolbar = cx.new(|cx| Toolbar::new(profiles.clone(), window, cx));
-        let discovery =
-            match crate::discovery::start(lan_server.as_ref().ok().map(|info| info.port)) {
-                Ok(discovery) => Some(discovery),
-                Err(message) => {
-                    log::error!("局域网设备发现启动失败：{message}");
-                    None
+        let lan_server: Result<ServerInfo, SharedString> = if auto_unlocked {
+            let server_password = match settings.lan_sftp_password_mode {
+                LanSftpPasswordMode::Default => Ok(None),
+                LanSftpPasswordMode::Manual => {
+                    store::load_lan_sftp_password().and_then(|password| {
+                        password
+                            .map(Some)
+                            .ok_or_else(|| "手动密码尚未设置，请在设置中填写".to_string())
+                    })
                 }
             };
+            server_password
+                .and_then(|password| {
+                    crate::sftp::lan_server::start(
+                        settings.lan_sftp_root.clone(),
+                        &settings.lan_sftp_username,
+                        password,
+                        lan_transfer_activity.clone(),
+                    )
+                })
+                .map_err(|message| {
+                    log::error!("内置局域网 SFTP 服务启动失败：{message}");
+                    SharedString::from(message)
+                })
+        } else {
+            Err(SharedString::from("配置尚未解锁"))
+        };
+        let toolbar = cx.new(|cx| Toolbar::new(profiles.clone(), window, cx));
+        let discovery = match crate::discovery::start(
+            lan_server.as_ref().ok().map(|info| info.port),
+            settings.discovery_username.as_deref(),
+            settings.discovery_port,
+        ) {
+            Ok(discovery) => Some(discovery),
+            Err(message) => {
+                log::error!("局域网设备发现启动失败：{message}");
+                None
+            }
+        };
         let discovery_events = discovery
             .as_ref()
             .map(|discovery| discovery.events().clone());
@@ -298,9 +392,9 @@ impl ScpApp {
                         // 标题栏跟着会话状态走：`Blip — user@host`。
                         app.sync_window_title(window, cx);
 
-                        // 连接成功才落盘凭证，避免把错误密码写进钥匙串。
+                        // 连接成功才落盘凭证，避免把错误密码写进加密配置。
                         if state == SessionState::Connected && !was_connected {
-                            app.persist_connection(cx);
+                            app.persist_connection(window, cx);
                         } else if state == SessionState::Disconnected {
                             // 认证失败、超时或主动断开后，绝不能把这份配置用于下一次成功事件。
                             app.pending_config = None;
@@ -344,13 +438,328 @@ impl ScpApp {
             _lan_transfer_pump: lan_transfer_pump,
         };
 
-        app.prefill_last_profile(window, cx);
         app.sync_window_title(window, cx);
         app.check_for_updates(cx);
-        if let Some(message) = profiles_warning {
-            window.push_notification(Notification::error(message), cx);
+        if auto_unlocked {
+            app.prefill_last_profile(window, cx);
+        } else {
+            let this = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                Self::open_master_password_dialog(this, auto_unlock_failed, window, cx);
+            });
         }
         app
+    }
+
+    fn open_master_password_dialog(
+        app: WeakEntity<Self>,
+        auto_unlock_failed: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let creating = !store::is_config_initialized();
+        let dialog_window_handle = window.window_handle();
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder(if creating {
+                    "设置主密码"
+                } else {
+                    "输入主密码"
+                })
+        });
+        let confirmation = creating.then(|| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder("再次输入主密码")
+            })
+        });
+        let draft = cx.new(|_| MasterPasswordDraft {
+            password_visible: false,
+            saving: false,
+            error: None,
+        });
+        let focus_on_mount = Rc::new(Cell::new(true));
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if focus_on_mount.replace(false) {
+                let password = password.clone();
+                window.defer(cx, move |window, cx| {
+                    password.focus_handle(cx).focus(window, cx);
+                });
+            }
+
+            let snapshot = draft.read(cx);
+            let password_visible = snapshot.password_visible;
+            let saving = snapshot.saving;
+            let error = snapshot.error.clone();
+            let visibility_draft = draft.clone();
+            let visibility_password = password.clone();
+            let visibility_confirmation = confirmation.clone();
+            let submit_draft = draft.clone();
+            let submit_password = password.clone();
+            let submit_confirmation = confirmation.clone();
+            let submit_app = app.clone();
+            let skip_unlock = app.clone();
+
+            dialog
+                .title(if creating {
+                    "设置 Blip 主密码"
+                } else {
+                    "解锁 Blip 配置"
+                })
+                .w(px(480.))
+                .close_button(false)
+                .overlay_closable(false)
+                .keyboard(false)
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_3()
+                        .child(div().text_sm().child(if creating {
+                            "主密码用于加密收藏、应用设置和保存的连接凭据。"
+                        } else {
+                            "输入这一次主密码后，本机以后将自动解锁配置。"
+                        }))
+                        .when(auto_unlock_failed, |this| {
+                            this.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().warning)
+                                    .child(
+                                        "本机自动解锁信息已失效。输入主密码可重新绑定本机；如果仍失败，配置正文可能已损坏。",
+                                    ),
+                            )
+                        })
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .child(Input::new(&password).disabled(saving).w_full()),
+                                )
+                                .child(
+                                    Button::new("master-password-visibility")
+                                        .ghost()
+                                        .icon(if password_visible {
+                                            IconName::EyeOff
+                                        } else {
+                                            IconName::Eye
+                                        })
+                                        .accessibility_label(if password_visible {
+                                            "隐藏主密码"
+                                        } else {
+                                            "显示主密码"
+                                        })
+                                        .disabled(saving)
+                                        .on_click(move |_, window, cx| {
+                                            let visible =
+                                                !visibility_draft.read(cx).password_visible;
+                                            visibility_password.update(cx, |input, cx| {
+                                                input.set_masked(!visible, window, cx)
+                                            });
+                                            if let Some(confirmation) = &visibility_confirmation {
+                                                confirmation.update(cx, |input, cx| {
+                                                    input.set_masked(!visible, window, cx)
+                                                });
+                                            }
+                                            visibility_draft.update(cx, |draft, cx| {
+                                                draft.password_visible = visible;
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                        )
+                        .when_some(confirmation.clone(), |this, confirmation| {
+                            this.child(Input::new(&confirmation).disabled(saving).w_full())
+                        })
+                        .when_some(error, |this, error| {
+                            this.child(div().text_sm().text_color(cx.theme().danger).child(error))
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if creating {
+                                    "Blip 会把解锁密钥绑定到本机和当前用户；复制配置到其他电脑仍需主密码。"
+                                } else {
+                                    "解锁信息保存在 ~/.ssh/.blip-unlock-key，不使用系统密码存储。"
+                                }),
+                        ),
+                )
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .when(!creating, |this| {
+                            this.child(
+                                Button::new("master-password-skip")
+                                    .label("暂不解锁")
+                                    .disabled(saving)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = skip_unlock.update(cx, |app, cx| {
+                                            app.toolbar.update(cx, |toolbar, cx| {
+                                                toolbar.set_error(
+                                                    Some(
+                                                        "配置未解锁：收藏、设置和保存的凭据暂不可用"
+                                                            .into(),
+                                                    ),
+                                                    cx,
+                                                )
+                                            });
+                                        });
+                                        window.close_dialog(cx);
+                                        window.push_notification(
+                                            Notification::warning(
+                                                "已进入未解锁模式；仍可手动填写连接信息",
+                                            ),
+                                            cx,
+                                        );
+                                    }),
+                            )
+                        })
+                        .child(
+                            Button::new("master-password-submit")
+                                .primary()
+                                .label(if creating {
+                                    "创建并解锁"
+                                } else if auto_unlock_failed {
+                                    "解锁并修复"
+                                } else {
+                                    "解锁"
+                                })
+                                .loading(saving)
+                                .disabled(saving)
+                                .on_click(move |_, _window, cx| {
+                                let password = submit_password.read(cx).value().to_string();
+                                if password.is_empty() {
+                                    submit_draft.update(cx, |draft, cx| {
+                                        draft.error = Some("主密码不能为空".into());
+                                        cx.notify();
+                                    });
+                                    return;
+                                }
+                                if let Some(confirmation) = &submit_confirmation
+                                    && confirmation.read(cx).value() != password.as_str()
+                                {
+                                    submit_draft.update(cx, |draft, cx| {
+                                        draft.error = Some("两次输入的主密码不一致".into());
+                                        cx.notify();
+                                    });
+                                    return;
+                                }
+
+                                submit_draft.update(cx, |draft, cx| {
+                                    draft.saving = true;
+                                    draft.error = None;
+                                    cx.notify();
+                                });
+                                let submit_draft = submit_draft.clone();
+                                let submit_app = submit_app.clone();
+                                cx.spawn(async move |cx| {
+                                    let result = cx
+                                        .background_executor()
+                                        .spawn(async move {
+                                            if creating {
+                                                store::initialize_config(&password)
+                                            } else {
+                                                store::unlock_config(&password)
+                                            }
+                                        })
+                                        .await;
+                                    match result {
+                                        Ok(()) => {
+                                            let _ = cx.update_window(
+                                                dialog_window_handle,
+                                                |_, window, cx| {
+                                                    let _ = submit_app.update(cx, |app, cx| {
+                                                        app.apply_unlocked_config(window, cx)
+                                                    });
+                                                    window.close_dialog(cx);
+                                                },
+                                            );
+                                        }
+                                        Err(message) => {
+                                            submit_draft.update(cx, |draft, cx| {
+                                                draft.saving = false;
+                                                draft.error = Some(message.into());
+                                                cx.notify();
+                                            });
+                                        }
+                                    }
+                                })
+                                .detach();
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn apply_unlocked_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let profiles = store::load_profiles();
+        let settings = store::load_settings();
+        let server_password = match settings.lan_sftp_password_mode {
+            LanSftpPasswordMode::Default => Ok(None),
+            LanSftpPasswordMode::Manual => store::load_lan_sftp_password().and_then(|password| {
+                password
+                    .map(Some)
+                    .ok_or_else(|| "手动密码尚未设置，请在设置中填写".to_string())
+            }),
+        };
+        self.lan_server = server_password
+            .and_then(|password| {
+                crate::sftp::lan_server::start(
+                    settings.lan_sftp_root.clone(),
+                    &settings.lan_sftp_username,
+                    password,
+                    self.lan_transfer_activity.clone(),
+                )
+            })
+            .map_err(|message| {
+                log::error!("内置局域网 SFTP 服务启动失败：{message}");
+                SharedString::from(message)
+            });
+        if let Ok(info) = &self.lan_server {
+            log::info!(
+                "局域网 SFTP 已启动：{}@{}，共享目录 {}",
+                info.username(),
+                info.endpoint(),
+                info.root().display()
+            );
+        }
+        if let Some(discovery) = &self._discovery {
+            if let Err(message) = discovery.set_discovery_port(settings.discovery_port) {
+                log::warn!("更新 UDP 设备发现端口失败：{message}");
+                window.push_notification(
+                    Notification::error(format!("配置已解锁，但发现端口应用失败：{message}")),
+                    cx,
+                );
+            }
+            if let Err(message) = discovery.set_username(settings.discovery_username.as_deref()) {
+                log::warn!("更新设备发现用户名失败：{message}");
+            }
+            let port = self.lan_server.as_ref().ok().map(|server| server.port);
+            if let Err(message) = discovery.set_port(port) {
+                log::warn!("更新设备发现服务端口失败：{message}");
+            }
+        }
+
+        self.profiles = profiles.clone();
+        self.settings = settings.clone();
+        self.toolbar
+            .update(cx, |toolbar, cx| toolbar.set_profiles(profiles, cx));
+        self.workspace
+            .update(cx, |workspace, cx| workspace.set_settings(settings, cx));
+        self.prefill_last_profile(window, cx);
+        if let Err(message) = &self.lan_server {
+            window.push_notification(
+                Notification::error(format!("配置已解锁，但局域网 SFTP 启动失败：{message}")),
+                cx,
+            );
+        }
     }
 
     fn set_lan_transfer_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -619,92 +1028,85 @@ impl ScpApp {
     // 凭证
     // -----------------------------------------------------------------------
 
-    /// 连接成功后只持久化“记住密码”偏好，并刷新已有收藏的最近使用时间。
-    /// 新收藏只能由设置弹层的“收藏当前连接”显式创建。
-    fn persist_connection(&mut self, cx: &mut Context<Self>) {
+    /// 连接成功后自动加入收藏，并按“记住密码”偏好保存本次实际使用的密码。
+    fn persist_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.pending_config.clone() else {
             log::warn!("连接成功但缺少实际连接配置，跳过连接持久化");
             return;
         };
         let remember = self.toolbar.read(cx).snapshot(cx).remember;
         let prepared = prepare_profile_persistence(&config);
-        let mut previous_profile = None;
-
-        if let Some(existing) = self
+        let existing = self
             .profiles
             .iter()
-            .find(|profile| profile.host == config.host && profile.username == config.username)
-            .cloned()
-        {
-            let mut updated = prepared.profile.clone();
+            .find(|profile| {
+                profile.host == config.host
+                    && profile.port == config.port
+                    && profile.username == config.username
+            })
+            .cloned();
+        let mut updated = prepared.profile.clone();
+        if let Some(existing) = &existing {
             updated.name = existing.name.clone();
             updated.pinned = existing.pinned;
-            let mut profiles = self.profiles.clone();
-            let result = store::upsert_profile(&mut profiles, updated);
-            match store::save_profiles(&profiles) {
-                Ok(()) => {
-                    previous_profile = result.previous;
-                    self.profiles = profiles.clone();
-                    self.toolbar
+        }
+        let mut profiles = self.profiles.clone();
+        let result = store::upsert_profile(&mut profiles, updated);
+        let profile_retained = profiles.iter().any(|profile| {
+            profile.host == config.host
+                && profile.port == config.port
+                && profile.username == config.username
+        });
+        let previous = profile_retained.then_some(result.previous).flatten();
+        let evicted = result.evicted;
+        let has_secret = match &config.auth {
+            AuthMethod::Password(_) => prepared.password.is_some(),
+            AuthMethod::PrivateKey { passphrase, .. } => passphrase.is_some(),
+        };
+        let remember = remember && profile_retained && has_secret;
+
+        // age 的主密码派生是 CPU 密集型工作。收藏和凭据合并成一次写入，并在
+        // 后台完成；连接成功后 UI 可以立即继续响应。
+        cx.spawn_in(window, async move |this, cx| {
+            let persisted_profiles = profiles.clone();
+            let persisted_evicted = evicted.clone();
+            let task = cx.background_executor().spawn(async move {
+                store::save_connection(
+                    &persisted_profiles,
+                    &config,
+                    remember,
+                    previous.as_ref(),
+                    persisted_evicted.as_ref(),
+                )?;
+                Ok::<_, String>((persisted_profiles, persisted_evicted))
+            });
+
+            let result = task.await;
+            let _ = this.update_in(cx, |app, window, cx| match result {
+                Ok((profiles, evicted)) => {
+                    if let Some(evicted) = evicted {
+                        window.push_notification(
+                            Notification::info(format!(
+                                "收藏已达 50 条，已移除最久未使用的“{}”",
+                                evicted.title()
+                            )),
+                            cx,
+                        );
+                    }
+                    app.profiles = profiles.clone();
+                    app.toolbar
                         .update(cx, |toolbar, cx| toolbar.set_profiles(profiles, cx));
                 }
                 Err(err) => {
-                    log::warn!("刷新收藏最近连接时间失败：{err}");
-                    self.toolbar.update(cx, |toolbar, cx| {
+                    log::warn!("自动保存收藏失败：{err}");
+                    app.toolbar.update(cx, |toolbar, cx| {
                         toolbar
-                            .set_error(Some(format!("连接成功，但更新收藏失败：{err}").into()), cx)
+                            .set_error(Some(format!("连接成功，但保存收藏失败：{err}").into()), cx)
                     });
                 }
-            }
-        }
-
-        if let Some(password) = prepared.password
-            && remember
-        {
-            let password_config = config.clone();
-            let old_password_config = previous_profile
-                .as_ref()
-                .filter(|profile| matches!(profile.auth, SavedAuth::Password))
-                .map(profile_password_config)
-                .filter(|old| old.keyring_account() != password_config.keyring_account());
-            // 写系统凭据库可能触发授权弹窗，放到后台线程；失败时回到前台
-            // 把原因显示在工具栏上 —— 只写日志等于没告诉用户。
-            let this = cx.entity().downgrade();
-            cx.spawn(async move |_app, cx| {
-                let task = cx.background_executor().spawn(async move {
-                    store::store_password(&password_config, &password)?;
-                    if let Some(old) = old_password_config {
-                        store::forget_password(&old);
-                    }
-                    Ok::<_, String>(())
-                });
-
-                if let Err(err) = task.await {
-                    log::warn!("保存密码失败：{err}");
-                    let _ = this.update(cx, |app, cx| {
-                        let message =
-                            SharedString::from(format!("保存密码到系统凭据库失败：{err}"));
-                        app.toolbar
-                            .update(cx, |toolbar, cx| toolbar.set_error(Some(message), cx));
-                    });
-                }
-            })
-            .detach();
-        } else if matches!(config.auth, AuthMethod::Password(_)) {
-            store::forget_password(&config);
-            if let Some(previous) = previous_profile
-                && matches!(previous.auth, SavedAuth::Password)
-            {
-                let old = profile_password_config(&previous);
-                if old.keyring_account() != config.keyring_account() {
-                    store::forget_password(&old);
-                }
-            }
-        } else if let Some(previous) = previous_profile
-            && matches!(previous.auth, SavedAuth::Password)
-        {
-            store::forget_password(&profile_password_config(&previous));
-        }
+            });
+        })
+        .detach();
     }
 
     fn persist_installed_key(&mut self, private_key: &std::path::Path, cx: &mut Context<Self>) {
@@ -721,7 +1123,11 @@ impl ScpApp {
         let Some(existing) = self
             .profiles
             .iter()
-            .find(|profile| profile.host == config.host && profile.username == config.username)
+            .find(|profile| {
+                profile.host == config.host
+                    && profile.port == config.port
+                    && profile.username == config.username
+            })
             .cloned()
         else {
             return;
@@ -742,7 +1148,7 @@ impl ScpApp {
                 last_connected: Some(store::unix_timestamp()),
             },
         );
-        if let Err(err) = store::save_profiles(&profiles) {
+        if let Err(err) = store::save_profile_removal(&profiles, &existing) {
             log::warn!("保存密钥连接配置失败：{err}");
             self.toolbar.update(cx, |toolbar, cx| {
                 toolbar.set_error(
@@ -753,9 +1159,6 @@ impl ScpApp {
                 )
             });
             return;
-        }
-        if matches!(existing.auth, SavedAuth::Password) {
-            store::forget_password(&profile_password_config(&existing));
         }
         self.profiles = profiles.clone();
         self.toolbar
@@ -802,10 +1205,12 @@ impl ScpApp {
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let password_mode = self.settings.lan_sftp_password_mode;
         let profiles = self.toolbar.read(cx).profiles_for_display();
-        let can_favorite_current = self.toolbar.read(cx).state() == SessionState::Connected;
-        let (manual_password, password_error) = match store::load_lan_sftp_password() {
-            Ok(password) => (password.unwrap_or_default(), None),
-            Err(message) => (String::new(), Some(SharedString::from(message))),
+        let (manual_password, password_error) = match password_mode {
+            LanSftpPasswordMode::Default => (String::new(), None),
+            LanSftpPasswordMode::Manual => match store::load_lan_sftp_password() {
+                Ok(password) => (password.unwrap_or_default(), None),
+                Err(message) => (String::new(), Some(SharedString::from(message))),
+            },
         };
         let manual_password_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -813,9 +1218,27 @@ impl ScpApp {
                 .masked(true)
                 .placeholder("输入手动密码")
         });
+        let discovery_username_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(self.settings.discovery_username.clone().unwrap_or_default())
+                .placeholder("留空则显示计算机名")
+        });
+        let lan_sftp_username_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(self.settings.lan_sftp_username.clone())
+                .placeholder("SFTP 登录用户名")
+        });
+        let discovery_port_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(self.settings.discovery_port.to_string())
+                .placeholder("1–65535")
+        });
         let profile_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("名称（可选）"));
+        let profile_host_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("主机名或 IP"));
         let profile_port_input = cx.new(|cx| InputState::new(window, cx).placeholder("1–65535"));
+        let profile_username_input = cx.new(|cx| InputState::new(window, cx).placeholder("用户名"));
         let profile_key_path_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("私钥文件路径；留空则自动查找"));
         let profile_password_input = cx.new(|cx| {
@@ -823,18 +1246,27 @@ impl ScpApp {
                 .masked(true)
                 .placeholder("留空则保留原密码")
         });
+        let profile_key_passphrase_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("留空则保留原密钥口令")
+        });
         let draft = cx.new(|_| SettingsDraft {
             active_tab: SettingsTab::Favorites,
             profiles,
             selected_profile: None,
+            creating_profile: false,
             profile_use_key: false,
             profile_password_visible: false,
+            profile_key_passphrase_visible: false,
             profile_error: None,
+            feedback: None,
             remote_open_behavior: self.settings.remote_open_behavior,
             editor_path: self.settings.editor_path.clone(),
             lan_sftp_root: self.settings.lan_sftp_root.clone(),
             lan_sftp_password_mode: password_mode,
             password_visible: false,
+            saving: false,
             error: if password_mode == LanSftpPasswordMode::Manual {
                 password_error
             } else {
@@ -851,14 +1283,18 @@ impl ScpApp {
                 active_tab,
                 profiles,
                 selected_profile,
+                creating_profile,
                 profile_use_key,
                 profile_password_visible,
+                profile_key_passphrase_visible,
                 profile_error,
+                feedback,
                 selected,
                 editor_path,
                 lan_sftp_root,
                 lan_sftp_password_mode,
                 password_visible,
+                saving,
                 error,
             ) = {
                 let snapshot = draft.read(cx);
@@ -866,9 +1302,12 @@ impl ScpApp {
                     snapshot.active_tab,
                     snapshot.profiles.clone(),
                     snapshot.selected_profile.clone(),
+                    snapshot.creating_profile,
                     snapshot.profile_use_key,
                     snapshot.profile_password_visible,
+                    snapshot.profile_key_passphrase_visible,
                     snapshot.profile_error.clone(),
+                    snapshot.feedback.clone(),
                     match snapshot.remote_open_behavior {
                         RemoteOpenBehavior::SystemDefault => 0,
                         RemoteOpenBehavior::CustomEditor => 1,
@@ -878,6 +1317,7 @@ impl ScpApp {
                     snapshot.lan_sftp_root.clone(),
                     snapshot.lan_sftp_password_mode,
                     snapshot.password_visible,
+                    snapshot.saving,
                     snapshot.error.clone(),
                 )
             };
@@ -891,14 +1331,26 @@ impl ScpApp {
             let password_visibility_input = manual_password_input.clone();
             let save_draft = draft.clone();
             let save_password_input = manual_password_input.clone();
+            let save_discovery_username_input = discovery_username_input.clone();
+            let save_discovery_port_input = discovery_port_input.clone();
+            let save_lan_sftp_username_input = lan_sftp_username_input.clone();
             let save_app = app.clone();
-            let favorite_current_toolbar = toolbar.clone();
-            let favorite_current_draft = draft.clone();
             let tabs_draft = draft.clone();
+            let feedback_draft = draft.clone();
 
+            let add_profile_draft = draft.clone();
+            let add_profile_name_input = profile_name_input.clone();
+            let add_profile_host_input = profile_host_input.clone();
+            let add_profile_port_input = profile_port_input.clone();
+            let add_profile_username_input = profile_username_input.clone();
+            let add_profile_key_path_input = profile_key_path_input.clone();
+            let add_profile_password_input = profile_password_input.clone();
+            let add_profile_key_passphrase_input = profile_key_passphrase_input.clone();
             let favorite_auth_draft = draft.clone();
             let favorite_password_visibility_draft = draft.clone();
             let favorite_password_visibility_input = profile_password_input.clone();
+            let favorite_key_passphrase_visibility_draft = draft.clone();
+            let favorite_key_passphrase_visibility_input = profile_key_passphrase_input.clone();
             let choose_profile_key_input = profile_key_path_input.clone();
             let choose_profile_key_draft = draft.clone();
             let favorites = h_flex()
@@ -931,41 +1383,67 @@ impl ScpApp {
                                         ),
                                 )
                                 .child(
-                                    Button::new("settings-favorite-current")
-                                        .ghost()
-                                        .xsmall()
+                                    Button::new("settings-add-favorite")
+                                        .small()
                                         .icon(IconName::BookmarkPlus)
-                                        .accessibility_label("收藏当前连接")
-                                        .tooltip(if can_favorite_current {
-                                            "收藏当前连接（不保存密码）"
-                                        } else {
-                                            "连接后可收藏"
-                                        })
-                                        .disabled(!can_favorite_current)
+                                        .label("添加…")
                                         .on_click(move |_, window, cx| {
-                                            match favorite_current_toolbar.update(
+                                            add_profile_name_input.update(cx, |input, cx| {
+                                                input.set_value(String::new(), window, cx)
+                                            });
+                                            add_profile_host_input.update(cx, |input, cx| {
+                                                input.set_value(String::new(), window, cx)
+                                            });
+                                            add_profile_port_input.update(cx, |input, cx| {
+                                                input.set_value("22", window, cx)
+                                            });
+                                            add_profile_username_input.update(cx, |input, cx| {
+                                                input.set_value(String::new(), window, cx)
+                                            });
+                                            add_profile_key_path_input.update(cx, |input, cx| {
+                                                input.set_value(String::new(), window, cx)
+                                            });
+                                            add_profile_password_input.update(cx, |input, cx| {
+                                                input.set_value(String::new(), window, cx);
+                                                input.set_masked(true, window, cx);
+                                                input.set_placeholder("输入密码", window, cx);
+                                            });
+                                            add_profile_key_passphrase_input.update(
                                                 cx,
-                                                |toolbar, cx| {
-                                                    toolbar.favorite_current(window, cx)
-                                                },
-                                            ) {
-                                                Ok(()) => {
-                                                    let profiles = favorite_current_toolbar
-                                                        .read(cx)
-                                                        .profiles_for_display();
-                                                    favorite_current_draft.update(
+                                                |input, cx| {
+                                                    input.set_value(
+                                                        String::new(),
+                                                        window,
                                                         cx,
-                                                        |draft, cx| {
-                                                            draft.profiles = profiles;
-                                                            cx.notify();
-                                                        },
                                                     );
-                                                }
-                                                Err(message) => window.push_notification(
-                                                    Notification::error(message),
-                                                    cx,
-                                                ),
-                                            }
+                                                    input.set_masked(true, window, cx);
+                                                    input.set_placeholder(
+                                                        "口令（可选）",
+                                                        window,
+                                                        cx,
+                                                    );
+                                                },
+                                            );
+                                            add_profile_draft.update(cx, |draft, cx| {
+                                                draft.selected_profile = Some(SavedProfile {
+                                                    name: None,
+                                                    host: String::new(),
+                                                    port: 22,
+                                                    username: String::new(),
+                                                    auth: SavedAuth::Password,
+                                                    pinned: false,
+                                                    last_connected: None,
+                                                });
+                                                draft.creating_profile = true;
+                                                draft.profile_use_key = false;
+                                                draft.profile_password_visible = false;
+                                                draft.profile_key_passphrase_visible = false;
+                                                draft.profile_error = None;
+                                            draft.feedback = None;
+                                                cx.notify();
+                                            });
+                                            add_profile_host_input
+                                                .update(cx, |input, cx| input.focus(window, cx));
                                         }),
                                 ),
                         )
@@ -993,14 +1471,15 @@ impl ScpApp {
                                                 div()
                                                     .text_xs()
                                                     .text_color(theme.muted_foreground)
-                                                    .child("连接服务器后，可收藏当前连接"),
+                                                    .child("成功连接后会自动收藏，也可手动添加"),
                                             ),
                                     )
                                 })
                                 .children(profiles.clone().into_iter().map(|profile| {
-                                    let key = format!("{}@{}", profile.username, profile.host);
+                                    let key = profile.endpoint_label();
                                     let title = profile.title();
                                     let endpoint = profile.endpoint_label();
+                                    let tooltip = favorite_tooltip(&profile);
                                     let auth_icon = match profile.auth {
                                         SavedAuth::Password => IconName::Lock,
                                         SavedAuth::Key { .. } => IconName::KeyRound,
@@ -1008,10 +1487,16 @@ impl ScpApp {
                                     let is_selected = selected_profile.as_ref() == Some(&profile);
                                     let select_draft = draft.clone();
                                     let select_name_input = profile_name_input.clone();
+                                    let select_host_input = profile_host_input.clone();
                                     let select_port_input = profile_port_input.clone();
+                                    let select_username_input = profile_username_input.clone();
                                     let select_key_path_input = profile_key_path_input.clone();
                                     let select_password_input = profile_password_input.clone();
+                                    let select_key_passphrase_input =
+                                        profile_key_passphrase_input.clone();
                                     let select_profile = profile.clone();
+                                    let list_connect_toolbar = toolbar.clone();
+                                    let list_connect_profile = profile.clone();
 
                                     Button::new(format!("settings-favorite-{key}"))
                                         .ghost()
@@ -1040,10 +1525,24 @@ impl ScpApp {
                                                 }),
                                         )
                                         .accessibility_label(SharedString::from(format!(
-                                            "选择收藏 {title}，{endpoint}"
+                                            "选择收藏 {title}，{endpoint}；双击连接"
                                         )))
-                                        .tooltip(SharedString::from(endpoint))
-                                        .on_click(move |_, window, cx| {
+                                        .tooltip(SharedString::from(tooltip))
+                                        .on_click(move |event, window, cx| {
+                                            if event.click_count() == 2 {
+                                                list_connect_toolbar.update(
+                                                    cx,
+                                                    |toolbar, cx| {
+                                                        toolbar.connect_profile(
+                                                            &list_connect_profile,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                );
+                                                window.close_dialog(cx);
+                                                return;
+                                            }
                                             select_name_input.update(cx, |input, cx| {
                                                 input.set_value(
                                                     select_profile
@@ -1054,9 +1553,23 @@ impl ScpApp {
                                                     cx,
                                                 )
                                             });
+                                            select_host_input.update(cx, |input, cx| {
+                                                input.set_value(
+                                                    select_profile.host.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
                                             select_port_input.update(cx, |input, cx| {
                                                 input.set_value(
                                                     select_profile.port.to_string(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                            select_username_input.update(cx, |input, cx| {
+                                                input.set_value(
+                                                    select_profile.username.clone(),
                                                     window,
                                                     cx,
                                                 )
@@ -1071,8 +1584,30 @@ impl ScpApp {
                                             select_password_input.update(cx, |input, cx| {
                                                 input.set_value(String::new(), window, cx);
                                                 input.set_masked(true, window, cx);
+                                                input.set_placeholder(
+                                                    "留空则保留原密码",
+                                                    window,
+                                                    cx,
+                                                );
                                             });
+                                            select_key_passphrase_input.update(
+                                                cx,
+                                                |input, cx| {
+                                                    input.set_value(
+                                                        String::new(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    input.set_masked(true, window, cx);
+                                                    input.set_placeholder(
+                                                        "留空则保留原密钥口令",
+                                                        window,
+                                                        cx,
+                                                    );
+                                                },
+                                            );
                                             select_draft.update(cx, |draft, cx| {
+                                                draft.creating_profile = false;
                                                 draft.profile_use_key = matches!(
                                                     select_profile.auth,
                                                     SavedAuth::Key { .. }
@@ -1080,7 +1615,9 @@ impl ScpApp {
                                                 draft.selected_profile =
                                                     Some(select_profile.clone());
                                                 draft.profile_password_visible = false;
+                                                draft.profile_key_passphrase_visible = false;
                                                 draft.profile_error = None;
+                                                draft.feedback = None;
                                                 cx.notify();
                                             });
                                         })
@@ -1102,8 +1639,10 @@ impl ScpApp {
                             )
                         })
                         .when_some(selected_profile.clone(), |this, profile| {
-                            let password_hint = if matches!(&profile.auth, SavedAuth::Password) {
-                                "留空则保留系统凭据库中的原密码。"
+                            let password_hint = if creating_profile {
+                                "密码会保存到主密码保护的配置中。"
+                            } else if matches!(&profile.auth, SavedAuth::Password) {
+                                "留空则保留加密配置中的原密码。"
                             } else {
                                 "从私钥切换为密码认证时，请输入新密码。"
                             };
@@ -1115,14 +1654,18 @@ impl ScpApp {
                                             div()
                                                 .text_sm()
                                                 .font_weight(FontWeight::SEMIBOLD)
-                                                .child("收藏详情"),
+                                                .child(if creating_profile {
+                                                    "添加收藏"
+                                                } else {
+                                                    "收藏详情"
+                                                }),
                                         )
-                                        .child(
+                                        .when(!creating_profile, |this| this.child(
                                             div()
                                                 .text_xs()
                                                 .text_color(theme.muted_foreground)
                                                 .child(SharedString::from(profile.endpoint_label())),
-                                        ),
+                                        )),
                                 )
                                 .child(
                                     v_flex()
@@ -1145,18 +1688,9 @@ impl ScpApp {
                                                 .gap_2()
                                                 .child(div().text_xs().child("主机名"))
                                                 .child(
-                                                    div()
-                                                        .w_full()
-                                                        .px_3()
-                                                        .py_2()
-                                                        .rounded_md()
-                                                        .border_1()
-                                                        .border_color(theme.border)
-                                                        .text_sm()
-                                                        .truncate()
-                                                        .child(SharedString::from(
-                                                            profile.host.clone(),
-                                                        )),
+                                                    Input::new(&profile_host_input)
+                                                        .id("favorite-profile-host")
+                                                        .w_full(),
                                                 ),
                                         )
                                         .child(
@@ -1176,17 +1710,9 @@ impl ScpApp {
                                         .gap_2()
                                         .child(div().text_xs().child("用户名"))
                                         .child(
-                                            div()
-                                                .w_full()
-                                                .px_3()
-                                                .py_2()
-                                                .rounded_md()
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .text_sm()
-                                                .child(SharedString::from(
-                                                    profile.username.clone(),
-                                                )),
+                                            Input::new(&profile_username_input)
+                                                .id("favorite-profile-username")
+                                                .w_full(),
                                         ),
                                 )
                                 .child(
@@ -1472,6 +1998,74 @@ impl ScpApp {
                                                     .text_xs()
                                                     .text_color(theme.muted_foreground)
                                                     .child("支持 ~/ 开头的路径；留空时自动查找 ~/.ssh 中的私钥。"),
+                                            )
+                                            .child(
+                                                v_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .child("密钥口令（可选）"),
+                                                    )
+                                                    .child(
+                                                        h_flex()
+                                                            .w_full()
+                                                            .gap_2()
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .min_w_0()
+                                                                    .child(
+                                                                        Input::new(
+                                                                            &profile_key_passphrase_input,
+                                                                        )
+                                                                        .id("favorite-profile-key-passphrase")
+                                                                        .w_full(),
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                Button::new(
+                                                                    "favorite-key-passphrase-visibility",
+                                                                )
+                                                                .label(
+                                                                    if profile_key_passphrase_visible {
+                                                                        "隐藏"
+                                                                    } else {
+                                                                        "显示"
+                                                                    },
+                                                                )
+                                                                .on_click(
+                                                                    move |_, window, cx| {
+                                                                        let visible = !favorite_key_passphrase_visibility_draft
+                                                                            .read(cx)
+                                                                            .profile_key_passphrase_visible;
+                                                                        favorite_key_passphrase_visibility_input
+                                                                            .update(cx, |input, cx| {
+                                                                                input.set_masked(
+                                                                                    !visible,
+                                                                                    window,
+                                                                                    cx,
+                                                                                )
+                                                                            });
+                                                                        favorite_key_passphrase_visibility_draft
+                                                                            .update(cx, |draft, cx| {
+                                                                                draft.profile_key_passphrase_visible = visible;
+                                                                                cx.notify();
+                                                                            });
+                                                                    },
+                                                                ),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(theme.muted_foreground)
+                                                            .child(if creating_profile {
+                                                                "加密私钥才需要；会保存到主密码保护的配置中。"
+                                                            } else {
+                                                                "留空则保留加密配置中的原密钥口令。"
+                                                            }),
+                                                    ),
                                             ),
                                     )
                                 })
@@ -1490,8 +2084,9 @@ impl ScpApp {
                 .overlay_closable(false)
                 .child(
                     v_flex()
+                        .relative()
                         .w_full()
-                        .h(px(520.))
+                        .h(px(620.))
                         .gap_4()
                         .child(
                             TabBar::new("settings-tabs")
@@ -1506,11 +2101,12 @@ impl ScpApp {
                                         };
                                         draft.error = None;
                                         draft.profile_error = None;
+                                        draft.feedback = None;
                                         cx.notify();
                                     });
                                 })
-                                .child(Tab::new().label("收藏"))
-                                .child(Tab::new().label("设置")),
+                                .child(Tab::new().label("收藏").disabled(saving))
+                                .child(Tab::new().label("设置").disabled(saving)),
                         )
                         .when(active_tab == SettingsTab::Favorites, |this| {
                             this.child(favorites)
@@ -1664,6 +2260,53 @@ impl ScpApp {
                                 .child(
                                     v_flex()
                                         .gap_2()
+                                        .child(div().text_xs().child("发现用户名（可选）"))
+                                        .child(
+                                            Input::new(&discovery_username_input)
+                                                .id("discovery-username")
+                                                .w_full(),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(
+                                                    "设置后，其他 Blip 的发现列表显示“用户名~IP”；留空时显示本机计算机名。",
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(div().text_xs().child("UDP 发现端口"))
+                                        .child(
+                                            Input::new(&discovery_port_input)
+                                                .id("discovery-port")
+                                                .w_full(),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(format!(
+                                                    "局域网内使用 UDP 发现的 Blip 需设置为相同端口；默认 {}，mDNS 不受影响。",
+                                                    store::DEFAULT_DISCOVERY_PORT
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(div().text_xs().child("SFTP 登录用户名"))
+                                        .child(
+                                            Input::new(&lan_sftp_username_input)
+                                                .id("lan-sftp-username")
+                                                .w_full(),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_2()
                                         .child(
                                             div()
                                                 .text_xs()
@@ -1764,7 +2407,7 @@ impl ScpApp {
                                                     div()
                                                         .text_xs()
                                                         .text_color(theme.muted_foreground)
-                                                        .child("手动密码保存在系统凭据库中，不写入设置文件。"),
+                                                        .child("手动密码与设置一起保存在主密码保护的配置中。"),
                                                 )
                                             },
                                         ),
@@ -1881,6 +2524,29 @@ impl ScpApp {
                             this.child(div().text_xs().text_color(theme.danger).child(error))
                         }),
                 ))
+                        .when_some(feedback, |this, feedback| {
+                            let alert = match feedback {
+                                SettingsFeedback::Success(message) => {
+                                    Alert::success("settings-feedback", message)
+                                }
+                                SettingsFeedback::Error(message) => {
+                                    Alert::error("settings-feedback", message)
+                                }
+                            };
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .top_2()
+                                    .right_2()
+                                    .w(px(360.))
+                                    .child(alert.small().on_close(move |_, _, cx| {
+                                        feedback_draft.update(cx, |draft, cx| {
+                                            draft.feedback = None;
+                                            cx.notify();
+                                        });
+                                    })),
+                            )
+                        })
                 )
                 .footer(
                     if active_tab == SettingsTab::General {
@@ -1890,13 +2556,20 @@ impl ScpApp {
                         .child(
                             Button::new("settings-cancel")
                                 .label("取消")
+                                .disabled(saving)
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
                             Button::new("settings-save")
                                 .primary()
                                 .label("保存")
-                                .on_click(move |_, window, cx| {
+                                .loading(saving)
+                                .disabled(saving)
+                                .on_click(move |_, _, cx| {
+                                    save_draft.update(cx, |draft, cx| {
+                                        draft.feedback = None;
+                                        cx.notify();
+                                    });
                                     let (
                                         behavior,
                                         editor_path,
@@ -1920,6 +2593,60 @@ impl ScpApp {
                                             draft.error = Some(SharedString::from(
                                                 "请选择编辑器应用或可执行文件",
                                             ));
+                                            cx.notify();
+                                        });
+                                        return;
+                                    }
+                                    let discovery_username = save_discovery_username_input
+                                        .read(cx)
+                                        .value()
+                                        .trim()
+                                        .to_string();
+                                    if discovery_username.chars().count()
+                                        > crate::discovery::DISCOVERY_USERNAME_MAX_CHARS
+                                    {
+                                        save_draft.update(cx, |draft, cx| {
+                                            draft.error = Some(
+                                                format!(
+                                                    "发现用户名不能超过 {} 个字符",
+                                                    crate::discovery::DISCOVERY_USERNAME_MAX_CHARS
+                                                )
+                                                .into(),
+                                            );
+                                            cx.notify();
+                                        });
+                                        return;
+                                    }
+                                    let discovery_username =
+                                        (!discovery_username.is_empty()).then_some(discovery_username);
+                                    let Some(discovery_port) = parse_port(
+                                        save_discovery_port_input.read(cx).value().as_ref(),
+                                    ) else {
+                                        save_draft.update(cx, |draft, cx| {
+                                            draft.error = Some(
+                                                "发现端口必须是 1–65535 之间的整数".into(),
+                                            );
+                                            cx.notify();
+                                        });
+                                        return;
+                                    };
+                                    let lan_sftp_username = save_lan_sftp_username_input
+                                        .read(cx)
+                                        .value()
+                                        .trim()
+                                        .to_string();
+                                    if lan_sftp_username.is_empty()
+                                        || lan_sftp_username.chars().any(char::is_whitespace)
+                                    {
+                                        save_draft.update(cx, |draft, cx| {
+                                            draft.error = Some(
+                                                if lan_sftp_username.is_empty() {
+                                                    "SFTP 登录用户名不能为空"
+                                                } else {
+                                                    "SFTP 登录用户名不能包含空白字符"
+                                                }
+                                                .into(),
+                                            );
                                             cx.notify();
                                         });
                                         return;
@@ -1963,16 +2690,6 @@ impl ScpApp {
                                                 });
                                                 return;
                                             }
-                                            if let Err(message) =
-                                                store::store_lan_sftp_password(&password)
-                                            {
-                                                save_draft.update(cx, |draft, cx| {
-                                                    draft.error =
-                                                        Some(SharedString::from(message));
-                                                    cx.notify();
-                                                });
-                                                return;
-                                            }
                                             Some(password)
                                         } else {
                                             None
@@ -1980,82 +2697,349 @@ impl ScpApp {
                                     let settings = AppSettings {
                                         remote_open_behavior: behavior,
                                         editor_path,
+                                        discovery_username,
+                                        discovery_port,
                                         lan_sftp_root,
+                                        lan_sftp_username,
                                         lan_sftp_password_mode,
                                     };
-                                    if let Err(message) = store::save_settings(&settings) {
-                                        save_draft.update(cx, |draft, cx| {
-                                            draft.error = Some(SharedString::from(message));
-                                            cx.notify();
-                                        });
-                                        return;
-                                    }
+                                    save_draft.update(cx, |draft, cx| {
+                                        draft.saving = true;
+                                        draft.error = None;
+                                        draft.feedback = None;
+                                        cx.notify();
+                                    });
+                                    let task_draft = save_draft.clone();
+                                    let task_app = save_app.clone();
+                                    cx.spawn(async move |cx| {
+                                        let persisted_settings = settings.clone();
+                                        let persisted_password = manual_password.clone();
+                                        let result = cx
+                                            .background_executor()
+                                            .spawn(async move {
+                                                store::save_settings_with_lan_password(
+                                                    &persisted_settings,
+                                                    persisted_password.as_deref(),
+                                                )
+                                            })
+                                            .await;
+                                        if let Err(message) = result {
+                                            task_draft.update(cx, |draft, cx| {
+                                                draft.saving = false;
+                                                draft.feedback = None;
+                                                draft.error =
+                                                    Some(SharedString::from(message));
+                                                cx.notify();
+                                            });
+                                            return;
+                                        }
 
-                                    let update_result = save_app.update(cx, |app, cx| {
-                                        app.lan_server = match &app.lan_server {
-                                            Ok(server) => server
-                                                .set_root(effective_root.clone())
-                                                .and_then(|_| match lan_sftp_password_mode {
-                                                    LanSftpPasswordMode::Manual => server
-                                                        .set_password(manual_password.clone()),
-                                                    LanSftpPasswordMode::Default
-                                                        if app.settings.lan_sftp_password_mode
-                                                            == LanSftpPasswordMode::Manual =>
-                                                    {
-                                                        server.set_password(None)
-                                                    }
-                                                    LanSftpPasswordMode::Default => Ok(()),
-                                                })
-                                                .map(|_| server.clone())
+                                        let update_result = task_app.update(cx, |app, cx| {
+                                            app.lan_server = match &app.lan_server {
+                                                Ok(server) => server
+                                                    .set_username(&settings.lan_sftp_username)
+                                                    .and_then(|_| {
+                                                        server.set_root(effective_root.clone())
+                                                    })
+                                                    .and_then(|_| match lan_sftp_password_mode {
+                                                        LanSftpPasswordMode::Manual => server
+                                                            .set_password(manual_password.clone()),
+                                                        LanSftpPasswordMode::Default
+                                                            if app.settings.lan_sftp_password_mode
+                                                                == LanSftpPasswordMode::Manual =>
+                                                        {
+                                                            server.set_password(None)
+                                                        }
+                                                        LanSftpPasswordMode::Default => Ok(()),
+                                                    })
+                                                    .map(|_| server.clone())
+                                                    .map_err(SharedString::from),
+                                                Err(_) => crate::sftp::lan_server::start(
+                                                    settings.lan_sftp_root.clone(),
+                                                    &settings.lan_sftp_username,
+                                                    manual_password.clone(),
+                                                    app.lan_transfer_activity.clone(),
+                                                )
                                                 .map_err(SharedString::from),
-                                            Err(_) => crate::sftp::lan_server::start(
-                                                settings.lan_sftp_root.clone(),
-                                                manual_password.clone(),
-                                                app.lan_transfer_activity.clone(),
-                                            )
-                                            .map_err(SharedString::from),
-                                        };
-                                        app.settings = settings.clone();
-                                        if let Some(discovery) = &app._discovery {
-                                            let port = app
+                                            };
+                                            app.settings = settings.clone();
+                                            let mut apply_error = app
                                                 .lan_server
                                                 .as_ref()
-                                                .ok()
-                                                .map(|server| server.port);
-                                            if let Err(message) = discovery.set_port(port) {
-                                                log::warn!(
-                                                    "更新设备发现服务端口失败：{message}"
-                                                );
+                                                .err()
+                                                .cloned();
+                                            if let Some(discovery) = &app._discovery {
+                                                if let Err(message) = discovery
+                                                    .set_discovery_port(settings.discovery_port)
+                                                {
+                                                    log::warn!(
+                                                        "更新 UDP 设备发现端口失败：{message}"
+                                                    );
+                                                    apply_error = Some(message.into());
+                                                }
+                                                if let Err(message) = discovery.set_username(
+                                                    settings.discovery_username.as_deref(),
+                                                ) {
+                                                    log::warn!(
+                                                        "更新设备发现用户名失败：{message}"
+                                                    );
+                                                }
+                                                let port = app
+                                                    .lan_server
+                                                    .as_ref()
+                                                    .ok()
+                                                    .map(|server| server.port);
+                                                if let Err(message) = discovery.set_port(port) {
+                                                    log::warn!(
+                                                        "更新设备发现服务端口失败：{message}"
+                                                    );
+                                                }
                                             }
-                                        }
-                                        app.workspace.update(cx, |workspace, cx| {
-                                            workspace.set_settings(settings.clone(), cx)
+                                            app.workspace.update(cx, |workspace, cx| {
+                                                workspace.set_settings(settings.clone(), cx)
+                                            });
+                                            apply_error
                                         });
-                                        app.lan_server.as_ref().err().cloned()
-                                    });
-                                    window.close_dialog(cx);
-                                    if let Ok(Some(message)) = update_result {
-                                        window.push_notification(
-                                            Notification::error(format!(
-                                                "设置已保存，但局域网 SFTP 启动失败：{message}"
-                                            )),
-                                            cx,
-                                        );
-                                    } else {
-                                        window.push_notification(
-                                            Notification::success("设置已保存"),
-                                            cx,
-                                        );
-                                    }
+                                        let feedback = match update_result {
+                                            Ok(Some(message)) => SettingsFeedback::Error(
+                                                format!(
+                                                    "设置已保存，但部分设置未生效：{message}"
+                                                )
+                                                .into(),
+                                            ),
+                                            Ok(None) => SettingsFeedback::Success(
+                                                "设置已保存".into(),
+                                            ),
+                                            Err(error) => SettingsFeedback::Error(
+                                                format!("设置已保存，但应用失败：{error}").into(),
+                                            ),
+                                        };
+                                        task_draft.update(cx, |draft, cx| {
+                                            draft.saving = false;
+                                            draft.error = None;
+                                            draft.feedback = Some(feedback);
+                                            cx.notify();
+                                        });
+                                    })
+                                    .detach();
                                 }),
                         )
                         .into_any_element()
+                    } else if creating_profile {
+                        let cancel_draft = draft.clone();
+                        let add_toolbar = toolbar.clone();
+                        let add_draft = draft.clone();
+                        let add_name_input = profile_name_input.clone();
+                        let add_host_input = profile_host_input.clone();
+                        let add_port_input = profile_port_input.clone();
+                        let add_username_input = profile_username_input.clone();
+                        let add_key_path_input = profile_key_path_input.clone();
+                        let add_password_input = profile_password_input.clone();
+                        let add_key_passphrase_input = profile_key_passphrase_input.clone();
+
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("favorite-add-cancel")
+                                    .label("取消")
+                                    .on_click(move |_, _, cx| {
+                                        cancel_draft.update(cx, |draft, cx| {
+                                            draft.selected_profile = None;
+                                            draft.creating_profile = false;
+                                            draft.profile_error = None;
+                                            draft.feedback = None;
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("favorite-add-save")
+                                    .primary()
+                                    .label("添加")
+                                    .on_click(move |_, window, cx| {
+                                        add_draft.update(cx, |draft, cx| {
+                                            draft.feedback = None;
+                                            cx.notify();
+                                        });
+                                        let use_key = add_draft.read(cx).profile_use_key;
+                                        let name = add_name_input.read(cx).value().to_string();
+                                        let host = add_host_input.read(cx).value().to_string();
+                                        let port = add_port_input.read(cx).value().to_string();
+                                        let username =
+                                            add_username_input.read(cx).value().to_string();
+                                        let key_path =
+                                            add_key_path_input.read(cx).value().to_string();
+                                        let profile = match new_favorite_profile(
+                                            &name,
+                                            &host,
+                                            &port,
+                                            &username,
+                                            use_key,
+                                            &key_path,
+                                        ) {
+                                            Ok(profile) => profile,
+                                            Err(message) => {
+                                                add_draft.update(cx, |draft, cx| {
+                                                    draft.profile_error = Some(message.clone());
+                                                    cx.notify();
+                                                });
+                                                return;
+                                            }
+                                        };
+                                        let existing_profiles =
+                                            add_toolbar.read(cx).profiles_for_display();
+                                        if existing_profiles.iter().any(|existing| {
+                                            existing.host == profile.host
+                                                && existing.port == profile.port
+                                                && existing.username == profile.username
+                                        }) {
+                                            add_draft.update(cx, |draft, cx| {
+                                                draft.profile_error = Some(
+                                                    "该主机、端口和用户名已在收藏中，请直接编辑原条目"
+                                                        .into(),
+                                                );
+                                                cx.notify();
+                                            });
+                                            return;
+                                        }
+                                        if existing_profiles.len() >= store::PROFILE_LIMIT
+                                            && existing_profiles.iter().all(|profile| profile.pinned)
+                                        {
+                                            add_draft.update(cx, |draft, cx| {
+                                                draft.profile_error = Some(
+                                                    "收藏已满且全部置顶，请先取消一个置顶或删除收藏"
+                                                        .into(),
+                                                );
+                                                cx.notify();
+                                            });
+                                            return;
+                                        }
+
+                                        let password = (!use_key).then(|| {
+                                            add_password_input.read(cx).value().to_string()
+                                        });
+                                        if password.as_ref().is_some_and(String::is_empty) {
+                                            add_draft.update(cx, |draft, cx| {
+                                                draft.profile_error = Some("请填写密码".into());
+                                                cx.notify();
+                                            });
+                                            return;
+                                        }
+                                        let key_passphrase = use_key
+                                            .then(|| {
+                                                add_key_passphrase_input
+                                                    .read(cx)
+                                                    .value()
+                                                    .to_string()
+                                            })
+                                            .filter(|passphrase| !passphrase.is_empty());
+                                        let password_config = profile_password_config(&profile);
+                                        if let Some(password) = password.as_deref()
+                                            && let Err(message) =
+                                                store::store_password(&password_config, password)
+                                        {
+                                            add_draft.update(cx, |draft, cx| {
+                                                draft.profile_error =
+                                                    Some(SharedString::from(message));
+                                                cx.notify();
+                                            });
+                                            return;
+                                        }
+                                        if let Some(passphrase) = key_passphrase.as_deref()
+                                            && let Err(message) = store::store_key_passphrase(
+                                                &password_config,
+                                                passphrase,
+                                            )
+                                        {
+                                            add_draft.update(cx, |draft, cx| {
+                                                draft.profile_error =
+                                                    Some(SharedString::from(message));
+                                                cx.notify();
+                                            });
+                                            return;
+                                        }
+
+                                        match add_toolbar.update(cx, |toolbar, cx| {
+                                            toolbar.commit_profile(
+                                                profile.clone(),
+                                                None,
+                                                false,
+                                                window,
+                                                cx,
+                                            )
+                                        }) {
+                                            Ok(()) => {
+                                                let profiles = add_toolbar
+                                                    .read(cx)
+                                                    .profiles_for_display();
+                                                add_password_input.update(cx, |input, cx| {
+                                                    input.set_value(String::new(), window, cx);
+                                                    input.set_masked(true, window, cx);
+                                                    input.set_placeholder(
+                                                        "留空则保留原密码",
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                                add_key_passphrase_input.update(
+                                                    cx,
+                                                    |input, cx| {
+                                                        input.set_value(
+                                                            String::new(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                        input.set_masked(true, window, cx);
+                                                        input.set_placeholder(
+                                                            "留空则保留原密钥口令",
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                );
+                                                add_draft.update(cx, |draft, cx| {
+                                                    draft.profiles = profiles;
+                                                    draft.selected_profile =
+                                                        Some(profile.clone());
+                                                    draft.creating_profile = false;
+                                                    draft.profile_password_visible = false;
+                                                    draft.profile_key_passphrase_visible = false;
+                                                    draft.profile_error = None;
+                                                    draft.feedback = Some(
+                                                        SettingsFeedback::Success(
+                                                            "收藏已添加".into(),
+                                                        ),
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                            Err(message) => {
+                                                if password.is_some() {
+                                                    store::forget_password(&password_config);
+                                                }
+                                                if key_passphrase.is_some() {
+                                                    store::forget_key_passphrase(&password_config);
+                                                }
+                                                add_draft.update(cx, |draft, cx| {
+                                                    draft.feedback = None;
+                                                    draft.profile_error =
+                                                        Some(SharedString::from(message));
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }
+                                    }),
+                            )
+                            .into_any_element()
                     } else if let Some(profile) = selected_profile.clone() {
                         let pin_toolbar = toolbar.clone();
                         let pin_draft = draft.clone();
                         let pin_profile = profile.clone();
                         let pinned = profile.pinned;
                         let delete_toolbar = toolbar.clone();
+                        let delete_draft = draft.clone();
                         let delete_profile = profile.clone();
                         let connect_toolbar = toolbar.clone();
                         let connect_profile = profile.clone();
@@ -2063,9 +3047,12 @@ impl ScpApp {
                         let save_profile = profile.clone();
                         let save_profile_draft = draft.clone();
                         let save_name_input = profile_name_input.clone();
+                        let save_host_input = profile_host_input.clone();
                         let save_port_input = profile_port_input.clone();
+                        let save_username_input = profile_username_input.clone();
                         let save_key_path_input = profile_key_path_input.clone();
                         let save_profile_password_input = profile_password_input.clone();
+                        let save_key_passphrase_input = profile_key_passphrase_input.clone();
 
                         h_flex()
                             .w_full()
@@ -2078,15 +3065,47 @@ impl ScpApp {
                                         Button::new("favorite-delete")
                                             .danger()
                                             .label("删除")
-                                            .on_click(move |_, window, cx| {
-                                                window.close_dialog(cx);
-                                                delete_toolbar.update(cx, |toolbar, cx| {
-                                                    toolbar.confirm_remove_profile(
-                                                        delete_profile.clone(),
-                                                        window,
+                                            .on_click(move |_, _, cx| {
+                                                match delete_toolbar.update(
+                                                    cx,
+                                                    |toolbar, cx| {
+                                                        toolbar.remove_profile(
+                                                            &delete_profile,
+                                                            cx,
+                                                        )
+                                                    },
+                                                ) {
+                                                    Ok(()) => {
+                                                        let profiles = delete_toolbar
+                                                            .read(cx)
+                                                            .profiles_for_display();
+                                                        delete_draft.update(
+                                                            cx,
+                                                            |draft, cx| {
+                                                                draft.profiles = profiles;
+                                                                draft.selected_profile = None;
+                                                                draft.creating_profile = false;
+                                                                draft.profile_error = None;
+                                                                draft.feedback = Some(
+                                                                    SettingsFeedback::Success(
+                                                                        "收藏及其凭据已删除".into(),
+                                                                    ),
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        );
+                                                    }
+                                                    Err(message) => delete_draft.update(
                                                         cx,
-                                                    )
-                                                });
+                                                        |draft, cx| {
+                                                            draft.feedback = None;
+                                                            draft.profile_error = Some(
+                                                                SharedString::from(message),
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    ),
+                                                }
                                             }),
                                     )
                                     .child(
@@ -2155,30 +3174,61 @@ impl ScpApp {
                                             .primary()
                                             .label("保存")
                                             .on_click(move |_, window, cx| {
-                                                let port_text = save_port_input
+                                                save_profile_draft.update(
+                                                    cx,
+                                                    |draft, cx| {
+                                                        draft.feedback = None;
+                                                        cx.notify();
+                                                    },
+                                                );
+                                                let use_key = save_profile_draft
                                                     .read(cx)
-                                                    .value()
-                                                    .trim()
-                                                    .to_string();
-                                                let Ok(port) = port_text.parse::<u16>() else {
-                                                    save_profile_draft.update(
-                                                        cx,
-                                                        |draft, cx| {
-                                                            draft.profile_error = Some(
-                                                                "端口号必须是 1–65535 之间的整数"
-                                                                    .into(),
-                                                            );
-                                                            cx.notify();
-                                                        },
-                                                    );
-                                                    return;
+                                                    .profile_use_key;
+                                                let mut edited = match new_favorite_profile(
+                                                    save_name_input.read(cx).value().as_ref(),
+                                                    save_host_input.read(cx).value().as_ref(),
+                                                    save_port_input.read(cx).value().as_ref(),
+                                                    save_username_input.read(cx).value().as_ref(),
+                                                    use_key,
+                                                    save_key_path_input.read(cx).value().as_ref(),
+                                                ) {
+                                                    Ok(profile) => profile,
+                                                    Err(message) => {
+                                                        save_profile_draft.update(
+                                                            cx,
+                                                            |draft, cx| {
+                                                                draft.profile_error =
+                                                                    Some(message.clone());
+                                                                cx.notify();
+                                                            },
+                                                        );
+                                                        return;
+                                                    }
                                                 };
-                                                if port == 0 {
+                                                edited.pinned = save_profile.pinned;
+                                                edited.last_connected = save_profile.last_connected;
+                                                let identity_changed =
+                                                    edited.host != save_profile.host
+                                                        || edited.port != save_profile.port
+                                                        || edited.username
+                                                            != save_profile.username;
+                                                if identity_changed
+                                                    && save_toolbar
+                                                        .read(cx)
+                                                        .profiles_for_display()
+                                                        .iter()
+                                                        .any(|profile| {
+                                                            profile.host == edited.host
+                                                                && profile.port == edited.port
+                                                                && profile.username
+                                                                    == edited.username
+                                                        })
+                                                {
                                                     save_profile_draft.update(
                                                         cx,
                                                         |draft, cx| {
                                                             draft.profile_error = Some(
-                                                                "端口号必须是 1–65535 之间的整数"
+                                                                "该主机、端口和用户名已在收藏中"
                                                                     .into(),
                                                             );
                                                             cx.notify();
@@ -2186,18 +3236,6 @@ impl ScpApp {
                                                     );
                                                     return;
                                                 }
-
-                                                let mut edited = save_profile.clone();
-                                                let name = save_name_input
-                                                    .read(cx)
-                                                    .value()
-                                                    .trim()
-                                                    .to_string();
-                                                edited.name = (!name.is_empty()).then_some(name);
-                                                edited.port = port;
-                                                let use_key = save_profile_draft
-                                                    .read(cx)
-                                                    .profile_use_key;
                                                 let password = save_profile_password_input
                                                     .read(cx)
                                                     .value()
@@ -2220,21 +3258,14 @@ impl ScpApp {
                                                         return;
                                                     }
                                                 };
-                                                edited.auth = if use_key {
-                                                    let key_path = save_key_path_input
-                                                        .read(cx)
-                                                        .value()
-                                                        .trim()
-                                                        .to_string();
-                                                    SavedAuth::Key {
-                                                        path: expand_tilde(&key_path)
-                                                            .to_string_lossy()
-                                                            .to_string(),
-                                                    }
-                                                } else {
-                                                    SavedAuth::Password
-                                                };
-
+                                                let new_key_passphrase = use_key
+                                                    .then(|| {
+                                                        save_key_passphrase_input
+                                                            .read(cx)
+                                                            .value()
+                                                            .to_string()
+                                                    })
+                                                    .filter(|passphrase| !passphrase.is_empty());
                                                 let password_config =
                                                     profile_password_config(&edited);
                                                 if let Some(password) = new_password.as_deref()
@@ -2254,35 +3285,52 @@ impl ScpApp {
                                                     );
                                                     return;
                                                 }
+                                                if let Some(passphrase) =
+                                                    new_key_passphrase.as_deref()
+                                                    && let Err(message) =
+                                                        store::store_key_passphrase(
+                                                            &password_config,
+                                                            passphrase,
+                                                        )
+                                                {
+                                                    save_profile_draft.update(
+                                                        cx,
+                                                        |draft, cx| {
+                                                            draft.profile_error = Some(
+                                                                SharedString::from(message),
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    );
+                                                    return;
+                                                }
 
                                                 match save_toolbar.update(cx, |toolbar, cx| {
                                                     toolbar.commit_profile(
                                                         edited.clone(),
-                                                        new_password.is_none(),
+                                                        Some(&save_profile),
+                                                        new_password.is_none()
+                                                            && new_key_passphrase.is_none(),
                                                         window,
                                                         cx,
                                                     )
                                                 }) {
                                                     Ok(()) => {
-                                                        if new_password.is_some()
-                                                            && matches!(
-                                                                &save_profile.auth,
-                                                                SavedAuth::Password
-                                                            )
-                                                        {
-                                                            let previous = profile_password_config(
-                                                                &save_profile,
-                                                            );
-                                                            if previous.keyring_account()
-                                                                != password_config.keyring_account()
-                                                            {
-                                                                store::forget_password(&previous);
-                                                            }
-                                                        }
                                                         let profiles = save_toolbar
                                                             .read(cx)
                                                             .profiles_for_display();
                                                         save_profile_password_input.update(
+                                                            cx,
+                                                            |input, cx| {
+                                                                input.set_value(
+                                                                    String::new(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                                input.set_masked(true, window, cx);
+                                                            },
+                                                        );
+                                                        save_key_passphrase_input.update(
                                                             cx,
                                                             |input, cx| {
                                                                 input.set_value(
@@ -2301,18 +3349,22 @@ impl ScpApp {
                                                                     Some(edited.clone());
                                                                 draft.profile_password_visible =
                                                                     false;
+                                                                draft.profile_key_passphrase_visible =
+                                                                    false;
                                                                 draft.profile_error = None;
+                                                                draft.feedback = Some(
+                                                                    SettingsFeedback::Success(
+                                                                        "收藏已保存".into(),
+                                                                    ),
+                                                                );
                                                                 cx.notify();
                                                             },
-                                                        );
-                                                        window.push_notification(
-                                                            Notification::success("收藏已保存"),
-                                                            cx,
                                                         );
                                                     }
                                                     Err(message) => save_profile_draft.update(
                                                         cx,
                                                         |draft, cx| {
+                                                            draft.feedback = None;
                                                             draft.profile_error = Some(
                                                                 SharedString::from(message),
                                                             );
@@ -2342,7 +3394,7 @@ impl ScpApp {
     /// 演示模式：把内置服务器的地址填进表单并直接连上。
     ///
     /// 只在 `--features demo-server` 下编译。故意 `remember = false` ——
-    /// 别把假账号写进用户的系统凭据库。
+    /// 别把假账号写进用户的加密配置。
     #[cfg(feature = "demo-server")]
     pub fn apply_demo_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(login) = crate::demo::login() else {
@@ -2591,18 +3643,71 @@ mod tests {
     }
 
     #[test]
+    fn manual_favorite_requires_connection_identity_and_builds_auth() {
+        assert!(new_favorite_profile("", "", "22", "root", false, "").is_err());
+        assert!(new_favorite_profile("", "server", "0", "root", false, "").is_err());
+        assert!(new_favorite_profile("", "server", "22", "", false, "").is_err());
+
+        let profile = new_favorite_profile(
+            " Work ",
+            " server.example ",
+            " 2022 ",
+            " alice ",
+            true,
+            "/tmp/id_ed25519",
+        )
+        .unwrap();
+        assert_eq!(profile.name.as_deref(), Some("Work"));
+        assert_eq!(profile.host, "server.example");
+        assert_eq!(profile.port, 2022);
+        assert_eq!(profile.username, "alice");
+        assert_eq!(profile.last_connected, None);
+        assert!(matches!(
+            profile.auth,
+            SavedAuth::Key { ref path } if path == "/tmp/id_ed25519"
+        ));
+    }
+
+    #[test]
+    fn port_parser_accepts_only_the_valid_tcp_udp_range() {
+        assert_eq!(parse_port(" 1 "), Some(1));
+        assert_eq!(parse_port("65535"), Some(65535));
+        assert_eq!(parse_port("0"), None);
+        assert_eq!(parse_port("65536"), None);
+        assert_eq!(parse_port("not-a-port"), None);
+    }
+
+    #[test]
+    fn favorite_tooltip_shows_complete_connection_data() {
+        let profile = new_favorite_profile(
+            "Work",
+            "server.example",
+            "2022",
+            "alice",
+            true,
+            "/tmp/id_ed25519",
+        )
+        .unwrap();
+
+        assert_eq!(
+            favorite_tooltip(&profile),
+            "名称：Work\n登录名：alice\n主机/IP：server.example\n端口：2022\n认证：私钥\n私钥：/tmp/id_ed25519\n\n双击连接"
+        );
+    }
+
+    #[test]
     fn favorite_persists_the_password_that_was_actually_used() {
         let config = SessionConfig {
             host: "server.example".to_string(),
             port: 2222,
             username: "alice".to_string(),
-            // 这可以是 build_config 从系统凭据库补出来的密码；密码输入框仍可能为空。
-            auth: AuthMethod::Password("resolved-from-keychain".to_string()),
+            // 这可以是 build_config 从加密配置补出来的密码；密码输入框仍可能为空。
+            auth: AuthMethod::Password("resolved-from-config".to_string()),
         };
 
         let prepared = prepare_profile_persistence(&config);
 
-        assert_eq!(prepared.password.as_deref(), Some("resolved-from-keychain"));
+        assert_eq!(prepared.password.as_deref(), Some("resolved-from-config"));
         assert_eq!(prepared.profile.host, "server.example");
         assert_eq!(prepared.profile.port, 2222);
         assert_eq!(prepared.profile.username, "alice");

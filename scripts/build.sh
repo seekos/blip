@@ -6,11 +6,14 @@
 #   macOS: dist/Blip.app + dist/Blip-<version>-macos-<arch>.dmg
 #   Linux: dist/blip + dist/install.sh + 桌面入口与图标
 #   Windows: dist/Blip-<version>-windows-<arch>.exe
+#   Mobile: dist/Blip-<version>-ios-*.ipa + dist/Blip-<version>-android-*.apk
 #
 # 用法：
-#   scripts/build.sh                # 当前系统 release 构建，先清空 dist/
+#   scripts/build.sh                # release 构建桌面端及当前系统支持的移动端
 #   scripts/build.sh -v 0.2.0       # 指定版本号
 #   scripts/build.sh debug          # debug 构建
+#   scripts/build.sh --no-mobile    # 仅构建桌面端
+#   scripts/build.sh --mobile ios   # 仅额外打包指定移动端
 #   scripts/build.sh --no-clean     # 增量构建，不清空 dist/
 #   scripts/build.sh --no-icon      # macOS 跳过图标检查
 #
@@ -23,8 +26,15 @@ PROFILE="release"
 CLEAN=1
 WITH_ICON=1
 VERSION=""
+MOBILE_TARGET="auto"
 VERSION_FILE="${ROOT}/.blip-build-version"
 LEGACY_VERSION_FILE="${ROOT}/.macscp-build-version"
+
+usage() {
+  echo "用法：scripts/build.sh [debug|release] [-v VERSION] [--mobile TARGET|--no-mobile] [--no-clean] [--no-icon]"
+  echo "  --mobile TARGET  打包 ios、android 或 all（默认 all）"
+  echo "  --no-mobile      仅构建桌面端"
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,13 +48,20 @@ while [ $# -gt 0 ]; do
     --clean)       CLEAN=1 ;;
     --no-clean)    CLEAN=0 ;;
     --no-icon)     WITH_ICON=0 ;;
+    --no-mobile)   MOBILE_TARGET="" ;;
+    --mobile)
+      [ $# -ge 2 ] && [ -n "$2" ] \
+        || { echo "$1 后缺少目标（ios、android 或 all）" >&2; exit 1; }
+      MOBILE_TARGET="$2"
+      shift
+      ;;
     -h|--help)
-      sed -n '10,15p' "$0" | sed 's/^# \{0,1\}//'
+      usage
       exit 0
       ;;
     *)
       echo "未知参数：$1" >&2
-      echo "用法：scripts/build.sh [debug|release] [-v VERSION] [--no-clean] [--no-icon]" >&2
+      usage >&2
       exit 1
       ;;
   esac
@@ -63,6 +80,10 @@ fi
 VERSION=${VERSION#v}
 [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] \
   || { echo "版本号无效：${VERSION}（应类似 0.2.0）" >&2; exit 1; }
+case "${MOBILE_TARGET}" in
+  ""|auto|ios|android|all) ;;
+  *) echo "移动端目标无效：${MOBILE_TARGET}（应为 ios、android 或 all）" >&2; exit 1 ;;
+esac
 
 case "${PROFILE}" in
   debug)   CARGO_FLAGS="" ;;
@@ -87,6 +108,41 @@ if [ "${CLEAN}" = "1" ]; then
   fi
 fi
 mkdir -p "${DIST}"
+
+build_mobile() {
+  local target="$1"
+  local args=("${target}" --no-run --out "${DIST}" --version "${VERSION}")
+  [ "${PROFILE}" = "release" ] && args+=(--release)
+  "${ROOT}/mobile/build.sh" "${args[@]}"
+}
+
+case "${MOBILE_TARGET}" in
+  auto)
+    case "${PLATFORM}" in
+      Darwin) build_mobile ios; build_mobile android ;;
+      Linux) build_mobile android ;;
+      *) echo "当前构建主机不支持移动端打包，仅构建桌面端：${PLATFORM}" ;;
+    esac
+    ;;
+  ios)
+    [ "${PLATFORM}" = "Darwin" ] \
+      || { echo "iOS 只能在 macOS 上打包" >&2; exit 1; }
+    build_mobile ios
+    ;;
+  android)
+    case "${PLATFORM}" in
+      Darwin|Linux) build_mobile android ;;
+      *) echo "当前构建主机不支持 Android 打包：${PLATFORM}" >&2; exit 1 ;;
+    esac
+    ;;
+  all)
+    case "${PLATFORM}" in
+      Darwin) build_mobile ios; build_mobile android ;;
+      Linux) build_mobile android ;;
+      *) echo "当前构建主机不支持移动端打包：${PLATFORM}" >&2; exit 1 ;;
+    esac
+    ;;
+esac
 
 if [ "${PLATFORM}" = "Linux" ]; then
   echo "→ cargo build ${PROFILE}"

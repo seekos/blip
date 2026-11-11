@@ -1,0 +1,71 @@
+[package]
+name = "blip-mobile"
+version = "0.1.0"
+edition = "2024"
+description = "Blip mobile client for iOS and Android"
+publish = false
+
+[lib]
+name = "blip_mobile"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+demo-server = []
+
+[dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.6", default-features = false }
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "13c716b687b47f96a677aaf46c8fa341fa7208da", default-features = false, features = ["component", "assets"] }
+# gpui-mobile's current iOS platform-view module references camera/video symbols
+# unconditionally, so those two zero-dependency feature gates must stay enabled.
+gpui-mobile = { git = "https://github.com/itsbalamurali/gpui-mobile", rev = "5fd54f4554263ae06753e90472c7f2e2ff5d7495", default-features = false, features = ["camera", "file_selector", "path_provider", "share", "url_launcher", "video_player"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time", "sync"] }
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
+russh-sftp = "3.0"
+flume = { version = "0.12", features = ["async"] }
+futures = "0.3"
+age = "0.11.1"
+base64 = "0.22"
+dirs = "6"
+toml = "0.9"
+anyhow = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+libc = "0.2"
+rand = "0.10"
+gethostname = "1"
+ignore = "0.4.33"
+mdns-sd = "0.21"
+netdev = { version = "0.47", default-features = false }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+android-activity = { version = "0.6", features = ["native-activity"] }
+jni = "0.22"
+
+[patch.crates-io]
+block = { path = "../vendor/block" }
+i18n-embed-fl = { path = "../vendor/i18n-embed-fl" }
+
+[profile.dev]
+opt-level = 2
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
