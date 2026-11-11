@@ -1,9 +1,10 @@
-# Blip：跨平台原生 SFTP 客户端
+# Blip：全平台原生 SFTP 客户端
 
 > 文件传输，不该是一次提心吊胆的等待。
 
-Blip 是一款面向 macOS、Windows 和 Linux 的原生 SFTP 客户端。它拥有熟悉的双栏文件管理体验，也把安全连接、
-断点续传、目录传输和冲突处理做成了清晰可控的操作。
+Blip 是一款支持 macOS、Windows、Linux、iOS 和 Android 的全平台原生 SFTP 客户端。
+桌面端提供熟悉的双栏文件管理体验，移动端则针对触屏、系统文件选择器和安全区进行了适配；
+各平台共享安全连接、断点续传、目录传输、冲突处理、局域网发现和内置 SFTP 服务等核心能力。
 
 ![Blip 工作区](docs/workspace.png)
 
@@ -135,11 +136,14 @@ Blip 会保留空目录与隐藏文件，并跳过可能导致循环或越界访
 
 ## 现在就试试
 
-需要 Rust 工具链，支持 macOS 12+、Windows 10+ 以及使用 X11/Wayland 的桌面 Linux：
+桌面端需要 Rust 工具链，支持 macOS 12+、Windows 10+ 以及使用 X11/Wayland 的桌面 Linux：
 
 ```bash
 cargo run
 ```
+
+移动端支持 iOS 16+ 和 Android 8+（API 26+），构建和真机运行方法见
+[`mobile/README.md`](mobile/README.md)。
 
 没有现成的 SFTP 服务器？项目内置了一个只使用内存文件系统的演示服务器：
 
@@ -194,11 +198,14 @@ scripts/build.sh release --mobile android
 
 若 key password 与 store password 相同，可省略 `BLIP_ANDROID_KEY_PASSWORD`。
 
-GitHub Actions 会在三个原生构建环境中并行生成发布包：
+GitHub Actions 会在三个原生构建环境中并行生成桌面端发布包：
 
 - `Blip-<version>-macos-arm64.dmg`
 - `Blip-<version>-windows-x86_64.exe`
 - Linux 直接输出 `dist/blip`、`dist/install.sh`、桌面入口和 PNG 图标
+
+移动端由本机统一构建脚本根据参数生成 `Blip-<version>-ios-*.ipa`、
+`Blip-<version>-ios-simulator-*.zip` 或 `Blip-<version>-android-*.apk`。
 
 Linux 构建完成后直接安装；Wayland/GNOME 会用 `com.amov.Blip` 的应用 ID 匹配命名图标：
 
