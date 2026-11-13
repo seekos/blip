@@ -43,7 +43,7 @@ struct TransferActivityState {
     events: flume::Sender<bool>,
 }
 
-struct TransferActivityGuard {
+pub(crate) struct TransferActivityGuard {
     activity: TransferActivity,
 }
 
@@ -59,7 +59,7 @@ pub fn transfer_activity() -> (TransferActivity, flume::Receiver<bool>) {
 }
 
 impl TransferActivity {
-    fn begin(&self) -> TransferActivityGuard {
+    pub(crate) fn begin(&self) -> TransferActivityGuard {
         let mut state = self
             .state
             .lock()
@@ -224,18 +224,18 @@ pub fn start(
     })
 }
 
-fn selected_username(username: &str) -> Result<String, String> {
+pub(crate) fn selected_username(username: &str) -> Result<String, String> {
     let username = username.trim();
     if username.is_empty() {
-        return Err("SFTP 登录用户名不能为空".to_string());
+        return Err("局域网登录用户名不能为空".to_string());
     }
     if username.chars().any(char::is_whitespace) {
-        return Err("SFTP 登录用户名不能包含空白字符".to_string());
+        return Err("局域网登录用户名不能包含空白字符".to_string());
     }
     Ok(username.to_string())
 }
 
-fn canonical_root(configured_root: Option<PathBuf>) -> Result<PathBuf, String> {
+pub(crate) fn canonical_root(configured_root: Option<PathBuf>) -> Result<PathBuf, String> {
     let root = configured_root
         .or_else(dirs::home_dir)
         .ok_or_else(|| "无法确定用户主目录".to_string())?;
@@ -265,7 +265,7 @@ fn bind_listener_on(host: Ipv4Addr, port: u16) -> Result<TcpListener, String> {
     Ok(listener)
 }
 
-fn local_ipv4() -> IpAddr {
+pub(crate) fn local_ipv4() -> IpAddr {
     UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .and_then(|socket| {
             // UDP connect 不会发送数据，只让系统选择当前默认路由对应的本机地址。
@@ -278,7 +278,7 @@ fn local_ipv4() -> IpAddr {
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
-fn selected_password(manual_password: Option<String>) -> Result<String, String> {
+pub(crate) fn selected_password(manual_password: Option<String>) -> Result<String, String> {
     match manual_password {
         Some(password) if password.is_empty() => Err("手动密码不能为空".to_string()),
         Some(password) => Ok(password),

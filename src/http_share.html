@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Blip 文件共享</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --background: #f8fafc;
+      --surface: #ffffff;
+      --surface-muted: #f1f5f9;
+      --foreground: #0f172a;
+      --muted: #475569;
+      --border: #dbe3ef;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --primary-soft: #eff6ff;
+      --danger: #b91c1c;
+      --focus: #2563eb;
+      --shadow: 0 16px 45px rgb(15 23 42 / 0.16);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --background: #0b1120;
+        --surface: #111827;
+        --surface-muted: #1e293b;
+        --foreground: #f8fafc;
+        --muted: #a8b4c7;
+        --border: #334155;
+        --primary: #60a5fa;
+        --primary-hover: #93c5fd;
+        --primary-soft: #172554;
+        --danger: #fca5a5;
+        --focus: #93c5fd;
+        --shadow: 0 16px 45px rgb(0 0 0 / 0.35);
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    html { min-height: 100%; }
+
+    body {
+      min-height: 100dvh;
+      margin: 0;
+      background: var(--background);
+      color: var(--foreground);
+      font: 16px/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    button, input { font: inherit; }
+
+    button, .download-link { touch-action: manipulation; }
+
+    button:focus-visible, input:focus-visible, .download-link:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    button {
+      min-height: 44px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 14px;
+      background: var(--surface);
+      color: var(--foreground);
+      cursor: pointer;
+      transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
+    }
+
+    button:hover { background: var(--surface-muted); }
+    button:disabled { cursor: not-allowed; opacity: 0.55; }
+
+    button.primary {
+      border-color: var(--primary);
+      background: var(--primary);
+      color: #ffffff;
+      font-weight: 650;
+    }
+
+    button.primary:hover { background: var(--primary-hover); }
+
+    button.quiet {
+      min-height: 36px;
+      padding: 6px 10px;
+      border-color: transparent;
+      background: transparent;
+    }
+
+    .shell {
+      width: min(1120px, 100%);
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+
+    .brand-mark {
+      display: grid;
+      width: 42px;
+      height: 42px;
+      flex: 0 0 auto;
+      place-items: center;
+      border-radius: 12px;
+      background: var(--primary);
+      color: #ffffff;
+    }
+
+    h1, h2, p { margin: 0; }
+    h1 { font-size: 1.3rem; line-height: 1.25; }
+    h2 { font-size: 1.15rem; line-height: 1.3; }
+    .subtitle { color: var(--muted); font-size: 0.9rem; }
+
+    .card {
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--surface);
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .breadcrumbs {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 2px;
+      overflow-x: auto;
+      scrollbar-width: thin;
+    }
+
+    .breadcrumbs button {
+      min-height: 36px;
+      flex: 0 0 auto;
+      border-color: transparent;
+      background: transparent;
+      padding: 5px 8px;
+      color: var(--muted);
+    }
+
+    .breadcrumbs button:last-child { color: var(--foreground); font-weight: 650; }
+    .breadcrumb-separator { color: var(--muted); }
+
+    .upload-zone {
+      margin: 16px;
+      padding: 24px;
+      border: 2px dashed var(--border);
+      border-radius: 14px;
+      background: var(--surface-muted);
+      text-align: center;
+      transition: border-color 160ms ease, background-color 160ms ease;
+    }
+
+    .upload-zone.dragging {
+      border-color: var(--primary);
+      background: var(--primary-soft);
+    }
+
+    .upload-icon { width: 40px; height: 40px; margin: 0 auto 10px; color: var(--primary); }
+    .upload-help { margin-top: 4px; color: var(--muted); font-size: 0.9rem; }
+    .upload-actions { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    input[type="file"] { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
+
+    .notice {
+      display: none;
+      margin: 0 16px 16px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: var(--surface-muted);
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+
+    .notice.visible { display: block; }
+    .notice.error { border-color: var(--danger); color: var(--danger); }
+
+    .list-head, .file-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 110px 180px 52px;
+      align-items: center;
+      gap: 16px;
+      padding: 11px 16px;
+    }
+
+    .list-head {
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 650;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .file-row { min-height: 58px; border-bottom: 1px solid var(--border); }
+    .file-row:last-child { border-bottom: 0; }
+    .file-row:hover { background: var(--surface-muted); }
+
+    .file-name {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 10px;
+      color: inherit;
+      text-align: left;
+    }
+
+    button.file-name { width: 100%; min-height: 36px; border-color: transparent; padding: 3px; background: transparent; }
+    button.file-name:hover .name-text { color: var(--primary); }
+    .file-icon { width: 22px; height: 22px; flex: 0 0 auto; color: var(--muted); }
+    .folder .file-icon { color: var(--primary); }
+    .name-text { min-width: 0; overflow-wrap: anywhere; }
+    .metadata { color: var(--muted); font-size: 0.88rem; font-variant-numeric: tabular-nums; }
+
+    .download-link {
+      display: grid;
+      width: 40px;
+      height: 40px;
+      place-items: center;
+      border-radius: 9px;
+      color: var(--muted);
+      text-decoration: none;
+    }
+
+    .download-link:hover { background: var(--primary-soft); color: var(--primary); }
+    .download-link svg { width: 20px; height: 20px; }
+
+    .empty {
+      padding: 50px 20px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    dialog {
+      width: min(460px, calc(100% - 32px));
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 0;
+      background: var(--surface);
+      color: var(--foreground);
+      box-shadow: var(--shadow);
+    }
+
+    dialog::backdrop { background: rgb(2 6 23 / 0.56); backdrop-filter: blur(2px); }
+    .dialog-body { padding: 22px; }
+    .dialog-description { margin-top: 7px; color: var(--muted); }
+    .field { display: grid; gap: 6px; margin-top: 16px; }
+    .field label { font-size: 0.9rem; font-weight: 650; }
+
+    .field input {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 11px;
+      background: var(--background);
+      color: var(--foreground);
+    }
+
+    .field-error { min-height: 24px; margin-top: 8px; color: var(--danger); font-size: 0.9rem; }
+    .dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 14px 22px; border-top: 1px solid var(--border); }
+
+    progress { width: 100%; height: 10px; margin-top: 18px; accent-color: var(--primary); }
+    .progress-copy { margin-top: 8px; color: var(--muted); font-size: 0.9rem; overflow-wrap: anywhere; }
+
+    @media (max-width: 720px) {
+      .shell { padding: 16px; }
+      .toolbar { align-items: stretch; flex-direction: column; }
+      .upload-zone { margin: 12px; padding: 22px 14px; }
+      .list-head { display: none; }
+      .file-row { grid-template-columns: minmax(0, 1fr) 44px; gap: 8px; padding: 11px 12px; }
+      .file-row .metadata { grid-column: 1; padding-left: 35px; }
+      .file-row .modified { display: none; }
+      .file-row .download-link { grid-column: 2; grid-row: 1 / span 2; }
+      header { align-items: flex-start; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+        </div>
+        <div>
+          <h1>Blip 文件共享</h1>
+          <p class="subtitle">在浏览器中上传和下载文件</p>
+        </div>
+      </div>
+      <button id="logout" class="quiet" type="button">退出</button>
+    </header>
+
+    <main class="card">
+      <div class="toolbar">
+        <nav id="breadcrumbs" class="breadcrumbs" aria-label="当前文件夹"></nav>
+        <button id="refresh" class="quiet" type="button">刷新</button>
+      </div>
+
+      <section id="drop-zone" class="upload-zone" aria-labelledby="upload-title">
+        <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/></svg>
+        <h2 id="upload-title">上传到当前文件夹</h2>
+        <p class="upload-help">可拖放文件，或选择文件与文件夹</p>
+        <div class="upload-actions">
+          <button id="choose-files" class="primary" type="button">选择文件</button>
+          <button id="choose-folder" type="button">选择文件夹</button>
+        </div>
+        <input id="file-input" type="file" multiple>
+        <input id="folder-input" type="file" webkitdirectory directory multiple>
+        <input id="mobile-folder-input" type="file" multiple>
+      </section>
+
+      <div id="notice" class="notice" role="status" aria-live="polite"></div>
+
+      <div class="list-head" aria-hidden="true">
+        <span>名称</span><span>大小</span><span>修改时间</span><span></span>
+      </div>
+      <div id="file-list"></div>
+    </main>
+  </div>
+
+  <dialog id="login-dialog" aria-labelledby="login-title">
+    <form id="login-form">
+      <div class="dialog-body">
+        <h2 id="login-title">登录 Blip</h2>
+        <p class="dialog-description">使用 Blip“局域网共享”设置中的用户名和密码。</p>
+        <div class="field">
+          <label for="username">用户名</label>
+          <input id="username" name="username" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="password">密码</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <div id="login-error" class="field-error" role="alert" aria-live="assertive"></div>
+      </div>
+      <div class="dialog-actions">
+        <button id="login-submit" class="primary" type="submit">登录</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="mobile-folder-dialog" aria-labelledby="mobile-folder-title">
+    <div class="dialog-body">
+      <h2 id="mobile-folder-title">手机上传文件夹</h2>
+      <p class="dialog-description">手机浏览器不能直接读取整个文件夹。输入文件夹名称，再一次选择其中的多个文件。</p>
+      <div class="field">
+        <label for="mobile-folder-name">文件夹名称</label>
+        <input id="mobile-folder-name" autocomplete="off" placeholder="例如：相册备份">
+      </div>
+      <div id="mobile-folder-error" class="field-error" role="alert" aria-live="assertive"></div>
+    </div>
+    <div class="dialog-actions">
+      <button id="mobile-folder-cancel" type="button">取消</button>
+      <button id="mobile-folder-choose" class="primary" type="button">选择文件</button>
+    </div>
+  </dialog>
+
+  <dialog id="progress-dialog" aria-labelledby="progress-title">
+    <div class="dialog-body">
+      <h2 id="progress-title">正在上传</h2>
+      <progress id="progress" max="1" value="0"></progress>
+      <p id="progress-copy" class="progress-copy"></p>
+    </div>
+    <div class="dialog-actions">
+      <button id="cancel-upload" type="button">取消</button>
+    </div>
+  </dialog>
+
+  <dialog id="conflict-dialog" aria-labelledby="conflict-title">
+    <div class="dialog-body">
+      <h2 id="conflict-title">同名文件已存在</h2>
+      <p id="conflict-copy" class="dialog-description"></p>
+    </div>
+    <div class="dialog-actions">
+      <button id="conflict-skip" type="button">跳过</button>
+      <button id="conflict-overwrite" type="button">覆盖</button>
+      <button id="conflict-overwrite-all" class="primary" type="button">全部覆盖</button>
+    </div>
+  </dialog>
+
+  <script>
+    const state = { path: "", controller: null, cancelled: false, overwriteAll: false, conflictResolve: null, defaultPassword: null };
+    const elements = {
+      breadcrumbs: document.querySelector("#breadcrumbs"),
+      fileList: document.querySelector("#file-list"),
+      notice: document.querySelector("#notice"),
+      dropZone: document.querySelector("#drop-zone"),
+      fileInput: document.querySelector("#file-input"),
+      folderInput: document.querySelector("#folder-input"),
+      mobileFolderInput: document.querySelector("#mobile-folder-input"),
+      mobileFolderDialog: document.querySelector("#mobile-folder-dialog"),
+      mobileFolderName: document.querySelector("#mobile-folder-name"),
+      mobileFolderError: document.querySelector("#mobile-folder-error"),
+      login: document.querySelector("#login-dialog"),
+      loginForm: document.querySelector("#login-form"),
+      loginError: document.querySelector("#login-error"),
+      loginSubmit: document.querySelector("#login-submit"),
+      username: document.querySelector("#username"),
+      password: document.querySelector("#password"),
+      progressDialog: document.querySelector("#progress-dialog"),
+      progress: document.querySelector("#progress"),
+      progressCopy: document.querySelector("#progress-copy"),
+      conflictDialog: document.querySelector("#conflict-dialog"),
+      conflictCopy: document.querySelector("#conflict-copy")
+    };
+
+    const icons = {
+      folder: '<svg class="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>',
+      file: '<svg class="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></svg>',
+      download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>'
+    };
+
+    function joinPath(parent, child) {
+      return [parent, child].filter(Boolean).join("/");
+    }
+
+    function showNotice(message, isError = false) {
+      elements.notice.textContent = message;
+      elements.notice.className = `notice visible${isError ? " error" : ""}`;
+    }
+
+    function clearNotice() {
+      elements.notice.textContent = "";
+      elements.notice.className = "notice";
+    }
+
+    async function responseError(response) {
+      try {
+        const body = await response.json();
+        return body.error || `请求失败（${response.status}）`;
+      } catch (_) {
+        return `请求失败（${response.status}）`;
+      }
+    }
+
+    function showLogin() {
+      if (!elements.login.open) elements.login.showModal();
+      const prepare = () => queueMicrotask(() => {
+        if (state.defaultPassword) elements.password.value = "88888888";
+        elements.username.focus();
+      });
+      if (state.defaultPassword === null) publicInfo.finally(prepare);
+      else prepare();
+    }
+
+    async function api(url, options = {}) {
+      const response = await fetch(url, options);
+      if (response.status === 401) {
+        showLogin();
+        throw new Error("请先登录");
+      }
+      return response;
+    }
+
+    function renderBreadcrumbs() {
+      elements.breadcrumbs.replaceChildren();
+      const parts = state.path ? state.path.split("/") : [];
+      const locations = [{ name: "共享目录", path: "" }];
+      let current = "";
+      for (const part of parts) {
+        current = joinPath(current, part);
+        locations.push({ name: part, path: current });
+      }
+      locations.forEach((location, index) => {
+        if (index > 0) {
+          const separator = document.createElement("span");
+          separator.className = "breadcrumb-separator";
+          separator.textContent = "/";
+          separator.setAttribute("aria-hidden", "true");
+          elements.breadcrumbs.append(separator);
+        }
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = location.name;
+        button.addEventListener("click", () => openDirectory(location.path));
+        elements.breadcrumbs.append(button);
+      });
+    }
+
+    function formatSize(size) {
+      if (!size) return "—";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      const unit = Math.min(Math.floor(Math.log(size) / Math.log(1024)), units.length - 1);
+      const value = size / (1024 ** unit);
+      return `${value.toLocaleString("zh-CN", { maximumFractionDigits: unit ? 1 : 0 })} ${units[unit]}`;
+    }
+
+    function formatDate(seconds) {
+      return seconds ? new Date(seconds * 1000).toLocaleString("zh-CN", { dateStyle: "medium", timeStyle: "short" }) : "—";
+    }
+
+    function renderFiles(entries) {
+      elements.fileList.replaceChildren();
+      if (!entries.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "这个文件夹还是空的";
+        elements.fileList.append(empty);
+        return;
+      }
+      for (const entry of entries) {
+        const row = document.createElement("div");
+        row.className = `file-row${entry.is_dir ? " folder" : ""}`;
+
+        const name = document.createElement(entry.is_dir ? "button" : "div");
+        name.className = "file-name";
+        if (entry.is_dir) {
+          name.type = "button";
+          name.addEventListener("click", () => openDirectory(entry.path));
+        }
+        name.insertAdjacentHTML("afterbegin", entry.is_dir ? icons.folder : icons.file);
+        const nameText = document.createElement("span");
+        nameText.className = "name-text";
+        nameText.textContent = entry.name;
+        name.append(nameText);
+
+        const size = document.createElement("span");
+        size.className = "metadata";
+        size.textContent = entry.is_dir ? "文件夹" : formatSize(entry.size);
+        const modified = document.createElement("span");
+        modified.className = "metadata modified";
+        modified.textContent = formatDate(entry.modified);
+
+        row.append(name, size, modified);
+        if (!entry.is_dir) {
+          const download = document.createElement("a");
+          download.className = "download-link";
+          download.href = `/api/download?path=${encodeURIComponent(entry.path)}`;
+          download.setAttribute("download", entry.name);
+          download.setAttribute("aria-label", `下载 ${entry.name}`);
+          download.innerHTML = icons.download;
+          row.append(download);
+        } else {
+          row.append(document.createElement("span"));
+        }
+        elements.fileList.append(row);
+      }
+    }
+
+    async function openDirectory(path) {
+      clearNotice();
+      const response = await api(`/api/files?path=${encodeURIComponent(path)}`);
+      if (!response.ok) throw new Error(await responseError(response));
+      state.path = path;
+      renderBreadcrumbs();
+      renderFiles(await response.json());
+    }
+
+    function uploadItems(files, folder = false) {
+      return Array.from(files).map(file => ({
+        file,
+        path: folder && file.webkitRelativePath ? file.webkitRelativePath : file.name
+      }));
+    }
+
+    function openFolderPicker() {
+      if (!matchMedia("(pointer: coarse), (max-width: 720px)").matches) {
+        elements.folderInput.click();
+        return;
+      }
+      elements.mobileFolderError.textContent = "";
+      elements.mobileFolderDialog.showModal();
+      queueMicrotask(() => elements.mobileFolderName.focus());
+    }
+
+    function mobileFolderName() {
+      const name = elements.mobileFolderName.value.trim();
+      if (!name) return "请输入文件夹名称";
+      if (name === "." || name === ".." || /[\\/\0]/.test(name)) return "文件夹名称不能包含 / 或 \\";
+      return "";
+    }
+
+    function conflictDecision(path) {
+      if (elements.progressDialog.open) elements.progressDialog.close();
+      elements.conflictCopy.textContent = `“${path}”已存在。请选择如何处理。`;
+      elements.conflictDialog.showModal();
+      return new Promise(resolve => { state.conflictResolve = resolve; });
+    }
+
+    function finishConflict(decision) {
+      if (!state.conflictResolve) return;
+      const resolve = state.conflictResolve;
+      state.conflictResolve = null;
+      elements.conflictDialog.close();
+      resolve(decision);
+    }
+
+    async function beginUpload(items) {
+      if (!items.length) return;
+      state.cancelled = false;
+      state.overwriteAll = false;
+      elements.progress.max = items.length;
+      elements.progress.value = 0;
+      elements.progressDialog.showModal();
+      let uploaded = 0;
+      let skipped = 0;
+      try {
+        for (let index = 0; index < items.length; index += 1) {
+          if (state.cancelled) break;
+          const item = items[index];
+          const path = joinPath(state.path, item.path.replace(/^\/+/, ""));
+          elements.progressCopy.textContent = `${index + 1} / ${items.length} · ${path}`;
+          let overwrite = state.overwriteAll;
+          while (true) {
+            state.controller = new AbortController();
+            const response = await api(`/api/upload?path=${encodeURIComponent(path)}&overwrite=${overwrite}`, {
+              method: "PUT",
+              body: item.file,
+              signal: state.controller.signal
+            });
+            if (response.status !== 409) {
+              if (!response.ok) throw new Error(await responseError(response));
+              uploaded += 1;
+              break;
+            }
+            const decision = await conflictDecision(path);
+            if (!elements.progressDialog.open) elements.progressDialog.showModal();
+            if (decision === "skip") {
+              skipped += 1;
+              break;
+            }
+            if (decision === "overwrite-all") state.overwriteAll = true;
+            overwrite = true;
+          }
+          elements.progress.value = index + 1;
+        }
+        if (elements.progressDialog.open) elements.progressDialog.close();
+        await openDirectory(state.path);
+        if (state.cancelled) showNotice(`上传已取消，已完成 ${uploaded} 个文件`);
+        else showNotice(`上传完成：${uploaded} 个文件${skipped ? `，跳过 ${skipped} 个` : ""}`);
+      } catch (error) {
+        if (elements.progressDialog.open) elements.progressDialog.close();
+        if (error.name === "AbortError" && state.cancelled) showNotice(`上传已取消，已完成 ${uploaded} 个文件`);
+        else showNotice(error.message || "上传失败", true);
+      } finally {
+        state.controller = null;
+        elements.fileInput.value = "";
+        elements.folderInput.value = "";
+        elements.mobileFolderInput.value = "";
+      }
+    }
+
+    elements.login.addEventListener("cancel", event => event.preventDefault());
+    elements.loginForm.addEventListener("submit", async event => {
+      event.preventDefault();
+      elements.loginError.textContent = "";
+      elements.loginSubmit.disabled = true;
+      try {
+        const response = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: elements.username.value, password: elements.password.value })
+        });
+        if (!response.ok) throw new Error(await responseError(response));
+        elements.password.value = "";
+        elements.login.close();
+        await openDirectory(state.path);
+      } catch (error) {
+        elements.loginError.textContent = error.message || "登录失败";
+      } finally {
+        elements.loginSubmit.disabled = false;
+      }
+    });
+
+    document.querySelector("#logout").addEventListener("click", async () => {
+      await fetch("/api/logout", { method: "POST" });
+      showLogin();
+    });
+    document.querySelector("#refresh").addEventListener("click", () => openDirectory(state.path).catch(error => showNotice(error.message, true)));
+    document.querySelector("#choose-files").addEventListener("click", () => elements.fileInput.click());
+    document.querySelector("#choose-folder").addEventListener("click", openFolderPicker);
+    elements.fileInput.addEventListener("change", () => beginUpload(uploadItems(elements.fileInput.files)));
+    elements.folderInput.addEventListener("change", () => beginUpload(uploadItems(elements.folderInput.files, true)));
+    document.querySelector("#mobile-folder-cancel").addEventListener("click", () => elements.mobileFolderDialog.close());
+    document.querySelector("#mobile-folder-choose").addEventListener("click", () => {
+      const error = mobileFolderName();
+      elements.mobileFolderError.textContent = error;
+      if (!error) elements.mobileFolderInput.click();
+    });
+    elements.mobileFolderInput.addEventListener("change", () => {
+      if (!elements.mobileFolderInput.files.length) return;
+      const name = elements.mobileFolderName.value.trim();
+      const items = Array.from(elements.mobileFolderInput.files).map(file => ({ file, path: joinPath(name, file.name) }));
+      elements.mobileFolderDialog.close();
+      beginUpload(items);
+    });
+    document.querySelector("#cancel-upload").addEventListener("click", () => {
+      state.cancelled = true;
+      if (state.controller) state.controller.abort();
+    });
+    document.querySelector("#conflict-skip").addEventListener("click", () => finishConflict("skip"));
+    document.querySelector("#conflict-overwrite").addEventListener("click", () => finishConflict("overwrite"));
+    document.querySelector("#conflict-overwrite-all").addEventListener("click", () => finishConflict("overwrite-all"));
+    elements.conflictDialog.addEventListener("cancel", event => { event.preventDefault(); finishConflict("skip"); });
+
+    ["dragenter", "dragover"].forEach(type => elements.dropZone.addEventListener(type, event => {
+      event.preventDefault();
+      elements.dropZone.classList.add("dragging");
+    }));
+    ["dragleave", "drop"].forEach(type => elements.dropZone.addEventListener(type, event => {
+      event.preventDefault();
+      elements.dropZone.classList.remove("dragging");
+    }));
+    elements.dropZone.addEventListener("drop", event => beginUpload(uploadItems(event.dataTransfer.files)));
+
+    const publicInfo = fetch("/api/info", { cache: "no-store" })
+      .then(response => response.json())
+      .then(info => {
+        elements.username.value = info.username || "";
+        state.defaultPassword = Boolean(info.default_password);
+        if (state.defaultPassword) elements.password.value = "88888888";
+      })
+      .catch(() => { state.defaultPassword = false; });
+    publicInfo.finally(() => openDirectory("").catch(error => {
+        if (error.message !== "请先登录") showNotice(error.message, true);
+      }));
+  </script>
+</body>
+</html>

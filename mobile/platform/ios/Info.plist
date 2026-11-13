@@ -35,7 +35,7 @@
   <key>UIFileSharingEnabled</key><true/>
   <key>LSSupportsOpeningDocumentsInPlace</key><true/>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>Blip 使用本地网络发现设备并提供局域网 SFTP 文件传输。</string>
+  <string>Blip 使用本地网络发现设备并提供局域网 SFTP 与 HTTP 文件传输。</string>
   <key>NSBonjourServices</key>
   <array><string>_blip-sftp._tcp</string></array>
 </dict>

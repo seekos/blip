@@ -4,12 +4,18 @@
 mod android_picker;
 #[cfg(any(target_os = "ios", target_os = "android"))]
 mod app;
+#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
+mod qr;
 mod remote_path;
 
 #[cfg(any(target_os = "ios", target_os = "android"))]
 #[allow(dead_code)]
 #[path = "../../src/discovery.rs"]
 mod discovery;
+#[cfg(any(target_os = "ios", target_os = "android"))]
+#[allow(dead_code)]
+#[path = "../../src/http_share.rs"]
+mod http_share;
 #[cfg(any(target_os = "ios", target_os = "android"))]
 #[allow(dead_code)]
 mod session;

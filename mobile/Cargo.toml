@@ -21,6 +21,8 @@ gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "13c716b687b4
 gpui-mobile = { git = "https://github.com/itsbalamurali/gpui-mobile", rev = "5fd54f4554263ae06753e90472c7f2e2ff5d7495", default-features = false, features = ["camera", "file_selector", "path_provider", "share", "url_launcher", "video_player"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time", "sync"] }
+axum = "0.8"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3.0"
 flume = { version = "0.12", features = ["async"] }

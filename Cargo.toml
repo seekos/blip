@@ -15,9 +15,11 @@ demo-server = []
 # UI: GPUI Kit re-exports gpui, base, component library and the icon set.
 gpui-kit = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
+qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
 tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 
 # Networking: a dedicated multi-threaded Tokio runtime lives on its own thread.
+axum = "0.8"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",

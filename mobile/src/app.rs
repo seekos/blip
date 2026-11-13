@@ -1,19 +1,20 @@
-use std::{ops::Range, path::PathBuf};
+use std::{ops::Range, path::PathBuf, sync::Arc, time::Duration};
 
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, PathPromptOptions, Render, ScrollStrategy, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
-    WeakEntity, Window, div, prelude::FluentBuilder as _, px, rgb, uniform_list,
+    App, AppContext as _, ClipboardItem, Context, Entity, Image, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Render, ScrollStrategy,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, Window, div, img, prelude::FluentBuilder as _, px, rgb,
+    uniform_list,
 };
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
-    Icon,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     checkbox::Checkbox,
     dialog::{DialogAction, DialogButtonProps, DialogClose, DialogFooter},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    notification::Notification,
     progress::Progress,
     spinner::Spinner,
     switch::Switch,
@@ -23,6 +24,8 @@ use gpui_mobile::components::material::{ListTile, MaterialTheme, NavigationBarBu
 use gpui_mobile::{StatusBarContentStyle, SystemChromeStyle, set_system_chrome};
 
 use crate::discovery::{DiscoveredDevice, DiscoveryService};
+use crate::http_share::HttpServer;
+use crate::qr::qr_code_image;
 use crate::remote_path;
 use crate::session::store::{self, AppSettings, LanSftpPasswordMode, SavedAuth, SavedProfile};
 use crate::sftp::SftpWorker;
@@ -41,6 +44,9 @@ const ICON_LINK: &[u8] = include_bytes!("../assets/icons/link.svg");
 const ICON_CHEVRON_RIGHT: &[u8] = include_bytes!("../assets/icons/chevron-right.svg");
 const ICON_ELLIPSIS_VERTICAL: &[u8] = include_bytes!("../assets/icons/ellipsis-vertical.svg");
 const ICON_CORNER_LEFT_UP: &[u8] = include_bytes!("../assets/icons/corner-left-up.svg");
+const CONNECTED_NOTIFICATION_DURATION: Duration = Duration::from_secs(3);
+
+struct ConnectedNotification;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Screen {
@@ -173,6 +179,8 @@ pub struct MobileApp {
     unlocked: bool,
     discovery: Option<DiscoveryService>,
     lan_server: Result<ServerInfo, SharedString>,
+    http_server: Result<HttpServer, SharedString>,
+    http_qr_code: Option<(Arc<Image>, f32)>,
     lan_activity: TransferActivity,
 
     host: Entity<InputState>,
@@ -266,6 +274,8 @@ impl MobileApp {
             unlocked: auto_unlocked,
             discovery: None,
             lan_server: Err("配置尚未解锁".into()),
+            http_server: Err("配置尚未解锁".into()),
+            http_qr_code: None,
             lan_activity,
             host,
             port,
@@ -364,10 +374,19 @@ impl MobileApp {
         self.lan_server = crate::sftp::lan_server::start(
             self.settings.lan_sftp_root.clone(),
             &self.settings.lan_sftp_username,
-            password,
+            password.clone(),
             self.lan_activity.clone(),
         )
         .map_err(SharedString::from);
+        self.http_server = crate::http_share::start(
+            self.settings.lan_sftp_root.clone(),
+            &self.settings.lan_sftp_username,
+            password,
+            self.settings.lan_http_port,
+            self.lan_activity.clone(),
+        )
+        .map_err(SharedString::from);
+        self.refresh_http_qr_code();
 
         match crate::discovery::start(
             self.lan_server.as_ref().ok().map(|server| server.port),
@@ -394,6 +413,52 @@ impl MobileApp {
             Err(message) => self.status_message = Some(message.into()),
         }
         cx.notify();
+    }
+
+    fn apply_http_settings(&mut self, password: Option<String>) -> Result<(), String> {
+        if let Ok(server) = &self.http_server
+            && server.port() == self.settings.lan_http_port
+        {
+            server.set_username(&self.settings.lan_sftp_username)?;
+            server.set_password(password)?;
+            self.refresh_http_qr_code();
+            return Ok(());
+        }
+
+        match crate::http_share::start(
+            self.settings.lan_sftp_root.clone(),
+            &self.settings.lan_sftp_username,
+            password,
+            self.settings.lan_http_port,
+            self.lan_activity.clone(),
+        ) {
+            Ok(server) => {
+                self.http_server = Ok(server);
+                self.refresh_http_qr_code();
+                Ok(())
+            }
+            Err(message) => {
+                if self.http_server.is_err() {
+                    self.http_server = Err(message.clone().into());
+                    self.http_qr_code = None;
+                }
+                Err(message)
+            }
+        }
+    }
+
+    fn refresh_http_qr_code(&mut self) {
+        self.http_qr_code =
+            self.http_server
+                .as_ref()
+                .ok()
+                .and_then(|server| match qr_code_image(&server.url()) {
+                    Ok(image) => Some(image),
+                    Err(error) => {
+                        log::warn!("生成移动端 HTTP 共享二维码失败：{error}");
+                        None
+                    }
+                });
     }
 
     fn open_master_password_dialog(app: WeakEntity<Self>, window: &mut Window, cx: &mut App) {
@@ -1296,7 +1361,22 @@ impl MobileApp {
                 self.remote_path = home.clone();
                 self.persist_successful_connection();
                 self.request_directory(home, None, cx);
-                window.push_notification("SFTP 已连接", cx);
+                let notification_id = self.active_request_id.to_string();
+                window.push_notification(
+                    Notification::success("SFTP 已连接")
+                        .id1::<ConnectedNotification>(notification_id.clone())
+                        .autohide(false),
+                    cx,
+                );
+                cx.spawn_in(window, async move |_, cx| {
+                    cx.background_executor()
+                        .timer(CONNECTED_NOTIFICATION_DURATION)
+                        .await;
+                    let _ = cx.update(|window, cx| {
+                        window.remove_notification1::<ConnectedNotification>(notification_id, cx)
+                    });
+                })
+                .detach();
             }
             SftpEvent::Reconnecting => {
                 self.connection = ConnectionState::Reconnecting;
@@ -1899,14 +1979,19 @@ impl MobileApp {
                 .placeholder("UDP 发现端口")
                 .default_value(settings.discovery_port.to_string())
         });
+        let http_port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("HTTP 端口")
+                .default_value(settings.lan_http_port.to_string())
+        });
         let lan_username = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("SFTP 登录用户名")
+                .placeholder("共享登录用户名")
                 .default_value(settings.lan_sftp_username.clone())
         });
         let lan_password = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("内置 SFTP 密码")
+                .placeholder("共享登录密码")
                 .masked(true)
         });
         let draft = cx.new(|_| SettingsDraft {
@@ -1921,6 +2006,7 @@ impl MobileApp {
             let draft_for_save = draft.clone();
             let discovery_name_for_save = discovery_name.clone();
             let discovery_port_for_save = discovery_port.clone();
+            let http_port_for_save = http_port.clone();
             let lan_username_for_save = lan_username.clone();
             let lan_password_for_save = lan_password.clone();
             dialog
@@ -1930,10 +2016,11 @@ impl MobileApp {
                         .gap_3()
                         .child(Input::new(&discovery_name))
                         .child(Input::new(&discovery_port))
+                        .child(Input::new(&http_port))
                         .child(Input::new(&lan_username))
                         .child(
                             Switch::new("manual-lan-password")
-                                .label("使用手动 SFTP 密码")
+                                .label("使用手动共享密码")
                                 .checked(manual_password)
                                 .on_change({
                                     let draft = draft.clone();
@@ -1961,11 +2048,17 @@ impl MobileApp {
                                 .parse::<u16>()
                                 .ok()
                                 .filter(|port| *port > 0);
+                            let http_port = Self::input_value(&http_port_for_save, cx)
+                                .parse::<u16>()
+                                .ok()
+                                .filter(|port| *port > 0);
                             let manual = draft_for_save.read(cx).manual_password;
                             let password = Self::input_value(&lan_password_for_save, cx);
-                            let lan_username =
-                                Self::input_value(&lan_username_for_save, cx).trim().to_string();
+                            let lan_username = Self::input_value(&lan_username_for_save, cx)
+                                .trim()
+                                .to_string();
                             if port.is_none()
+                                || http_port.is_none()
                                 || lan_username.is_empty()
                                 || lan_username.chars().any(char::is_whitespace)
                                 || (manual && password.is_empty())
@@ -1974,10 +2067,12 @@ impl MobileApp {
                                     draft.error = Some(
                                         if port.is_none() {
                                             "发现端口必须是 1–65535 之间的整数"
+                                        } else if http_port.is_none() {
+                                            "HTTP 端口必须是 1–65535 之间的整数"
                                         } else if lan_username.is_empty() {
-                                            "SFTP 登录用户名不能为空"
+                                            "共享登录用户名不能为空"
                                         } else if lan_username.chars().any(char::is_whitespace) {
-                                            "SFTP 登录用户名不能包含空白字符"
+                                            "共享登录用户名不能包含空白字符"
                                         } else {
                                             "手动密码不能为空"
                                         }
@@ -1992,6 +2087,8 @@ impl MobileApp {
                                 app.settings.discovery_username =
                                     (!username.is_empty()).then_some(username.clone());
                                 app.settings.discovery_port = port.expect("validated port");
+                                app.settings.lan_http_port =
+                                    http_port.expect("validated HTTP port");
                                 app.settings.lan_sftp_username = lan_username.clone();
                                 app.settings.lan_sftp_password_mode = if manual {
                                     LanSftpPasswordMode::Manual
@@ -2016,7 +2113,17 @@ impl MobileApp {
                                             let _ = server
                                                 .set_password(manual.then_some(password.clone()));
                                         }
-                                        app.status_message = Some("设置已保存".into());
+                                        app.status_message = Some(
+                                            match app.apply_http_settings(
+                                                manual.then_some(password.clone()),
+                                            ) {
+                                                Ok(()) => "设置已保存".to_string(),
+                                                Err(message) => format!(
+                                                    "设置已保存，但 HTTP 服务未切换：{message}"
+                                                ),
+                                            }
+                                            .into(),
+                                        );
                                     }
                                     Err(message) => app.status_message = Some(message.into()),
                                 }
@@ -2047,6 +2154,12 @@ impl MobileApp {
             let _ = this.update(cx, |app, cx| match selected {
                 Ok(Some(path)) => {
                     let path = PathBuf::from(path);
+                    let password = match app.settings.lan_sftp_password_mode {
+                        LanSftpPasswordMode::Default => None,
+                        LanSftpPasswordMode::Manual => {
+                            store::load_lan_sftp_password().ok().flatten()
+                        }
+                    };
                     let new_server = match &app.lan_server {
                         Ok(server) => match server.set_root(path.clone()) {
                             Ok(()) => None,
@@ -2057,16 +2170,10 @@ impl MobileApp {
                             }
                         },
                         Err(_) => {
-                            let password = match app.settings.lan_sftp_password_mode {
-                                LanSftpPasswordMode::Default => None,
-                                LanSftpPasswordMode::Manual => {
-                                    store::load_lan_sftp_password().ok().flatten()
-                                }
-                            };
                             match crate::sftp::lan_server::start(
                                 Some(path.clone()),
                                 &app.settings.lan_sftp_username,
-                                password,
+                                password.clone(),
                                 app.lan_activity.clone(),
                             ) {
                                 Ok(server) => Some(server),
@@ -2085,11 +2192,44 @@ impl MobileApp {
                             let _ = discovery.set_port(Some(port));
                         }
                     }
+                    let mut new_http_server = None;
+                    let http_start_error = match &app.http_server {
+                        Ok(server) => match server.set_root(path.clone()) {
+                            Ok(()) => None,
+                            Err(message) => {
+                                app.status_message = Some(message.into());
+                                cx.notify();
+                                return;
+                            }
+                        },
+                        Err(_) => match crate::http_share::start(
+                            Some(path.clone()),
+                            &app.settings.lan_sftp_username,
+                            password,
+                            app.settings.lan_http_port,
+                            app.lan_activity.clone(),
+                        ) {
+                            Ok(server) => {
+                                new_http_server = Some(server);
+                                None
+                            }
+                            Err(message) => Some(message),
+                        },
+                    };
+                    if let Some(server) = new_http_server {
+                        app.http_server = Ok(server);
+                    } else if let Some(message) = &http_start_error {
+                        app.http_server = Err(message.clone().into());
+                    }
+                    app.refresh_http_qr_code();
                     app.settings.lan_sftp_root = Some(path);
                     if let Err(message) =
                         store::save_settings_with_lan_password(&app.settings, None)
                     {
                         app.status_message = Some(message.into());
+                    } else if let Some(message) = http_start_error {
+                        app.status_message =
+                            Some(format!("共享目录已切换，但 HTTP 服务启动失败：{message}").into());
                     } else {
                         app.status_message = Some("共享目录已切换".into());
                     }
@@ -2118,11 +2258,7 @@ impl MobileApp {
                 .justify_center()
                 .gap_3()
                 .p_6()
-                .child(
-                    Spinner::new()
-                        .with_size(px(32.))
-                        .color(cx.theme().primary),
-                )
+                .child(Spinner::new().with_size(px(32.)).color(cx.theme().primary))
                 .child(div().text_xl().child(title))
                 .when_some(self.endpoint.clone(), |this, endpoint| {
                     this.child(
@@ -2219,29 +2355,24 @@ impl MobileApp {
                         ListTile::new(MaterialTheme::from_appearance(app.dark_mode))
                             .id(format!("remote-entry:{path}"))
                             .leading(
-                                div()
-                                    .w_6()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        Icon::default()
-                                            .data(leading_icon)
-                                            .small()
-                                            .text_color(cx.theme().muted_foreground),
-                                    ),
+                                div().w_6().flex().items_center().justify_center().child(
+                                    Icon::default()
+                                        .data(leading_icon)
+                                        .small()
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
                             )
                             .title(entry.name.clone())
                             .subtitle(subtitle)
                             .trailing(
                                 Icon::default()
-                                .data(if is_dir {
-                                    ICON_CHEVRON_RIGHT
-                                } else {
-                                    ICON_ELLIPSIS_VERTICAL
-                                })
-                                .small()
-                                .text_color(cx.theme().muted_foreground),
+                                    .data(if is_dir {
+                                        ICON_CHEVRON_RIGHT
+                                    } else {
+                                        ICON_ELLIPSIS_VERTICAL
+                                    })
+                                    .small()
+                                    .text_color(cx.theme().muted_foreground),
                             )
                             .on_click(cx.listener(move |app, _, window, cx| {
                                 if is_dir {
@@ -2275,17 +2406,12 @@ impl MobileApp {
         ListTile::new(MaterialTheme::from_appearance(self.dark_mode))
             .id("remote-parent-directory")
             .leading(
-                div()
-                    .w_6()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Icon::default()
-                            .data(ICON_CORNER_LEFT_UP)
-                            .small()
-                            .text_color(cx.theme().muted_foreground),
-                    ),
+                div().w_6().flex().items_center().justify_center().child(
+                    Icon::default()
+                        .data(ICON_CORNER_LEFT_UP)
+                        .small()
+                        .text_color(cx.theme().muted_foreground),
+                ),
             )
             .title("上级目录")
             .subtitle(parent.clone())
@@ -2317,10 +2443,7 @@ impl MobileApp {
                 )
                 .into_any_element();
         }
-        let has_clearable = self
-            .transfers
-            .iter()
-            .any(|row| row.state.is_clearable());
+        let has_clearable = self.transfers.iter().any(|row| row.state.is_clearable());
         let rows = self.transfers.clone();
         v_flex()
             .size_full()
@@ -2561,6 +2684,13 @@ impl MobileApp {
         };
         let (server_endpoint, server_command, server_root, server_error, password) = server_info;
         let password_to_copy = password.clone();
+        let (http_url, http_error) = match &self.http_server {
+            Ok(server) => (Some(server.url()), None),
+            Err(message) => (None, Some(message.clone())),
+        };
+        let http_qr_code = self.http_qr_code.clone();
+        let qr_unavailable = http_url.is_some() && http_qr_code.is_none();
+        let http_url_to_copy = http_url.clone();
         v_flex()
             .id("settings-list")
             .size_full()
@@ -2635,6 +2765,73 @@ impl MobileApp {
                                         password.clone(),
                                     ));
                                     window.push_notification("登录密码已复制", cx);
+                                }
+                            }),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_3()
+                    .p_4()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(div().text_base().child("HTTP 文件共享"))
+                    .when_some(http_url, |this, url| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .whitespace_normal()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("访问地址：{url}")),
+                        )
+                    })
+                    .when_some(http_qr_code, |this, (image, size)| {
+                        this.child(
+                            v_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(img(image).size(px(size)))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("扫码打开此地址"),
+                                ),
+                        )
+                    })
+                    .when(qr_unavailable, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("二维码生成失败，可复制访问地址"),
+                        )
+                    })
+                    .when_some(http_error, |this, error| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .whitespace_normal()
+                                .text_color(cx.theme().danger)
+                                .child(error),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("与 SFTP 共用共享目录、用户名和密码"),
+                    )
+                    .child(
+                        Button::new("copy-http-url")
+                            .label("复制访问地址")
+                            .disabled(http_url_to_copy.is_none())
+                            .on_click(move |_, window, cx| {
+                                if let Some(url) = &http_url_to_copy {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                                    window.push_notification("访问地址已复制", cx);
                                 }
                             }),
                     ),
@@ -2724,7 +2921,10 @@ impl MobileApp {
         if self.screen == Screen::Files && self.connection == ConnectionState::Connected {
             let app = cx.entity().downgrade();
             bar = bar
-                .trailing_icon("刷新", cx.listener(|app, _, _, cx| app.refresh_directory(cx)))
+                .trailing_icon(
+                    "刷新",
+                    cx.listener(|app, _, _, cx| app.refresh_directory(cx)),
+                )
                 .trailing_icon("＋", move |_, window, cx| {
                     Self::open_file_actions(app.clone(), window, cx)
                 });

@@ -34,6 +34,7 @@ const PROFILES_SCHEMA_VERSION: u32 = 1;
 const LOCAL_UNLOCK_WORK_FACTOR: u8 = 2;
 pub(crate) const PROFILE_LIMIT: usize = 50;
 pub const DEFAULT_DISCOVERY_PORT: u16 = 1985;
+pub const DEFAULT_LAN_HTTP_PORT: u16 = 1986;
 pub const DEFAULT_LAN_SFTP_USERNAME: &str = "zy";
 
 static UNLOCKED_CONFIG: OnceLock<Mutex<Option<UnlockedConfig>>> = OnceLock::new();
@@ -135,9 +136,11 @@ pub struct AppSettings {
     pub discovery_port: u16,
     /// 内置局域网 SFTP 的共享根目录；`None` 表示当前用户主目录。
     pub lan_sftp_root: Option<PathBuf>,
-    /// 内置局域网 SFTP 的登录用户名。
+    /// 内置局域网 SFTP 与 HTTP 文件共享共用的登录用户名。
     pub lan_sftp_username: String,
     pub lan_sftp_password_mode: LanSftpPasswordMode,
+    /// 浏览器文件共享服务的监听端口。
+    pub lan_http_port: u16,
 }
 
 impl Default for AppSettings {
@@ -156,6 +159,7 @@ fn preferred_settings(notepad: Option<PathBuf>) -> AppSettings {
             lan_sftp_root: None,
             lan_sftp_username: DEFAULT_LAN_SFTP_USERNAME.to_string(),
             lan_sftp_password_mode: LanSftpPasswordMode::Default,
+            lan_http_port: DEFAULT_LAN_HTTP_PORT,
         },
         None => AppSettings {
             remote_open_behavior: RemoteOpenBehavior::SystemDefault,
@@ -165,6 +169,7 @@ fn preferred_settings(notepad: Option<PathBuf>) -> AppSettings {
             lan_sftp_root: None,
             lan_sftp_username: DEFAULT_LAN_SFTP_USERNAME.to_string(),
             lan_sftp_password_mode: LanSftpPasswordMode::Default,
+            lan_http_port: DEFAULT_LAN_HTTP_PORT,
         },
     }
 }
@@ -1946,6 +1951,7 @@ mod tests {
             lan_sftp_root: Some(PathBuf::from("/Users/tester/Shared")),
             lan_sftp_username: "phone".to_string(),
             lan_sftp_password_mode: LanSftpPasswordMode::Manual,
+            lan_http_port: 2986,
         };
         let json = serde_json::to_string(&settings).expect("序列化设置");
         let decoded: AppSettings = serde_json::from_str(&json).expect("读回设置");
@@ -1961,6 +1967,7 @@ mod tests {
         assert_eq!(previous_random.discovery_username, None);
         assert_eq!(previous_random.discovery_port, DEFAULT_DISCOVERY_PORT);
         assert_eq!(previous_random.lan_sftp_username, DEFAULT_LAN_SFTP_USERNAME);
+        assert_eq!(previous_random.lan_http_port, DEFAULT_LAN_HTTP_PORT);
 
         let previous_download: AppSettings =
             serde_json::from_str(r#"{"remote_open_behavior":"download"}"#).expect("迁移原下载设置");

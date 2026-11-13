@@ -9,7 +9,7 @@
 //! 重入提醒：GPUI 的 `Entity::update` 是独占租约，在某个实体被更新期间再更新它会
 //! panic。所以工具栏事件里只更新 `workspace`，工作区事件里只更新 `toolbar`。
 
-use std::{cell::Cell, path::PathBuf, rc::Rc};
+use std::{cell::Cell, io::Cursor, path::PathBuf, rc::Rc, sync::Arc};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -27,8 +27,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use image::{DynamicImage, ImageFormat as RasterImageFormat, Luma};
+use qrcode::QrCode;
 
 use crate::discovery::DiscoveryService;
+use crate::http_share::HttpServer;
 use crate::session::store::{
     self, AppSettings, LanSftpPasswordMode, RemoteOpenBehavior, SavedAuth, SavedProfile,
 };
@@ -41,6 +44,20 @@ use crate::ui::transfer_panel::TransferQueue;
 use crate::ui::workspace::{Workspace, WorkspaceEvent};
 use crate::update::{self, AvailableUpdate};
 
+fn qr_code_image(value: &str) -> Result<(Arc<Image>, f32), String> {
+    let code = QrCode::new(value.as_bytes()).map_err(|error| error.to_string())?;
+    let raster = code.render::<Luma<u8>>().module_dimensions(6, 6).build();
+    let size = raster.width() as f32;
+    let mut png = Cursor::new(Vec::new());
+    DynamicImage::ImageLuma8(raster)
+        .write_to(&mut png, RasterImageFormat::Png)
+        .map_err(|error| error.to_string())?;
+    Ok((
+        Arc::new(Image::from_bytes(ImageFormat::Png, png.into_inner())),
+        size,
+    ))
+}
+
 pub struct ScpApp {
     toolbar: Entity<Toolbar>,
     workspace: Entity<Workspace>,
@@ -51,6 +68,7 @@ pub struct ScpApp {
     profiles: Vec<SavedProfile>,
     settings: AppSettings,
     lan_server: Result<ServerInfo, SharedString>,
+    http_server: Result<HttpServer, SharedString>,
     lan_transfer_activity: TransferActivity,
     lan_transfer_active: bool,
     lan_idle_sleep_guard: Option<ActivityGuard>,
@@ -207,6 +225,17 @@ fn parse_port(value: &str) -> Option<u16> {
     value.trim().parse::<u16>().ok().filter(|port| *port > 0)
 }
 
+fn configured_lan_password(settings: &AppSettings) -> Result<Option<String>, String> {
+    match settings.lan_sftp_password_mode {
+        LanSftpPasswordMode::Default => Ok(None),
+        LanSftpPasswordMode::Manual => store::load_lan_sftp_password().and_then(|password| {
+            password
+                .map(Some)
+                .ok_or_else(|| "手动密码尚未设置，请在设置中填写".to_string())
+        }),
+    }
+}
+
 fn favorite_tooltip(profile: &SavedProfile) -> String {
     let name = profile
         .name
@@ -248,33 +277,45 @@ impl ScpApp {
         };
         let (lan_transfer_activity, lan_transfer_events) =
             crate::sftp::lan_server::transfer_activity();
-        let lan_server: Result<ServerInfo, SharedString> = if auto_unlocked {
-            let server_password = match settings.lan_sftp_password_mode {
-                LanSftpPasswordMode::Default => Ok(None),
-                LanSftpPasswordMode::Manual => {
-                    store::load_lan_sftp_password().and_then(|password| {
-                        password
-                            .map(Some)
-                            .ok_or_else(|| "手动密码尚未设置，请在设置中填写".to_string())
+        let server_password = auto_unlocked.then(|| configured_lan_password(&settings));
+        let lan_server: Result<ServerInfo, SharedString> =
+            if let Some(server_password) = &server_password {
+                server_password
+                    .clone()
+                    .and_then(|password| {
+                        crate::sftp::lan_server::start(
+                            settings.lan_sftp_root.clone(),
+                            &settings.lan_sftp_username,
+                            password,
+                            lan_transfer_activity.clone(),
+                        )
                     })
-                }
+                    .map_err(|message| {
+                        log::error!("内置局域网 SFTP 服务启动失败：{message}");
+                        SharedString::from(message)
+                    })
+            } else {
+                Err(SharedString::from("配置尚未解锁"))
             };
-            server_password
-                .and_then(|password| {
-                    crate::sftp::lan_server::start(
-                        settings.lan_sftp_root.clone(),
-                        &settings.lan_sftp_username,
-                        password,
-                        lan_transfer_activity.clone(),
-                    )
-                })
-                .map_err(|message| {
-                    log::error!("内置局域网 SFTP 服务启动失败：{message}");
-                    SharedString::from(message)
-                })
-        } else {
-            Err(SharedString::from("配置尚未解锁"))
-        };
+        let http_server: Result<HttpServer, SharedString> =
+            if let Some(server_password) = server_password {
+                server_password
+                    .and_then(|password| {
+                        crate::http_share::start(
+                            settings.lan_sftp_root.clone(),
+                            &settings.lan_sftp_username,
+                            password,
+                            settings.lan_http_port,
+                            lan_transfer_activity.clone(),
+                        )
+                    })
+                    .map_err(|message| {
+                        log::error!("浏览器文件共享服务启动失败：{message}");
+                        SharedString::from(message)
+                    })
+            } else {
+                Err(SharedString::from("配置尚未解锁"))
+            };
         let toolbar = cx.new(|cx| Toolbar::new(profiles.clone(), window, cx));
         let discovery = match crate::discovery::start(
             lan_server.as_ref().ok().map(|info| info.port),
@@ -425,6 +466,7 @@ impl ScpApp {
             profiles,
             settings,
             lan_server,
+            http_server,
             lan_transfer_activity,
             lan_transfer_active: false,
             lan_idle_sleep_guard: None,
@@ -701,15 +743,9 @@ impl ScpApp {
     fn apply_unlocked_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let profiles = store::load_profiles();
         let settings = store::load_settings();
-        let server_password = match settings.lan_sftp_password_mode {
-            LanSftpPasswordMode::Default => Ok(None),
-            LanSftpPasswordMode::Manual => store::load_lan_sftp_password().and_then(|password| {
-                password
-                    .map(Some)
-                    .ok_or_else(|| "手动密码尚未设置，请在设置中填写".to_string())
-            }),
-        };
+        let server_password = configured_lan_password(&settings);
         self.lan_server = server_password
+            .clone()
             .and_then(|password| {
                 crate::sftp::lan_server::start(
                     settings.lan_sftp_root.clone(),
@@ -720,6 +756,20 @@ impl ScpApp {
             })
             .map_err(|message| {
                 log::error!("内置局域网 SFTP 服务启动失败：{message}");
+                SharedString::from(message)
+            });
+        self.http_server = server_password
+            .and_then(|password| {
+                crate::http_share::start(
+                    settings.lan_sftp_root.clone(),
+                    &settings.lan_sftp_username,
+                    password,
+                    settings.lan_http_port,
+                    self.lan_transfer_activity.clone(),
+                )
+            })
+            .map_err(|message| {
+                log::error!("浏览器文件共享服务启动失败：{message}");
                 SharedString::from(message)
             });
         if let Ok(info) = &self.lan_server {
@@ -760,6 +810,55 @@ impl ScpApp {
                 cx,
             );
         }
+        if let Err(message) = &self.http_server {
+            window.push_notification(
+                Notification::error(format!("配置已解锁，但浏览器文件共享启动失败：{message}")),
+                cx,
+            );
+        }
+    }
+
+    fn apply_http_settings(
+        &mut self,
+        settings: &AppSettings,
+        manual_password: Option<String>,
+        effective_root: PathBuf,
+    ) -> Result<(), String> {
+        if let Ok(server) = &self.http_server
+            && server.port() == settings.lan_http_port
+        {
+            server.set_username(&settings.lan_sftp_username)?;
+            server.set_root(effective_root)?;
+            match settings.lan_sftp_password_mode {
+                LanSftpPasswordMode::Manual => server.set_password(manual_password)?,
+                LanSftpPasswordMode::Default
+                    if self.settings.lan_sftp_password_mode == LanSftpPasswordMode::Manual =>
+                {
+                    server.set_password(None)?
+                }
+                LanSftpPasswordMode::Default => {}
+            }
+            return Ok(());
+        }
+
+        match crate::http_share::start(
+            settings.lan_sftp_root.clone(),
+            &settings.lan_sftp_username,
+            manual_password,
+            settings.lan_http_port,
+            self.lan_transfer_activity.clone(),
+        ) {
+            Ok(server) => {
+                self.http_server = Ok(server);
+                Ok(())
+            }
+            Err(message) => {
+                if self.http_server.is_err() {
+                    self.http_server = Err(message.clone().into());
+                }
+                Err(message)
+            }
+        }
     }
 
     fn set_lan_transfer_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -773,7 +872,7 @@ impl ScpApp {
         }
 
         self.lan_idle_sleep_request_pending = true;
-        let request = cx.prevent_idle_sleep("Blip 局域网 SFTP 正在传输文件");
+        let request = cx.prevent_idle_sleep("Blip 局域网正在传输文件");
         cx.spawn(async move |this, cx| {
             let result = request.await;
             let _ = this.update(cx, |app, _cx| {
@@ -1024,6 +1123,223 @@ impl ScpApp {
         });
     }
 
+    fn open_http_server_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let server = self
+            .http_server
+            .as_ref()
+            .map(|server| {
+                (
+                    server.url(),
+                    server.username(),
+                    server.password(),
+                    server.root(),
+                )
+            })
+            .map_err(Clone::clone);
+        window.open_dialog(cx, move |dialog, _window, cx| match server.clone() {
+            Ok((url, username, password, root)) => {
+                let theme = cx.theme().clone();
+                let qr_code = qr_code_image(&url);
+                let copy_url = url.clone();
+                let open_url = url.clone();
+                let copy_password = password.clone();
+                dialog
+                    .title("浏览器文件共享")
+                    .w(px(560.))
+                    .overlay_closable(false)
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child("同一局域网内的设备可在浏览器中打开以下地址。"),
+                            )
+                            .child(match qr_code {
+                                Ok((image, size)) => v_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(img(image).size(px(size)))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("手机扫码打开"),
+                                    )
+                                    .into_any_element(),
+                                Err(error) => {
+                                    log::warn!("生成 HTTP 共享二维码失败：{error}");
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("二维码生成失败，可复制访问地址")
+                                        .into_any_element()
+                                }
+                            })
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .w(px(72.))
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("访问地址"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .px_3()
+                                                    .py_2()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .text_sm()
+                                                    .truncate()
+                                                    .child(SharedString::from(url)),
+                                            )
+                                            .child(
+                                                Button::new("copy-http-url")
+                                                    .label("复制")
+                                                    .on_click(move |_, window, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(
+                                                                copy_url.clone(),
+                                                            ),
+                                                        );
+                                                        window.push_notification(
+                                                            Notification::success("访问地址已复制"),
+                                                            cx,
+                                                        );
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .w(px(72.))
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("用户名"),
+                                            )
+                                            .child(
+                                                div().text_sm().child(SharedString::from(username)),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .w(px(72.))
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("登录密码"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .px_3()
+                                                    .py_2()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(SharedString::from(password)),
+                                            )
+                                            .child(
+                                                Button::new("copy-http-password")
+                                                    .label("复制")
+                                                    .on_click(move |_, window, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(
+                                                                copy_password.clone(),
+                                                            ),
+                                                        );
+                                                        window.push_notification(
+                                                            Notification::success("登录密码已复制"),
+                                                            cx,
+                                                        );
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .w(px(72.))
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("共享目录"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .text_sm()
+                                                    .truncate()
+                                                    .child(SharedString::from(display_local_path(
+                                                        &root,
+                                                    ))),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("支持文件与文件夹上传；请只在可信局域网中使用。"),
+                            ),
+                    )
+                    .footer(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("close-http-share")
+                                    .label("关闭")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                Button::new("open-http-share")
+                                    .primary()
+                                    .label("打开")
+                                    .on_click(move |_, _, cx| cx.open_url(&open_url)),
+                            ),
+                    )
+            }
+            Err(message) => dialog
+                .title("浏览器文件共享启动失败")
+                .w(px(480.))
+                .overlay_closable(false)
+                .child(
+                    v_flex().gap_2().child(message).child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("请在设置中检查 HTTP 端口和共享目录，保存后会重新启动服务。"),
+                    ),
+                )
+                .footer(
+                    h_flex().justify_end().child(
+                        Button::new("close-http-share-error")
+                            .primary()
+                            .label("关闭")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                ),
+        });
+    }
+
     // -----------------------------------------------------------------------
     // 凭证
     // -----------------------------------------------------------------------
@@ -1233,6 +1549,11 @@ impl ScpApp {
                 .default_value(self.settings.discovery_port.to_string())
                 .placeholder("1–65535")
         });
+        let lan_http_port_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(self.settings.lan_http_port.to_string())
+                .placeholder("1–65535")
+        });
         let profile_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("名称（可选）"));
         let profile_host_input =
@@ -1333,6 +1654,7 @@ impl ScpApp {
             let save_password_input = manual_password_input.clone();
             let save_discovery_username_input = discovery_username_input.clone();
             let save_discovery_port_input = discovery_port_input.clone();
+            let save_lan_http_port_input = lan_http_port_input.clone();
             let save_lan_sftp_username_input = lan_sftp_username_input.clone();
             let save_app = app.clone();
             let tabs_draft = draft.clone();
@@ -2255,7 +2577,7 @@ impl ScpApp {
                                     div()
                                         .text_sm()
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .child("局域网 SFTP"),
+                                        .child("局域网共享"),
                                 )
                                 .child(
                                     v_flex()
@@ -2297,7 +2619,26 @@ impl ScpApp {
                                 .child(
                                     v_flex()
                                         .gap_2()
-                                        .child(div().text_xs().child("SFTP 登录用户名"))
+                                        .child(div().text_xs().child("HTTP 端口"))
+                                        .child(
+                                            Input::new(&lan_http_port_input)
+                                                .id("lan-http-port")
+                                                .w_full(),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(format!(
+                                                    "浏览器文件共享使用此端口；默认 {}，保存后立即应用。",
+                                                    crate::http_share::DEFAULT_PORT
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(div().text_xs().child("登录用户名"))
                                         .child(
                                             Input::new(&lan_sftp_username_input)
                                                 .id("lan-sftp-username")
@@ -2517,7 +2858,7 @@ impl ScpApp {
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("默认共享当前用户主目录；更改后立即应用到新的 SFTP 文件操作。"),
+                                        .child("默认共享当前用户主目录；SFTP 与浏览器文件共享共用此目录。"),
                                 ),
                         )
                         .when_some(error, |this, error| {
@@ -2630,6 +2971,17 @@ impl ScpApp {
                                         });
                                         return;
                                     };
+                                    let Some(lan_http_port) = parse_port(
+                                        save_lan_http_port_input.read(cx).value().as_ref(),
+                                    ) else {
+                                        save_draft.update(cx, |draft, cx| {
+                                            draft.error = Some(
+                                                "HTTP 端口必须是 1–65535 之间的整数".into(),
+                                            );
+                                            cx.notify();
+                                        });
+                                        return;
+                                    };
                                     let lan_sftp_username = save_lan_sftp_username_input
                                         .read(cx)
                                         .value()
@@ -2641,9 +2993,9 @@ impl ScpApp {
                                         save_draft.update(cx, |draft, cx| {
                                             draft.error = Some(
                                                 if lan_sftp_username.is_empty() {
-                                                    "SFTP 登录用户名不能为空"
+                                                    "登录用户名不能为空"
                                                 } else {
-                                                    "SFTP 登录用户名不能包含空白字符"
+                                                    "登录用户名不能包含空白字符"
                                                 }
                                                 .into(),
                                             );
@@ -2702,6 +3054,7 @@ impl ScpApp {
                                         lan_sftp_root,
                                         lan_sftp_username,
                                         lan_sftp_password_mode,
+                                        lan_http_port,
                                     };
                                     save_draft.update(cx, |draft, cx| {
                                         draft.saving = true;
@@ -2762,12 +3115,18 @@ impl ScpApp {
                                                 )
                                                 .map_err(SharedString::from),
                                             };
+                                            let mut apply_errors = Vec::new();
+                                            if let Err(message) = &app.lan_server {
+                                                apply_errors.push(format!("SFTP：{message}"));
+                                            }
+                                            if let Err(message) = app.apply_http_settings(
+                                                &settings,
+                                                manual_password.clone(),
+                                                effective_root.clone(),
+                                            ) {
+                                                apply_errors.push(format!("HTTP：{message}"));
+                                            }
                                             app.settings = settings.clone();
-                                            let mut apply_error = app
-                                                .lan_server
-                                                .as_ref()
-                                                .err()
-                                                .cloned();
                                             if let Some(discovery) = &app._discovery {
                                                 if let Err(message) = discovery
                                                     .set_discovery_port(settings.discovery_port)
@@ -2775,7 +3134,8 @@ impl ScpApp {
                                                     log::warn!(
                                                         "更新 UDP 设备发现端口失败：{message}"
                                                     );
-                                                    apply_error = Some(message.into());
+                                                    apply_errors
+                                                        .push(format!("设备发现：{message}"));
                                                 }
                                                 if let Err(message) = discovery.set_username(
                                                     settings.discovery_username.as_deref(),
@@ -2798,7 +3158,9 @@ impl ScpApp {
                                             app.workspace.update(cx, |workspace, cx| {
                                                 workspace.set_settings(settings.clone(), cx)
                                             });
-                                            apply_error
+                                            (!apply_errors.is_empty()).then(|| {
+                                                SharedString::from(apply_errors.join("；"))
+                                            })
                                         });
                                         let feedback = match update_result {
                                             Ok(Some(message)) => SettingsFeedback::Error(
@@ -3524,6 +3886,28 @@ impl ScpApp {
                     )
                     .into_any_element(),
             })
+            .child(match &self.http_server {
+                Ok(server) => Button::new("http-share-status")
+                    .link()
+                    .xsmall()
+                    .compact()
+                    .label(SharedString::from(format!("HTTP · {}", server.endpoint())))
+                    .tooltip("查看浏览器文件共享信息")
+                    .on_click(
+                        cx.listener(|app, _, window, cx| app.open_http_server_dialog(window, cx)),
+                    )
+                    .into_any_element(),
+                Err(_) => Button::new("http-share-status")
+                    .link()
+                    .xsmall()
+                    .compact()
+                    .label("HTTP · 启动失败")
+                    .tooltip("查看浏览器文件共享错误")
+                    .on_click(
+                        cx.listener(|app, _, window, cx| app.open_http_server_dialog(window, cx)),
+                    )
+                    .into_any_element(),
+            })
             .child(if self.available_update.is_some() {
                 Button::new("app-version")
                     .link()
@@ -3615,6 +3999,19 @@ mod tests {
     use ::core::prelude::v1::test;
 
     use super::*;
+
+    #[test]
+    fn http_share_qr_code_is_a_square_png() {
+        let (qr_code, size) = qr_code_image("http://192.168.1.10:1986").unwrap();
+        let raster = ::image::load_from_memory(&qr_code.bytes).unwrap();
+        let pixels = raster.to_luma8();
+
+        assert_eq!(raster.width(), raster.height());
+        assert_eq!(size, raster.width() as f32);
+        assert!(raster.width() >= 150);
+        assert!(pixels.pixels().any(|pixel| pixel.0 == [0]));
+        assert!(pixels.pixels().any(|pixel| pixel.0 == [255]));
+    }
 
     #[test]
     fn favorite_password_edit_preserves_or_requires_credentials_as_needed() {

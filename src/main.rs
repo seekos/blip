@@ -11,6 +11,7 @@ mod app;
 #[cfg(feature = "demo-server")]
 mod demo;
 mod discovery;
+mod http_share;
 mod session;
 mod sftp;
 mod ui;
