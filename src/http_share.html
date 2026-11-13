@@ -54,9 +54,9 @@
 
     button, input { font: inherit; }
 
-    button, .download-link { touch-action: manipulation; }
+    button, .download-link, a.file-name { touch-action: manipulation; }
 
-    button:focus-visible, input:focus-visible, .download-link:focus-visible {
+    button:focus-visible, input:focus-visible, .download-link:focus-visible, a.file-name:focus-visible {
       outline: 2px solid var(--focus);
       outline-offset: 2px;
     }
@@ -225,8 +225,10 @@
       text-align: left;
     }
 
-    button.file-name { width: 100%; min-height: 36px; border-color: transparent; padding: 3px; background: transparent; }
-    button.file-name:hover .name-text { color: var(--primary); }
+    button.file-name, a.file-name { width: 100%; min-height: 36px; padding: 3px; }
+    button.file-name { border-color: transparent; background: transparent; }
+    a.file-name { text-decoration: none; }
+    .file-name:hover .name-text { color: var(--primary); }
     .file-icon { width: 22px; height: 22px; flex: 0 0 auto; color: var(--muted); }
     .folder .file-icon { color: var(--primary); }
     .name-text { min-width: 0; overflow-wrap: anywhere; }
@@ -309,7 +311,7 @@
         </div>
         <div>
           <h1>Blip 文件共享</h1>
-          <p class="subtitle">在浏览器中上传和下载文件</p>
+          <p class="subtitle">在浏览器中上传、预览和下载文件</p>
         </div>
       </div>
       <button id="logout" class="quiet" type="button">退出</button>
@@ -527,11 +529,16 @@
         const row = document.createElement("div");
         row.className = `file-row${entry.is_dir ? " folder" : ""}`;
 
-        const name = document.createElement(entry.is_dir ? "button" : "div");
+        const name = document.createElement(entry.is_dir ? "button" : "a");
         name.className = "file-name";
         if (entry.is_dir) {
           name.type = "button";
           name.addEventListener("click", () => openDirectory(entry.path));
+        } else {
+          name.href = `/files/${entry.path.split("/").map(segment => encodeURIComponent(segment)).join("/")}`;
+          name.target = "_blank";
+          name.rel = "noopener";
+          name.setAttribute("aria-label", `打开或预览 ${entry.name}`);
         }
         name.insertAdjacentHTML("afterbegin", entry.is_dir ? icons.folder : icons.file);
         const nameText = document.createElement("span");

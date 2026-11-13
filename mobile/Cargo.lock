@@ -906,6 +906,7 @@ dependencies = [
  "libc",
  "log",
  "mdns-sd",
+ "mime_guess",
  "netdev",
  "objc2 0.6.5",
  "qrcode",

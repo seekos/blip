@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::UNIX_EPOCH;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, REFERRER_POLICY,
     SET_COOKIE,
@@ -236,6 +236,7 @@ fn router(state: ShareState) -> Router {
         .route("/api/logout", post(logout))
         .route("/api/files", get(list_files))
         .route("/api/upload", put(upload_file))
+        .route("/files/{*path}", get(static_file))
         .route("/api/download", get(download_file))
         .with_state(state)
 }
@@ -447,8 +448,25 @@ async fn download_file(
     headers: HeaderMap,
     Query(query): Query<PathQuery>,
 ) -> ApiResult<Response> {
+    file_response(state, headers, query.path, true).await
+}
+
+async fn static_file(
+    State(state): State<ShareState>,
+    headers: HeaderMap,
+    AxumPath(path): AxumPath<String>,
+) -> ApiResult<Response> {
+    file_response(state, headers, path, false).await
+}
+
+async fn file_response(
+    state: ShareState,
+    headers: HeaderMap,
+    requested_path: String,
+    download: bool,
+) -> ApiResult<Response> {
     require_auth(&state, &headers)?;
-    let normalized = normalize_relative(&query.path)?;
+    let normalized = normalize_relative(&requested_path)?;
     let path = resolve_existing(&state, &normalized).await?;
     let metadata = tokio::fs::metadata(&path)
         .await
@@ -456,10 +474,6 @@ async fn download_file(
     if !metadata.is_file() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "路径不是文件"));
     }
-    let filename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("download");
     let file = tokio::fs::File::open(&path)
         .await
         .map_err(ApiError::from_io)?;
@@ -475,21 +489,31 @@ async fn download_file(
         }
     });
     let mut response = Body::from_stream(stream).into_response();
-    let headers = response.headers_mut();
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    headers.insert(
+    let response_headers = response.headers_mut();
+    let content_type = if download {
+        HeaderValue::from_static("application/octet-stream")
+    } else {
+        let mime = mime_guess::from_path(&path).first_or_octet_stream();
+        HeaderValue::from_str(mime.essence_str())
+            .map_err(|_| ApiError::internal("无法生成文件类型"))?
+    };
+    response_headers.insert(CONTENT_TYPE, content_type);
+    response_headers.insert(
         CONTENT_LENGTH,
         HeaderValue::from_str(&metadata.len().to_string())
             .map_err(|_| ApiError::internal("无法生成文件长度"))?,
     );
-    headers.insert(
-        CONTENT_DISPOSITION,
-        HeaderValue::from_str(&content_disposition(filename))
-            .map_err(|_| ApiError::internal("文件名无法用于下载"))?,
-    );
+    if download {
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("download");
+        response_headers.insert(
+            CONTENT_DISPOSITION,
+            HeaderValue::from_str(&content_disposition(filename))
+                .map_err(|_| ApiError::internal("文件名无法用于下载"))?,
+        );
+    }
     Ok(response)
 }
 
@@ -881,7 +905,19 @@ mod tests {
             ),
         );
         assert!(download.starts_with("HTTP/1.1 200"));
+        assert!(download.contains("content-disposition: attachment;"));
         assert!(download.ends_with(body));
+
+        let opened = request(
+            port,
+            &format!(
+                "GET /files/photos/trip/note.txt HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(opened.starts_with("HTTP/1.1 200"));
+        assert!(opened.contains("content-type: text/plain"), "{opened}");
+        assert!(!opened.contains("content-disposition:"), "{opened}");
+        assert!(opened.ends_with(body));
 
         let conflict = request(
             port,

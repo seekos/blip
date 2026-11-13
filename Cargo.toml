@@ -63,6 +63,7 @@ gethostname = "1"
 ignore = "0.4.33"
 mdns-sd = "0.21"
 netdev = { version = "0.47", default-features = false }
+mime_guess = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # macOS-only integration. Dock 图标：裸二进制（`cargo run`）没有 bundle，Dock 里只能靠运行时
