@@ -33,8 +33,8 @@ use crate::sftp::lan_server::{DEFAULT_PASSWORD, ServerInfo, TransferActivity};
 use crate::sftp::session::format_size;
 use crate::sftp::types::{
     AuthMethod, EntryKind, ErrorContext, ExistingPolicy, FileEntry, HostKeyDecision, HostKeyPrompt,
-    SessionConfig, SftpCommand, SftpEvent, TransferDirection, TransferId, TransferOutcome,
-    UploadConflict, UploadDecision,
+    RemoteProtocol, SessionConfig, SftpCommand, SftpEvent, TransferDirection, TransferId,
+    TransferOutcome, UploadConflict, UploadDecision,
 };
 use crate::update::AvailableUpdate;
 
@@ -135,6 +135,7 @@ impl TransferRow {
 }
 
 struct ConnectionDraft {
+    protocol: RemoteProtocol,
     use_private_key: bool,
     remember_secret: bool,
     error: Option<SharedString>,
@@ -157,6 +158,7 @@ pub struct MobileApp {
     screen: Screen,
     dark_mode: bool,
     connection: ConnectionState,
+    active_protocol: RemoteProtocol,
     endpoint: Option<String>,
     pending_config: Option<SessionConfig>,
     pending_remember_secret: bool,
@@ -254,6 +256,7 @@ impl MobileApp {
             screen: Screen::default(),
             dark_mode: true,
             connection: ConnectionState::Disconnected,
+            active_protocol: RemoteProtocol::Sftp,
             endpoint: None,
             pending_config: None,
             pending_remember_secret: true,
@@ -624,15 +627,18 @@ impl MobileApp {
             )
         };
 
+        let mut protocol = RemoteProtocol::Sftp;
         let mut use_private_key = false;
         let mut remember_secret = false;
         if let Some(profile) = &profile {
+            protocol = profile.protocol;
             Self::set_input(&host, profile.host.clone(), window, cx);
             Self::set_input(&port, profile.port.to_string(), window, cx);
             Self::set_input(&username, profile.username.clone(), window, cx);
             match &profile.auth {
                 SavedAuth::Password => {
                     let config = SessionConfig {
+                        protocol: profile.protocol,
                         host: profile.host.clone(),
                         port: profile.port,
                         username: profile.username.clone(),
@@ -651,6 +657,7 @@ impl MobileApp {
                     use_private_key = true;
                     Self::set_input(&private_key, path.clone(), window, cx);
                     let config = SessionConfig {
+                        protocol: profile.protocol,
                         host: profile.host.clone(),
                         port: profile.port,
                         username: profile.username.clone(),
@@ -675,6 +682,7 @@ impl MobileApp {
             Self::set_input(&key_passphrase, "", window, cx);
         }
         let draft = cx.new(|_| ConnectionDraft {
+            protocol,
             use_private_key,
             remember_secret,
             error: None,
@@ -682,6 +690,7 @@ impl MobileApp {
 
         window.open_dialog(cx, move |dialog, _, cx| {
             let snapshot = draft.read(cx);
+            let protocol = snapshot.protocol;
             let use_private_key = snapshot.use_private_key;
             let remember_secret = snapshot.remember_secret;
             let error = snapshot.error.clone();
@@ -696,28 +705,61 @@ impl MobileApp {
             let key_passphrase_for_save = key_passphrase.clone();
 
             dialog
-                .title("连接 SFTP")
+                .title(format!("连接 {}", protocol.label()))
                 .child(
                     v_flex()
                         .gap_3()
-                        .child(Input::new(&host).prefix("主机"))
-                        .child(Input::new(&port).prefix("端口"))
-                        .child(Input::new(&username).prefix("用户"))
                         .child(
-                            Switch::new("connection-auth-mode")
-                                .label("使用私钥")
-                                .checked(use_private_key)
+                            Switch::new("connection-protocol")
+                                .label("使用普通 FTP")
+                                .checked(protocol == RemoteProtocol::Ftp)
                                 .on_change({
                                     let draft = draft.clone();
-                                    move |checked, _, cx| {
+                                    let port = port.clone();
+                                    move |checked, window, cx| {
+                                        let current = Self::input_value(&port, cx);
+                                        let next = if *checked {
+                                            RemoteProtocol::Ftp
+                                        } else {
+                                            RemoteProtocol::Sftp
+                                        };
                                         draft.update(cx, |draft, cx| {
-                                            draft.use_private_key = *checked;
+                                            draft.protocol = next;
+                                            draft.use_private_key = false;
                                             draft.error = None;
                                             cx.notify();
                                         });
+                                        if current == "21" || current == "22" {
+                                            Self::set_input(
+                                                &port,
+                                                next.default_port().to_string(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
                                     }
                                 }),
                         )
+                        .child(Input::new(&host).prefix("主机"))
+                        .child(Input::new(&port).prefix("端口"))
+                        .child(Input::new(&username).prefix("用户"))
+                        .when(protocol == RemoteProtocol::Sftp, |this| {
+                            this.child(
+                                Switch::new("connection-auth-mode")
+                                    .label("使用私钥")
+                                    .checked(use_private_key)
+                                    .on_change({
+                                        let draft = draft.clone();
+                                        move |checked, _, cx| {
+                                            draft.update(cx, |draft, cx| {
+                                                draft.use_private_key = *checked;
+                                                draft.error = None;
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            )
+                        })
                         .when(use_private_key, |this| {
                             this.child(Input::new(&private_key).prefix("私钥"))
                                 .child(
@@ -791,9 +833,10 @@ impl MobileApp {
                             let host = Self::input_value(&host_for_save, cx);
                             let port = Self::input_value(&port_for_save, cx).parse::<u16>().ok();
                             let username = Self::input_value(&username_for_save, cx);
-                            let (use_private_key, remember_secret) = {
+                            let (protocol, use_private_key, remember_secret) = {
                                 let draft_snapshot = draft_for_save.read(cx);
                                 (
+                                    draft_snapshot.protocol,
                                     draft_snapshot.use_private_key,
                                     draft_snapshot.remember_secret,
                                 )
@@ -838,6 +881,7 @@ impl MobileApp {
                                 AuthMethod::Password(Self::input_value(&password_for_save, cx))
                             };
                             let config = SessionConfig {
+                                protocol,
                                 host,
                                 port: port.expect("validated port"),
                                 username,
@@ -898,7 +942,8 @@ impl MobileApp {
                                 let result = pin_app.update(cx, |app, cx| {
                                     let mut profiles = app.profiles.clone();
                                     let Some(saved) = profiles.iter_mut().find(|saved| {
-                                        saved.host == pin_profile.host
+                                        saved.protocol == pin_profile.protocol
+                                            && saved.host == pin_profile.host
                                             && saved.port == pin_profile.port
                                             && saved.username == pin_profile.username
                                     }) else {
@@ -975,7 +1020,8 @@ impl MobileApp {
                             let result = app.update(cx, |app, cx| {
                                 let mut profiles = app.profiles.clone();
                                 let Some(saved) = profiles.iter_mut().find(|saved| {
-                                    saved.host == profile.host
+                                    saved.protocol == profile.protocol
+                                        && saved.host == profile.host
                                         && saved.port == profile.port
                                         && saved.username == profile.username
                                 }) else {
@@ -1050,6 +1096,7 @@ impl MobileApp {
                                         let mut profiles = app.profiles.clone();
                                         let removed = store::remove_profile(
                                             &mut profiles,
+                                            profile.protocol,
                                             &profile.username,
                                             &profile.host,
                                             profile.port,
@@ -1113,6 +1160,7 @@ impl MobileApp {
 
     fn connect(&mut self, config: SessionConfig, remember_secret: bool, cx: &mut Context<Self>) {
         self.connection = ConnectionState::Connecting;
+        self.active_protocol = config.protocol;
         self.endpoint = Some(config.endpoint());
         self.pending_config = Some(config.clone());
         self.pending_remember_secret = remember_secret;
@@ -1125,6 +1173,7 @@ impl MobileApp {
     fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.worker.send(SftpCommand::Disconnect);
         self.connection = ConnectionState::Disconnected;
+        self.active_protocol = RemoteProtocol::Sftp;
         self.endpoint = None;
         self.entries.clear();
         self.remote_path = "/".to_string();
@@ -1516,12 +1565,14 @@ impl MobileApp {
             },
         };
         let existing = self.profiles.iter().find(|profile| {
-            profile.host == config.host
+            profile.protocol == config.protocol
+                && profile.host == config.host
                 && profile.port == config.port
                 && profile.username == config.username
         });
         let profile = SavedProfile {
             name: existing.and_then(|profile| profile.name.clone()),
+            protocol: config.protocol,
             host: config.host.clone(),
             port: config.port,
             username: config.username.clone(),
@@ -2571,15 +2622,19 @@ impl MobileApp {
                     .child(
                         h_flex()
                             .gap_2()
-                            .when(self.connection == ConnectionState::Connected, |this| {
-                                this.child(
-                                    Button::new("install-public-key")
-                                        .label("部署公钥…")
-                                        .on_click(cx.listener(|app, _, _, cx| {
-                                            app.pick_and_install_public_key(cx)
-                                        })),
-                                )
-                            })
+                            .when(
+                                self.connection == ConnectionState::Connected
+                                    && self.active_protocol == RemoteProtocol::Sftp,
+                                |this| {
+                                    this.child(
+                                        Button::new("install-public-key")
+                                            .label("部署公钥…")
+                                            .on_click(cx.listener(|app, _, _, cx| {
+                                                app.pick_and_install_public_key(cx)
+                                            })),
+                                    )
+                                },
+                            )
                             .child(if self.connection == ConnectionState::Disconnected {
                                 Button::new("new-connection")
                                     .primary()

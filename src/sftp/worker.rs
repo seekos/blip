@@ -33,8 +33,8 @@ use super::session::{
 };
 use super::transfer;
 use super::types::{
-    ErrorContext, HostKeyDecision, HostKeyPrompt, SftpCommand, SftpEvent, TransferId,
-    TransferOutcome, UploadConflict, UploadDecision,
+    ErrorContext, HostKeyDecision, HostKeyPrompt, RemoteProtocol, SftpCommand, SftpEvent,
+    TransferId, TransferOutcome, UploadConflict, UploadDecision,
 };
 
 /// 传输任务的取消句柄。
@@ -374,6 +374,14 @@ async fn run_loop(commands: flume::Receiver<SftpCommand>, events: flume::Sender<
                 reconnect_target = None;
                 pending_host = None;
                 upload_policy = None;
+
+                if config.protocol == RemoteProtocol::Ftp {
+                    if super::ftp::run_session(config, &commands, &events).await {
+                        break;
+                    }
+                    connection_cancel = Arc::new(AtomicBool::new(false));
+                    continue;
+                }
 
                 match session::connect(&config, HostKeyPolicy::KnownHosts).await {
                     Ok(active) => {

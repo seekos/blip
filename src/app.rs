@@ -36,7 +36,7 @@ use crate::session::store::{
     self, AppSettings, LanSftpPasswordMode, RemoteOpenBehavior, SavedAuth, SavedProfile,
 };
 use crate::sftp::lan_server::{ServerInfo, TransferActivity};
-use crate::sftp::types::{AuthMethod, SessionConfig};
+use crate::sftp::types::{AuthMethod, RemoteProtocol, SessionConfig};
 use crate::ui::SessionState;
 use crate::ui::file_pane::FilePane;
 use crate::ui::toolbar::{Toolbar, ToolbarEvent};
@@ -150,6 +150,7 @@ fn prepare_profile_persistence(config: &SessionConfig) -> ProfilePersistence {
     ProfilePersistence {
         profile: SavedProfile {
             name: None,
+            protocol: config.protocol,
             host: config.host.clone(),
             port: config.port,
             username: config.username.clone(),
@@ -163,6 +164,7 @@ fn prepare_profile_persistence(config: &SessionConfig) -> ProfilePersistence {
 
 fn profile_password_config(profile: &SavedProfile) -> SessionConfig {
     SessionConfig {
+        protocol: profile.protocol,
         host: profile.host.clone(),
         port: profile.port,
         username: profile.username.clone(),
@@ -212,6 +214,7 @@ fn new_favorite_profile(
     };
     Ok(SavedProfile {
         name: (!name.is_empty()).then(|| name.to_string()),
+        protocol: RemoteProtocol::Sftp,
         host: host.to_string(),
         port,
         username: username.to_string(),
@@ -251,8 +254,11 @@ fn favorite_tooltip(profile: &SavedProfile) -> String {
         SavedAuth::Key { path } => format!("认证：私钥\n私钥：{path}"),
     };
     format!(
-        "名称：{name}\n登录名：{}\n主机/IP：{}\n端口：{}\n{auth}\n\n双击连接",
-        profile.username, profile.host, profile.port
+        "名称：{name}\n协议：{}\n登录名：{}\n主机/IP：{}\n端口：{}\n{auth}\n\n双击连接",
+        profile.protocol.label(),
+        profile.username,
+        profile.host,
+        profile.port
     )
 }
 
@@ -1356,7 +1362,8 @@ impl ScpApp {
             .profiles
             .iter()
             .find(|profile| {
-                profile.host == config.host
+                profile.protocol == config.protocol
+                    && profile.host == config.host
                     && profile.port == config.port
                     && profile.username == config.username
             })
@@ -1369,7 +1376,8 @@ impl ScpApp {
         let mut profiles = self.profiles.clone();
         let result = store::upsert_profile(&mut profiles, updated);
         let profile_retained = profiles.iter().any(|profile| {
-            profile.host == config.host
+            profile.protocol == config.protocol
+                && profile.host == config.host
                 && profile.port == config.port
                 && profile.username == config.username
         });
@@ -1440,7 +1448,8 @@ impl ScpApp {
             .profiles
             .iter()
             .find(|profile| {
-                profile.host == config.host
+                profile.protocol == config.protocol
+                    && profile.host == config.host
                     && profile.port == config.port
                     && profile.username == config.username
             })
@@ -1454,6 +1463,7 @@ impl ScpApp {
             &mut profiles,
             SavedProfile {
                 name: existing.name.clone(),
+                protocol: config.protocol,
                 host: config.host.clone(),
                 port: config.port,
                 username: config.username.clone(),
@@ -1502,7 +1512,11 @@ impl ScpApp {
         match toolbar.state() {
             SessionState::Connected => {
                 let snapshot = toolbar.snapshot(cx);
-                format!("Blip — {}@{}", snapshot.username, snapshot.host)
+                if snapshot.protocol == RemoteProtocol::Ftp {
+                    format!("Blip — FTP · {}@{}", snapshot.username, snapshot.host)
+                } else {
+                    format!("Blip — {}@{}", snapshot.username, snapshot.host)
+                }
             }
             SessionState::Connecting => "Blip — 正在连接…".to_string(),
             SessionState::Disconnected => "Blip".to_string(),
@@ -1749,6 +1763,7 @@ impl ScpApp {
                                             add_profile_draft.update(cx, |draft, cx| {
                                                 draft.selected_profile = Some(SavedProfile {
                                                     name: None,
+                                                    protocol: RemoteProtocol::Sftp,
                                                     host: String::new(),
                                                     port: 22,
                                                     username: String::new(),
@@ -3253,7 +3268,8 @@ impl ScpApp {
                                         let existing_profiles =
                                             add_toolbar.read(cx).profiles_for_display();
                                         if existing_profiles.iter().any(|existing| {
-                                            existing.host == profile.host
+                                            existing.protocol == profile.protocol
+                                                && existing.host == profile.host
                                                 && existing.port == profile.port
                                                 && existing.username == profile.username
                                         }) {
@@ -3569,8 +3585,10 @@ impl ScpApp {
                                                 };
                                                 edited.pinned = save_profile.pinned;
                                                 edited.last_connected = save_profile.last_connected;
+                                                edited.protocol = save_profile.protocol;
                                                 let identity_changed =
-                                                    edited.host != save_profile.host
+                                                    edited.protocol != save_profile.protocol
+                                                        || edited.host != save_profile.host
                                                         || edited.port != save_profile.port
                                                         || edited.username
                                                             != save_profile.username;
@@ -3580,7 +3598,8 @@ impl ScpApp {
                                                         .profiles_for_display()
                                                         .iter()
                                                         .any(|profile| {
-                                                            profile.host == edited.host
+                                                            profile.protocol == edited.protocol
+                                                                && profile.host == edited.host
                                                                 && profile.port == edited.port
                                                                 && profile.username
                                                                     == edited.username
@@ -3776,6 +3795,7 @@ impl ScpApp {
         });
 
         let config = crate::sftp::types::SessionConfig {
+            protocol: RemoteProtocol::Sftp,
             host: login.host.clone(),
             port: login.port,
             username: login.username.clone(),
@@ -4088,13 +4108,14 @@ mod tests {
 
         assert_eq!(
             favorite_tooltip(&profile),
-            "名称：Work\n登录名：alice\n主机/IP：server.example\n端口：2022\n认证：私钥\n私钥：/tmp/id_ed25519\n\n双击连接"
+            "名称：Work\n协议：SFTP\n登录名：alice\n主机/IP：server.example\n端口：2022\n认证：私钥\n私钥：/tmp/id_ed25519\n\n双击连接"
         );
     }
 
     #[test]
     fn favorite_persists_the_password_that_was_actually_used() {
         let config = SessionConfig {
+            protocol: RemoteProtocol::Sftp,
             host: "server.example".to_string(),
             port: 2222,
             username: "alice".to_string(),
@@ -4114,6 +4135,7 @@ mod tests {
     #[test]
     fn favorite_never_persists_a_private_key_passphrase() {
         let config = SessionConfig {
+            protocol: RemoteProtocol::Sftp,
             host: "server.example".to_string(),
             port: 22,
             username: "root".to_string(),

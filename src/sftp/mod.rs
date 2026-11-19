@@ -20,6 +20,7 @@
 //! 一条硬约束：这个模块里**不允许**出现任何 GPUI 类型，也**不允许**在 GPUI 的
 //! `render` / `Context` 里调用这里的 `async` 函数 —— 只能通过 `flume` 通信。
 
+pub mod ftp;
 pub mod lan_server;
 pub mod local_tree;
 mod path_lock;

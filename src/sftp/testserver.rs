@@ -999,6 +999,7 @@ mod tests {
 
     fn config_for(addr: SocketAddr, password: &str) -> SessionConfig {
         SessionConfig {
+            protocol: crate::sftp::types::RemoteProtocol::Sftp,
             host: addr.ip().to_string(),
             port: addr.port(),
             username: USER.to_string(),
@@ -1200,6 +1201,7 @@ mod tests {
         passphrase: Option<&str>,
     ) -> SessionConfig {
         SessionConfig {
+            protocol: crate::sftp::types::RemoteProtocol::Sftp,
             host: addr.ip().to_string(),
             port: addr.port(),
             username: USER.to_string(),
@@ -1697,6 +1699,7 @@ mod tests {
     async fn worker_reports_connect_failure() {
         let worker = SftpWorker::spawn();
         worker.send(SftpCommand::Connect(SessionConfig {
+            protocol: crate::sftp::types::RemoteProtocol::Sftp,
             host: "127.0.0.1".to_string(),
             port: 1,
             username: "nobody".to_string(),

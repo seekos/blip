@@ -7,7 +7,34 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
+
 pub const DEFAULT_SSH_PORT: u16 = 22;
+pub const DEFAULT_FTP_PORT: u16 = 21;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteProtocol {
+    #[default]
+    Sftp,
+    Ftp,
+}
+
+impl RemoteProtocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sftp => "SFTP",
+            Self::Ftp => "FTP",
+        }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::Sftp => DEFAULT_SSH_PORT,
+            Self::Ftp => DEFAULT_FTP_PORT,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 连接配置
@@ -16,6 +43,7 @@ pub const DEFAULT_SSH_PORT: u16 = 22;
 /// 一次连接的完整配置。
 #[derive(Clone)]
 pub struct SessionConfig {
+    pub protocol: RemoteProtocol,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -25,18 +53,30 @@ pub struct SessionConfig {
 impl SessionConfig {
     /// `user@host:port`，用于界面展示。
     pub fn endpoint(&self) -> String {
-        format!("{}@{}:{}", self.username, self.host, self.port)
+        match self.protocol {
+            RemoteProtocol::Sftp => format!("{}@{}:{}", self.username, self.host, self.port),
+            RemoteProtocol::Ftp => {
+                format!("ftp://{}@{}:{}", self.username, self.host, self.port)
+            }
+        }
     }
 
     /// 加密配置中的凭据键，保证不同端口的不同主机不会互相覆盖。
     pub fn credential_account(&self) -> String {
-        format!("{}@{}:{}", self.username, self.host, self.port)
+        match self.protocol {
+            // 保留旧键格式，现有 SFTP 收藏升级后仍能直接读取密码。
+            RemoteProtocol::Sftp => format!("{}@{}:{}", self.username, self.host, self.port),
+            RemoteProtocol::Ftp => {
+                format!("ftp:{}@{}:{}", self.username, self.host, self.port)
+            }
+        }
     }
 }
 
 impl fmt::Debug for SessionConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionConfig")
+            .field("protocol", &self.protocol)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("username", &self.username)

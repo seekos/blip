@@ -17,7 +17,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::sftp::types::{AuthMethod, SessionConfig};
+use crate::sftp::types::{AuthMethod, RemoteProtocol, SessionConfig};
 
 const CONFIG_FILE: &str = "blip.toml";
 const LOCAL_UNLOCK_KEY_FILE: &str = ".blip-unlock-key";
@@ -52,6 +52,8 @@ pub struct DirectoryHistory {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct RemoteDirectory {
+    #[serde(default)]
+    protocol: RemoteProtocol,
     host: String,
     username: String,
     path: String,
@@ -67,10 +69,12 @@ impl DirectoryHistory {
             .unwrap_or(default)
     }
 
-    pub fn remote_for(&self, host: &str, username: &str) -> Option<&str> {
+    pub fn remote_for(&self, protocol: RemoteProtocol, host: &str, username: &str) -> Option<&str> {
         self.remote
             .iter()
-            .find(|item| item.host == host && item.username == username)
+            .find(|item| {
+                item.protocol == protocol && item.host == host && item.username == username
+            })
             .map(|item| item.path.as_str())
     }
 
@@ -82,15 +86,23 @@ impl DirectoryHistory {
         true
     }
 
-    pub fn remember_remote(&mut self, host: &str, username: &str, path: String) -> bool {
-        if self.remote_for(host, username) == Some(path.as_str()) {
+    pub fn remember_remote(
+        &mut self,
+        protocol: RemoteProtocol,
+        host: &str,
+        username: &str,
+        path: String,
+    ) -> bool {
+        if self.remote_for(protocol, host, username) == Some(path.as_str()) {
             return false;
         }
-        self.remote
-            .retain(|item| !(item.host == host && item.username == username));
+        self.remote.retain(|item| {
+            !(item.protocol == protocol && item.host == host && item.username == username)
+        });
         self.remote.insert(
             0,
             RemoteDirectory {
+                protocol,
                 host: host.to_string(),
                 username: username.to_string(),
                 path,
@@ -235,6 +247,8 @@ fn migrate_legacy_editor(
 pub struct SavedProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default)]
+    pub protocol: RemoteProtocol,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -247,7 +261,12 @@ pub struct SavedProfile {
 
 impl SavedProfile {
     pub fn endpoint_label(&self) -> String {
-        format!("{}@{}:{}", self.username, self.host, self.port)
+        match self.protocol {
+            RemoteProtocol::Sftp => format!("{}@{}:{}", self.username, self.host, self.port),
+            RemoteProtocol::Ftp => {
+                format!("ftp://{}@{}:{}", self.username, self.host, self.port)
+            }
+        }
     }
 
     pub fn title(&self) -> String {
@@ -1212,7 +1231,10 @@ fn apply_connection_update(
 }
 
 fn same_profile(left: &SavedProfile, right: &SavedProfile) -> bool {
-    left.host == right.host && left.port == right.port && left.username == right.username
+    left.protocol == right.protocol
+        && left.host == right.host
+        && left.port == right.port
+        && left.username == right.username
 }
 
 fn oldest_profile_index(profiles: &[SavedProfile], unpinned_only: bool) -> Option<usize> {
@@ -1271,8 +1293,14 @@ pub fn replace_profile(
     if profiles.iter().any(|item| same_profile(item, &profile)) {
         return Err("该主机、端口和用户名已在收藏中".to_string());
     }
-    let previous = remove_profile(profiles, &previous.username, &previous.host, previous.port)
-        .ok_or_else(|| "原收藏已不存在，请重新打开设置后再试".to_string())?;
+    let previous = remove_profile(
+        profiles,
+        previous.protocol,
+        &previous.username,
+        &previous.host,
+        previous.port,
+    )
+    .ok_or_else(|| "原收藏已不存在，请重新打开设置后再试".to_string())?;
     let mut result = upsert_profile(profiles, profile);
     result.previous = Some(previous);
     Ok(result)
@@ -1297,6 +1325,7 @@ pub fn sort_profiles_for_display(profiles: &mut [SavedProfile]) {
 
 fn config_for_profile(profile: &SavedProfile) -> SessionConfig {
     SessionConfig {
+        protocol: profile.protocol,
         host: profile.host.clone(),
         port: profile.port,
         username: profile.username.clone(),
@@ -1366,13 +1395,17 @@ pub fn migrate_profile_key_passphrase(
 /// 删除一条收藏（唯一键与写入时一致：user@host:port）。
 pub fn remove_profile(
     profiles: &mut Vec<SavedProfile>,
+    protocol: RemoteProtocol,
     username: &str,
     host: &str,
     port: u16,
 ) -> Option<SavedProfile> {
-    let index = profiles
-        .iter()
-        .position(|item| item.host == host && item.port == port && item.username == username)?;
+    let index = profiles.iter().position(|item| {
+        item.protocol == protocol
+            && item.host == host
+            && item.port == port
+            && item.username == username
+    })?;
     Some(profiles.remove(index))
 }
 
@@ -1386,6 +1419,7 @@ mod tests {
     fn profile(host: &str, port: u16, username: &str) -> SavedProfile {
         SavedProfile {
             name: None,
+            protocol: RemoteProtocol::Sftp,
             host: host.to_string(),
             port,
             username: username.to_string(),
@@ -1408,6 +1442,7 @@ mod tests {
 
     fn probe_config() -> SessionConfig {
         SessionConfig {
+            protocol: RemoteProtocol::Sftp,
             host: "blip-config-probe.invalid".to_string(),
             port: 22,
             username: "tester".to_string(),
@@ -1435,6 +1470,24 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.contains("tester@"));
         assert!(a.ends_with(":22"));
+    }
+
+    #[test]
+    fn ftp_credentials_and_favorites_are_isolated_from_sftp() {
+        let mut config = probe_config();
+        let sftp_account = config.credential_account();
+        config.protocol = RemoteProtocol::Ftp;
+        config.port = 22;
+        let ftp_account = config.credential_account();
+        assert_ne!(sftp_account, ftp_account);
+
+        let sftp = profile("server", 21, "root");
+        let mut ftp = sftp.clone();
+        ftp.protocol = RemoteProtocol::Ftp;
+        let mut profiles = vec![sftp.clone()];
+        upsert_profile(&mut profiles, ftp);
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles.contains(&sftp));
     }
 
     #[test]
@@ -1540,7 +1593,8 @@ mod tests {
             profile("server", 22, "admin"),
         ];
 
-        let removed = remove_profile(&mut profiles, "root", "server", 22).unwrap();
+        let removed =
+            remove_profile(&mut profiles, RemoteProtocol::Sftp, "root", "server", 22).unwrap();
 
         assert_eq!(removed.username, "root");
         assert_eq!(removed.port, 22);
@@ -1754,6 +1808,7 @@ mod tests {
             "evicted-secret".into(),
         );
         let config = SessionConfig {
+            protocol: RemoteProtocol::Sftp,
             host: "server".into(),
             port: 2022,
             username: "root".into(),
@@ -1798,6 +1853,7 @@ mod tests {
             .credentials
             .insert("key-passphrase:root@server:22".into(), "key-secret".into());
         let config = SessionConfig {
+            protocol: RemoteProtocol::Sftp,
             host: "server".into(),
             port: 2022,
             username: "root".into(),
@@ -1832,6 +1888,7 @@ mod tests {
     fn connection_update_saves_key_passphrase_when_requested() {
         let mut document = ConfigDocument::default();
         let config = SessionConfig {
+            protocol: RemoteProtocol::Sftp,
             host: "server".into(),
             port: 2022,
             username: "root".into(),
@@ -1853,15 +1910,46 @@ mod tests {
     fn directory_history_keeps_remote_paths_per_user_and_host() {
         let mut history = DirectoryHistory::default();
 
-        assert!(history.remember_remote("server", "root", "/srv/root".to_string()));
-        assert!(history.remember_remote("server", "admin", "/srv/admin".to_string()));
-        assert!(history.remember_remote("other", "root", "/opt".to_string()));
-        assert!(!history.remember_remote("server", "root", "/srv/root".to_string()));
-        assert!(history.remember_remote("server", "root", "/srv/new".to_string()));
+        assert!(history.remember_remote(
+            RemoteProtocol::Sftp,
+            "server",
+            "root",
+            "/srv/root".to_string(),
+        ));
+        assert!(history.remember_remote(
+            RemoteProtocol::Sftp,
+            "server",
+            "admin",
+            "/srv/admin".to_string(),
+        ));
+        assert!(
+            history.remember_remote(RemoteProtocol::Sftp, "other", "root", "/opt".to_string(),)
+        );
+        assert!(!history.remember_remote(
+            RemoteProtocol::Sftp,
+            "server",
+            "root",
+            "/srv/root".to_string(),
+        ));
+        assert!(history.remember_remote(
+            RemoteProtocol::Sftp,
+            "server",
+            "root",
+            "/srv/new".to_string(),
+        ));
 
-        assert_eq!(history.remote_for("server", "root"), Some("/srv/new"));
-        assert_eq!(history.remote_for("server", "admin"), Some("/srv/admin"));
-        assert_eq!(history.remote_for("other", "root"), Some("/opt"));
+        assert_eq!(
+            history.remote_for(RemoteProtocol::Sftp, "server", "root"),
+            Some("/srv/new")
+        );
+        assert_eq!(
+            history.remote_for(RemoteProtocol::Sftp, "server", "admin"),
+            Some("/srv/admin")
+        );
+        assert_eq!(
+            history.remote_for(RemoteProtocol::Sftp, "other", "root"),
+            Some("/opt")
+        );
     }
 
     #[test]

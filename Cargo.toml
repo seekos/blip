@@ -2,7 +2,7 @@
 name = "blip"
 version = "0.1.0"
 edition = "2024"
-description = "A native, GPU-accelerated cross-platform SFTP client built with GPUI Kit"
+description = "A native, GPU-accelerated cross-platform SFTP and FTP client built with GPUI Kit"
 
 [features]
 default = []
@@ -37,6 +37,7 @@ russh = { version = "0.64", default-features = false, features = [
     "flate2",
 ] }
 russh-sftp = "3.0"
+suppaftp = { version = "13", features = ["tokio"] }
 
 # Cross-runtime actor channels.
 flume = { version = "0.12", features = ["async"] }

@@ -1133,6 +1133,7 @@ mod tests {
 
         let connected = session::connect(
             &SessionConfig {
+                protocol: crate::sftp::types::RemoteProtocol::Sftp,
                 host: address.ip().to_string(),
                 port: address.port(),
                 username: "lan-user".into(),

@@ -1578,6 +1578,7 @@ mod tests {
     #[tokio::test]
     async fn connect_to_closed_port_returns_error() {
         let config = SessionConfig {
+            protocol: crate::sftp::types::RemoteProtocol::Sftp,
             host: "127.0.0.1".to_string(),
             port: 1,
             username: "nobody".to_string(),
@@ -1744,6 +1745,7 @@ mod tests {
     #[test]
     fn unreachable_host_error_is_explained() {
         let config = SessionConfig {
+            protocol: crate::sftp::types::RemoteProtocol::Sftp,
             host: "192.168.146.7".to_string(),
             port: 22,
             username: "root".to_string(),

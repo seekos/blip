@@ -35,7 +35,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL, ns_string};
 use crate::discovery::DiscoveredDevice;
 use crate::session::store::{self, SavedAuth, SavedProfile};
 use crate::sftp::lan_server::DEFAULT_PASSWORD;
-use crate::sftp::types::{AuthMethod, DEFAULT_SSH_PORT, SessionConfig};
+use crate::sftp::types::{AuthMethod, RemoteProtocol, SessionConfig};
 use crate::ui::SessionState;
 
 const PASSWORD_STORE_TOOLTIP: &str = "密码会存入主密码保护的 ~/.ssh/blip.toml";
@@ -56,6 +56,7 @@ impl EventEmitter<ToolbarEvent> for Toolbar {}
 
 /// 表单当前值的快照，用于窗口标题和“记住连接”开关，不含任何凭证。
 pub struct ConnectionSnapshot {
+    pub protocol: RemoteProtocol,
     pub host: String,
     pub username: String,
     pub remember: bool,
@@ -63,6 +64,7 @@ pub struct ConnectionSnapshot {
 
 fn profile_config(profile: &SavedProfile) -> SessionConfig {
     SessionConfig {
+        protocol: profile.protocol,
         host: profile.host.clone(),
         port: profile.port,
         username: profile.username.clone(),
@@ -93,6 +95,7 @@ impl KeyPickerPurpose {
 }
 
 pub struct Toolbar {
+    protocol: RemoteProtocol,
     host: Entity<InputState>,
     port: Entity<InputState>,
     username: Entity<InputState>,
@@ -117,6 +120,7 @@ pub struct Toolbar {
 impl Toolbar {
     pub fn new(profiles: Vec<SavedProfile>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
+            protocol: RemoteProtocol::Sftp,
             host: cx.new(|cx| InputState::new(window, cx).placeholder("主机名或 IP")),
             port: cx.new(|cx| InputState::new(window, cx).default_value("22")),
             username: cx.new(|cx| {
@@ -325,7 +329,9 @@ impl Toolbar {
         let host = profile.host.clone();
         let port = profile.port.to_string();
         let username = profile.username.clone();
-        self.use_key = matches!(profile.auth, SavedAuth::Key { .. });
+        self.protocol = profile.protocol;
+        self.use_key =
+            self.protocol == RemoteProtocol::Sftp && matches!(profile.auth, SavedAuth::Key { .. });
         self.error = None;
 
         self.host
@@ -355,7 +361,8 @@ impl Toolbar {
             return;
         }
         self.prefill(profile, window, cx);
-        if matches!(profile.auth, SavedAuth::Key { .. }) {
+        if profile.protocol == RemoteProtocol::Sftp && matches!(profile.auth, SavedAuth::Key { .. })
+        {
             match store::load_key_passphrase(&profile_config(profile)) {
                 Ok(passphrase) => self.key_passphrase.update(cx, |state, cx| {
                     state.set_value(passphrase.unwrap_or_default(), window, cx)
@@ -380,6 +387,7 @@ impl Toolbar {
             return;
         }
         self.use_key = false;
+        self.protocol = RemoteProtocol::Sftp;
         self.error = None;
         self.host.update(cx, |state, cx| {
             state.set_value(device.address.to_string(), window, cx)
@@ -509,6 +517,7 @@ impl Toolbar {
         let mut profiles = self.profiles.clone();
         let removed = store::remove_profile(
             &mut profiles,
+            profile.protocol,
             &profile.username,
             &profile.host,
             profile.port,
@@ -535,6 +544,7 @@ impl Toolbar {
         cx: &mut Context<Self>,
     ) {
         self.use_key = false;
+        self.protocol = RemoteProtocol::Sftp;
         self.remember = remember;
         self.error = None;
         self.state = SessionState::Disconnected;
@@ -556,6 +566,7 @@ impl Toolbar {
 
     pub fn snapshot(&self, cx: &App) -> ConnectionSnapshot {
         ConnectionSnapshot {
+            protocol: self.protocol,
             host: self.host.read(cx).value().trim().to_string(),
             username: self.username.read(cx).value().trim().to_string(),
             remember: self.remember,
@@ -588,20 +599,21 @@ impl Toolbar {
             .value()
             .trim()
             .parse::<u16>()
-            .unwrap_or(DEFAULT_SSH_PORT);
+            .unwrap_or_else(|_| self.protocol.default_port());
 
         let username = self.username.read(cx).value().trim().to_string();
         if username.is_empty() {
             return Err("请填写用户名".into());
         }
 
-        let auth = if self.use_key {
+        let auth = if self.use_key && self.protocol == RemoteProtocol::Sftp {
             // 留空表示「自动查找」：worker 会依次试 ~/.ssh/id_ed25519、id_rsa。
             self.key_auth(cx)
         } else {
             let typed = self.password.read(cx).value().to_string();
             let password = if typed.is_empty() {
                 let probe = SessionConfig {
+                    protocol: self.protocol,
                     host: host.clone(),
                     port,
                     username: username.clone(),
@@ -627,6 +639,7 @@ impl Toolbar {
         };
 
         Ok(SessionConfig {
+            protocol: self.protocol,
             host,
             port,
             username,
@@ -646,6 +659,7 @@ impl Toolbar {
         let connecting = self.state == SessionState::Connecting;
         let form_locked = connected || connecting;
         let use_key = self.use_key;
+        let protocol = self.protocol;
         let discovered_devices = self.discovered_devices.clone();
         let discovered_count = discovered_devices.len();
         let toolbar = cx.entity().downgrade();
@@ -787,6 +801,35 @@ impl Toolbar {
                     .min_w_0()
                     .gap_2()
                     .child(
+                        Button::new("toggle-protocol")
+                            .outline()
+                            .small()
+                            .w(px(70.))
+                            .label(protocol.label())
+                            .accessibility_label("切换 SFTP/FTP 协议")
+                            .tooltip(match protocol {
+                                RemoteProtocol::Sftp => "当前使用 SFTP，点击切换到 FTP",
+                                RemoteProtocol::Ftp => "当前使用普通 FTP，点击切换到 SFTP",
+                            })
+                            .disabled(form_locked)
+                            .on_click(cx.listener(|toolbar, _, window, cx| {
+                                let old_default = toolbar.protocol.default_port().to_string();
+                                toolbar.protocol = match toolbar.protocol {
+                                    RemoteProtocol::Sftp => RemoteProtocol::Ftp,
+                                    RemoteProtocol::Ftp => RemoteProtocol::Sftp,
+                                };
+                                toolbar.use_key = false;
+                                if toolbar.port.read(cx).value().trim() == old_default {
+                                    let port = toolbar.protocol.default_port().to_string();
+                                    toolbar
+                                        .port
+                                        .update(cx, |state, cx| state.set_value(port, window, cx));
+                                }
+                                toolbar.error = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         div().flex_1().min_w(px(140.)).child(
                             Input::new(&self.host)
                                 .id("toolbar-host")
@@ -843,6 +886,7 @@ impl Toolbar {
                             })
                             .disabled(
                                 connecting
+                                    || protocol == RemoteProtocol::Ftp
                                     || (connected && use_key)
                                     || self.choosing_key
                                     || self.deploying_key,

@@ -106,7 +106,6 @@ pub struct TreeSymlink {
 }
 
 /// 一棵本地目录树的快照。
-#[cfg(test)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LocalTree {
     /// 子目录（相对根），**父目录一定排在子目录前面** —— 按它建目录不必再排序。
@@ -134,7 +133,6 @@ pub struct LocalDirectory {
 /// 扫描 `root` 这棵目录树。
 ///
 /// `root` 必须是目录；根目录本身不出现在 `dirs` 里（调用方负责在远端建它）。
-#[cfg(test)]
 pub fn scan(root: &Path) -> Result<LocalTree, String> {
     let mut tree = LocalTree::default();
     let ignore_rules = IgnoreRules::new(root);

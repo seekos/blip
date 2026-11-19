@@ -32,8 +32,8 @@ use gpui_kit::*;
 use crate::session::store::{self, AppSettings, DirectoryHistory, RemoteOpenBehavior};
 use crate::sftp::session::{join_remote, remote_parent};
 use crate::sftp::types::{
-    ErrorContext, ExistingPolicy, FileEntry, HostKeyDecision, HostKeyPrompt, SessionConfig,
-    TransferDirection, TransferOutcome, UploadConflict,
+    ErrorContext, ExistingPolicy, FileEntry, HostKeyDecision, HostKeyPrompt, RemoteProtocol,
+    SessionConfig, TransferDirection, TransferOutcome, UploadConflict,
 };
 use crate::sftp::{SftpCommand, SftpEvent, SftpWorker};
 use crate::ui::SessionState;
@@ -67,7 +67,7 @@ pub struct Workspace {
     settings: AppSettings,
     directory_history: DirectoryHistory,
     /// 当前连接用来查找/更新远端目录历史的 `user@host`。
-    remote_endpoint: Option<(String, String)>,
+    remote_endpoint: Option<(RemoteProtocol, String, String)>,
     /// 每次连接/断开都会推进；旧连接打开的编辑缓存绝不能写进新连接。
     connection_generation: u64,
     /// 服务器给出的登录目录。
@@ -360,7 +360,11 @@ impl Workspace {
         self.last_error = None;
         self.upload_sources.clear();
         self.upload_concurrency = 0;
-        self.remote_endpoint = Some((config.host.clone(), config.username.clone()));
+        self.remote_endpoint = Some((
+            config.protocol,
+            config.host.clone(),
+            config.username.clone(),
+        ));
         self.worker.send(SftpCommand::Connect(config));
         cx.notify();
     }
@@ -425,10 +429,13 @@ impl Workspace {
     }
 
     fn remember_remote_directory(&mut self, path: String) {
-        let Some((host, username)) = self.remote_endpoint.as_ref() else {
+        let Some((protocol, host, username)) = self.remote_endpoint.as_ref() else {
             return;
         };
-        if self.directory_history.remember_remote(host, username, path) {
+        if self
+            .directory_history
+            .remember_remote(*protocol, host, username, path)
+        {
             self.save_directory_history();
         }
     }
@@ -467,11 +474,14 @@ impl Workspace {
                 self.upload_concurrency = upload_concurrency;
                 self.transfers.update(cx, |queue, cx| queue.clear_all(cx));
 
-                let remembered = self.remote_endpoint.as_ref().and_then(|(host, username)| {
-                    self.directory_history
-                        .remote_for(host, username)
-                        .map(str::to_owned)
-                });
+                let remembered =
+                    self.remote_endpoint
+                        .as_ref()
+                        .and_then(|(protocol, host, username)| {
+                            self.directory_history
+                                .remote_for(*protocol, host, username)
+                                .map(str::to_owned)
+                        });
                 let initial_path = remembered.unwrap_or_else(|| home.clone());
                 let fallback = (initial_path != home).then_some(home);
                 self.go_live(initial_path.clone(), cx);

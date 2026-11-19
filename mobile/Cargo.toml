@@ -25,6 +25,7 @@ axum = "0.8"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3.0"
+suppaftp = { version = "13", features = ["tokio"] }
 flume = { version = "0.12", features = ["async"] }
 futures = "0.3"
 age = "0.11.1"
