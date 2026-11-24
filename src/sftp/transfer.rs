@@ -51,6 +51,9 @@ const SMALL_FILE_THRESHOLD: u64 = CHUNK_SIZE as u64;
 /// 最多四条网卡连接、每条八路；实际并发还会受共享信号量和每连接上限约束。
 const DIR_UPLOAD_CONCURRENCY: usize = 32;
 
+/// 目录下载共用主 SFTP 会话，保守地只让四个文件同时在途。
+const DIR_DOWNLOAD_CONCURRENCY: usize = 4;
+
 /// 写入失败后再试两次；临时文件会从安全偏移重新写，不触碰原目标。
 const UPLOAD_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(600)];
 
@@ -650,7 +653,7 @@ async fn download_file(
             "远端文件在下载或校验期间发生变化，校验值不一致；已保留半成品"
         ));
     }
-    replace_local(&plan.temp, local).await?;
+    replace_local(&plan.temp, local, true).await?;
     let _ = tokio::fs::remove_file(&plan.marker).await;
 
     // 终值：即使最后一次节流没触发，进度条也要走到头。
@@ -660,6 +663,70 @@ async fn download_file(
         speedometer.current(),
     );
 
+    Ok(())
+}
+
+/// 目录内小文件快速路径：不为几 KiB 数据逐个写断点标记、fsync 和二次回读。
+///
+/// 数据仍先写 `.filepart`，完整读到目录扫描得到的长度后才原子替换目标。
+async fn download_small_file(
+    sftp: &SftpSession,
+    remote: &str,
+    local: &Path,
+    total: u64,
+    cancel: &AtomicBool,
+    sink: &mut dyn UploadSink,
+) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("已取消"));
+    }
+
+    let temp = local_filepart_path(local);
+    let marker = local_marker_path(&temp);
+    let mut source = sftp
+        .open(remote)
+        .await
+        .map_err(|err| anyhow!("打开远端文件失败：{err}"))?;
+    let mut target = open_local_no_follow(&temp, false)
+        .await
+        .map_err(|err| anyhow!("创建本地半成品 {} 失败：{err}", temp.display()))?;
+    sink.started(total, 0);
+
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut transferred = 0u64;
+    let mut speedometer = Speedometer::new(0);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!("已取消"));
+        }
+        let read = source
+            .read(&mut buffer)
+            .await
+            .map_err(|err| anyhow!("读取远端数据失败：{err}"))?;
+        if read == 0 {
+            break;
+        }
+        target
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|err| anyhow!("写入本地文件失败：{err}"))?;
+        transferred += read as u64;
+    }
+    target
+        .flush()
+        .await
+        .map_err(|err| anyhow!("刷新本地文件失败：{err}"))?;
+    drop(target);
+
+    if transferred != total {
+        return Err(anyhow!(
+            "远端文件长度在下载过程中发生变化：预期 {total} 字节，实际读取 {transferred} 字节"
+        ));
+    }
+
+    replace_local(&temp, local, false).await?;
+    let _ = tokio::fs::remove_file(marker).await;
+    sink.progress(transferred, total, speedometer.sample(transferred));
     Ok(())
 }
 
@@ -920,7 +987,7 @@ fn windows_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-async fn replace_local(temp: &Path, target: &Path) -> Result<()> {
+async fn replace_local(temp: &Path, target: &Path, sync_parent: bool) -> Result<()> {
     if tokio::fs::symlink_metadata(target)
         .await
         .is_ok_and(|meta| meta.is_dir())
@@ -940,9 +1007,8 @@ async fn replace_local(temp: &Path, target: &Path) -> Result<()> {
         replace_local_with_backup(temp, target, &rename_err).await?;
     }
 
-    // 文件本身已经 fsync；再同步目录项，降低系统崩溃后 rename 丢失的概率。
-    // 某些文件系统不允许打开目录做 fsync，此时目标已经完整发布，只记录警告。
-    if let Some(parent) = target.parent() {
+    // 严格耐久路径会在文件 fsync 后再同步目录项；小文件批量路径不逐个下磁盘屏障。
+    if sync_parent && let Some(parent) = target.parent() {
         match tokio::fs::File::open(parent).await {
             Ok(directory) => {
                 if let Err(err) = directory.sync_all().await {
@@ -1438,48 +1504,6 @@ impl UploadSink for RowSink<'_> {
     }
 }
 
-/// 整目录上传：所有文件折算成同一行，`base` 是前面那些文件已经传完的字节。
-struct BatchSink<'a> {
-    id: TransferId,
-    events: &'a flume::Sender<SftpEvent>,
-    /// 本文件开始前，整批已完成的字节数。
-    base: u64,
-    /// 整批总字节（扫描时算好，全程不变）。
-    total: u64,
-    /// 最近一次上报的「整批已传字节」。
-    ///
-    /// 单个文件失败时，调用方要靠它知道已经推进到哪儿了 —— 否则下一个文件
-    /// 会从 `base` 重新开始，进度条当场倒退。
-    last: u64,
-}
-
-impl<'a> BatchSink<'a> {
-    fn new(id: TransferId, events: &'a flume::Sender<SftpEvent>, base: u64, total: u64) -> Self {
-        Self {
-            id,
-            events,
-            base,
-            total,
-            last: base,
-        }
-    }
-}
-
-impl UploadSink for BatchSink<'_> {
-    /// 整批只在开始时发一条 `TransferStarted`，单个文件不再单独报。
-    fn started(&mut self, _total: u64, _resumed_from: u64) {}
-
-    fn progress(&mut self, transferred: u64, _total: u64, speed: f64) {
-        self.last = self.base + transferred;
-        let _ = self.events.send(SftpEvent::TransferProgress {
-            id: self.id,
-            transferred: self.last,
-            total: self.total,
-            speed,
-        });
-    }
-}
-
 #[derive(Default)]
 struct ConcurrentBatchProgress {
     transferred: u64,
@@ -1489,7 +1513,7 @@ struct ConcurrentBatchProgress {
     active_files: Vec<String>,
 }
 
-/// 并发目录上传的进度汇总器。每个文件持有自己的 `file_transferred`，只把增量加到整批。
+/// 并发目录传输的进度汇总器。每个文件持有自己的 `file_transferred`，只把增量加到整批。
 struct ConcurrentBatchSink {
     id: TransferId,
     events: flume::Sender<SftpEvent>,
@@ -2685,9 +2709,16 @@ async fn ensure_dir(sftp: &SftpSession, path: &str) -> Result<bool> {
 // 整目录下载：一条指令取回一棵树
 // ---------------------------------------------------------------------------
 
+enum DirDownloadResult {
+    Downloaded,
+    Skipped,
+    Ignored,
+    Failed(String),
+}
+
 /// 下载一整个远端目录。
 ///
-/// 和 [`run_upload_dir`] 对称：扫远端树 → 在本地建目录 → 逐个文件走单文件那套流程。
+/// 和 [`run_upload_dir`] 对称：扫远端树 → 在本地建目录 → 受控并发下载文件。
 /// 队列里只占一行，进度按整批字节汇总。
 ///
 /// 单个文件失败不中断整批，最后把首个错误连同失败个数一起报回去。
@@ -2749,25 +2780,22 @@ async fn download_dir_inner(
     );
 
     let total = tree.total_bytes;
+    let scan_skipped = tree.skipped;
     let _ = events.send(SftpEvent::TransferStarted {
         id,
         resumed_from: 0,
         total,
     });
     let total_files = tree.files.len();
-    let mut processed_files = 0usize;
     let _ = events.send(SftpEvent::TransferFileProgress {
         id,
-        completed: processed_files,
+        completed: 0,
         total: total_files,
     });
 
     // 每一级都拒绝符号链接，恶意服务器文件名或本地预置链接都不能把下载写出根目录。
     ensure_safe_download_root(local).await?;
 
-    let mut done = 0u64;
-    let mut finished = 0usize;
-    let mut skipped = 0usize;
     let mut failures: Vec<String> = Vec::new();
     // 建不出来的本地子目录：它下面的文件不再逐个尝试（错误已经记在目录那一条）。
     let mut broken_dirs: Vec<PathBuf> = Vec::new();
@@ -2782,88 +2810,83 @@ async fn download_dir_inner(
         }
     }
 
-    for file in &tree.files {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(TransferOutcome::Cancelled);
-        }
-        if broken_dirs.iter().any(|dir| file.relative.starts_with(dir)) {
-            processed_files += 1;
-            let _ = events.send(SftpEvent::TransferFileProgress {
-                id,
-                completed: processed_files,
-                total: total_files,
-            });
-            continue;
-        }
-
-        let name = local_tree::relative_to_posix(&file.relative);
-        let parent = file.relative.parent().unwrap_or_else(|| Path::new(""));
-        if let Err(err) = ensure_safe_download_subdir(local, parent).await {
-            failures.push(format!("{name}：本地父目录不安全：{err}"));
-            processed_files += 1;
-            let _ = events.send(SftpEvent::TransferFileProgress {
-                id,
-                completed: processed_files,
-                total: total_files,
-            });
-            continue;
-        }
-        let target = local.join(&file.relative);
-
-        // 「跳过同名」且本地已经有这个文件：一个字节都不动，进度照走。
-        if on_existing == ExistingPolicy::Skip && tokio::fs::metadata(&target).await.is_ok() {
-            skipped += 1;
-            done += file.size;
-            let _ = events.send(SftpEvent::TransferProgress {
-                id,
-                transferred: done,
-                total,
-                speed: 0.,
-            });
-            processed_files += 1;
-            let _ = events.send(SftpEvent::TransferFileProgress {
-                id,
-                completed: processed_files,
-                total: total_files,
-            });
-            continue;
-        }
-
-        // 只续写带匹配身份标记的 `.filepart`；已有目标文件始终保持不动直到下载完成。
-        let plan = match plan_download(sftp, &file.remote, &target, file.size, true, cancel).await {
-            Ok(plan) => plan,
-            Err(err) => {
-                failures.push(format!("{name}：{err}"));
-                processed_files += 1;
-                let _ = events.send(SftpEvent::TransferFileProgress {
-                    id,
-                    completed: processed_files,
-                    total: total_files,
-                });
-                continue;
+    let progress = Arc::new(Mutex::new(ConcurrentBatchProgress {
+        total,
+        total_files,
+        ..Default::default()
+    }));
+    let blocked_dirs = &broken_dirs;
+    let results = stream::iter(tree.files.into_iter().map(|file| {
+        let progress = progress.clone();
+        async move {
+            let mut sink = ConcurrentBatchSink::new(id, events, progress);
+            if cancel.load(Ordering::Relaxed) {
+                return DirDownloadResult::Ignored;
             }
-        };
+            if blocked_dirs
+                .iter()
+                .any(|dir| file.relative.starts_with(dir))
+            {
+                sink.file_completed();
+                return DirDownloadResult::Ignored;
+            }
 
-        let mut sink = BatchSink::new(id, events, done, total);
-        match download_file(sftp, &file.remote, &target, &plan, cancel, &mut sink).await {
-            Ok(()) => finished += 1,
-            Err(err) => {
-                if cancel.load(Ordering::Relaxed) {
-                    return Ok(TransferOutcome::Cancelled);
+            let name = local_tree::relative_to_posix(&file.relative);
+            let parent = file.relative.parent().unwrap_or_else(|| Path::new(""));
+            if let Err(err) = ensure_safe_download_subdir(local, parent).await {
+                sink.file_completed();
+                return DirDownloadResult::Failed(format!("{name}：本地父目录不安全：{err}"));
+            }
+            let target = local.join(&file.relative);
+
+            // 「跳过同名」且本地已经有这个文件：一个字节都不动，进度照走。
+            if on_existing == ExistingPolicy::Skip && tokio::fs::metadata(&target).await.is_ok() {
+                sink.add_completed(file.size);
+                sink.file_completed();
+                return DirDownloadResult::Skipped;
+            }
+
+            let result = if file.size <= SMALL_FILE_THRESHOLD {
+                download_small_file(sftp, &file.remote, &target, file.size, cancel, &mut sink).await
+            } else {
+                // 大文件仍保留断点身份、fsync 和远端内容复校验。
+                match plan_download(sftp, &file.remote, &target, file.size, true, cancel).await {
+                    Ok(plan) => {
+                        download_file(sftp, &file.remote, &target, &plan, cancel, &mut sink).await
+                    }
+                    Err(err) => Err(err),
                 }
-                failures.push(format!("{name}：{err}"));
+            };
+            sink.file_completed();
+            match result {
+                Ok(()) => DirDownloadResult::Downloaded,
+                Err(_) if cancel.load(Ordering::Relaxed) => DirDownloadResult::Ignored,
+                Err(err) => DirDownloadResult::Failed(format!("{name}：{err}")),
             }
         }
+    }))
+    .buffer_unordered(DIR_DOWNLOAD_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
 
-        // 成功或半途失败，都以「最后一次上报的位置」为准：进度绝不倒退。
-        done = sink.last.max(done);
-        processed_files += 1;
-        let _ = events.send(SftpEvent::TransferFileProgress {
-            id,
-            completed: processed_files,
-            total: total_files,
-        });
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(TransferOutcome::Cancelled);
     }
+
+    let mut finished = 0usize;
+    let mut skipped = 0usize;
+    for result in results {
+        match result {
+            DirDownloadResult::Downloaded => finished += 1,
+            DirDownloadResult::Skipped => skipped += 1,
+            DirDownloadResult::Ignored => {}
+            DirDownloadResult::Failed(message) => failures.push(message),
+        }
+    }
+    let done = progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .transferred;
 
     let _ = events.send(SftpEvent::TransferProgress {
         id,
@@ -2872,7 +2895,7 @@ async fn download_dir_inner(
         speed: 0.,
     });
 
-    Ok(batch_outcome(finished, skipped, &failures, tree.skipped))
+    Ok(batch_outcome(finished, skipped, &failures, scan_skipped))
 }
 
 /// 准备递归下载的根目录。只创建最后一级，避免 `create_dir_all` 沿途跟随符号链接。

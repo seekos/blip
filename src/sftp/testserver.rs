@@ -3355,6 +3355,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ctx.dir);
     }
 
+    /// 大量小文件走目录快速路径：不逐个 stat，并发落盘后内容仍完整。
+    #[tokio::test]
+    async fn download_dir_handles_many_small_files_without_per_file_stat() {
+        let ctx = connect_and_dir("dl-many-small").await;
+        const REMOTE: &str = "/home/tester/many-small";
+        vfs_mkdir(REMOTE).await;
+
+        let files = (0..48)
+            .map(|index| {
+                let name = format!("item-{index:02}.txt");
+                let data = vec![index as u8; 128 + index as usize];
+                (name, data)
+            })
+            .collect::<Vec<_>>();
+        for (name, data) in &files {
+            vfs_write(&format!("{REMOTE}/{name}"), data).await;
+        }
+
+        // 旧路径会在每个文件下载前 stat，这个文件会因此失败。
+        let rejected_stat = format!("{REMOTE}/item-17.txt");
+        set_stat_failure_path(Some(&rejected_stat));
+        let local = ctx.dir.join("many-small");
+        let expected_total: u64 = files.iter().map(|(_, data)| data.len() as u64).sum();
+        let (total, progress, outcome) =
+            run_folder_download(&ctx, 36, REMOTE, local.clone(), ExistingPolicy::Overwrite).await;
+        set_stat_failure_path(None);
+
+        assert_eq!(outcome, TransferOutcome::Completed);
+        assert_eq!(total, expected_total);
+        assert_eq!(progress, expected_total);
+        for (name, data) in &files {
+            let stored = std::fs::read(local.join(name)).expect("读小文件下载结果");
+            assert_eq!(stored.as_slice(), data.as_slice(), "{name} 内容应完整");
+        }
+
+        let _ = std::fs::remove_dir_all(&ctx.dir);
+    }
+
     /// 策略「跳过同名」：本地已有内容一个字节都不动，其余照下。
     #[tokio::test]
     async fn download_dir_skips_existing_files() {
